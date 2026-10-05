@@ -1,0 +1,203 @@
+# Discord read-only MCP stack.
+#
+#   ChatGPT ── Secure MCP Tunnel ── tunnel-client ── discord-mcp ── discord-reader-daemon ── Discord
+#
+# `docker compose up -d --build` starts the whole runtime. No ports are
+# published to the host by default. For local debugging see compose.dev.yaml
+# (loaded explicitly with `-f`, never automatically).
+
+services:
+  discord-reader:
+    build:
+      context: .
+      dockerfile: docker/discord-reader.Dockerfile
+    restart: unless-stopped
+
+    # The ONLY service that sees the Discord credential.
+    secrets:
+      - discord_token
+
+    environment:
+      DISCORD_TOKEN_FILE: /run/secrets/discord_token
+      # `user` for a user (self) account token, `bot` for a bot token.
+      DISCORD_TOKEN_KIND: user
+      DISCORD_READER_SOCKET: /run/discord-reader/reader.sock
+      DATABASE_URL: /data/discord.sqlite3
+      RUST_LOG: info
+
+    volumes:
+      - reader-runtime:/run/discord-reader
+      - reader-data:/data
+
+    networks:
+      - backend
+      - egress
+
+    read_only: true
+    tmpfs:
+      - /tmp
+
+    security_opt:
+      - no-new-privileges:true
+
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/discord-reader-daemon", "--healthcheck"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+
+
+  discord-mcp:
+    build:
+      context: .
+      dockerfile: docker/discord-mcp.Dockerfile
+    restart: unless-stopped
+
+    # No secrets here: the MCP server never sees a Discord credential.
+    environment:
+      DISCORD_READER_SOCKET: /run/discord-reader/reader.sock
+      MCP_LISTEN_ADDR: 0.0.0.0:3000
+      RUST_LOG: info
+
+    volumes:
+      - reader-runtime:/run/discord-reader
+
+    networks:
+      - backend
+
+    depends_on:
+      discord-reader:
+        condition: service_healthy
+
+    read_only: true
+    tmpfs:
+      - /tmp
+
+    security_opt:
+      - no-new-privileges:true
+
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/discord-reader-mcp", "--healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+    # Host access is intentionally NOT published. Only the tunnel-client on
+    # the internal `backend` network may reach http://discord-mcp:3000/mcp.
+    #
+    # Debug only (see compose.dev.yaml):
+    # ports:
+    #   - "127.0.0.1:3000:3000"
+
+
+  tunnel-client:
+    # OpenAI Secure MCP Tunnel client. Version is pinned; renovate/dependabot
+    # can propose updates. Never use `latest`.
+    image: ghcr.io/openai/tunnel-client:v0.0.15
+    restart: unless-stopped
+
+    depends_on:
+      discord-mcp:
+        condition: service_healthy
+
+    # Only the OpenAI runtime API key (Tunnels Read + Use) is mounted here.
+    secrets:
+      - openai_tunnel_api_key
+
+    environment:
+      CONTROL_PLANE_TUNNEL_ID: ${OPENAI_TUNNEL_ID:?set OPENAI_TUNNEL_ID in .env}
+      MCP_SERVER_URL: http://discord-mcp:3000/mcp
+      LOG_LEVEL: info
+      LOG_FORMAT: json
+      HEALTH_LISTEN_ADDR: :8080
+
+    # The image entrypoint is `tunnel-client run`, so these are just flags.
+    command:
+      - --control-plane.api-key=file:/run/secrets/openai_tunnel_api_key
+      - --control-plane.tunnel-id=${OPENAI_TUNNEL_ID:?set OPENAI_TUNNEL_ID in .env}
+      - --mcp.server-url=http://discord-mcp:3000/mcp
+      - --mcp.startup-wait-timeout=60s
+      - --log.level=info
+      - --log.format=json
+      - --health.listen-addr=:8080
+
+    networks:
+      - backend
+      - egress
+
+    security_opt:
+      - no-new-privileges:true
+
+    healthcheck:
+      # The image ships busybox wget; probe the official liveness endpoint.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+    # Debug only: expose the tunnel health UI / endpoints on localhost.
+    # Never publish this to a LAN. Normally keep ports commented out.
+    #
+    # ports:
+    #   - "127.0.0.1:8080:8080"
+
+
+  # Optional one-shot provisioning: create the Tunnel object on the OpenAI
+  # Platform with an ADMIN key. Never runs in the default profile, and the
+  # admin key is not mounted into any long-running container.
+  #
+  #   docker compose --profile provision run --rm tunnel-provision
+  #
+  # Manual creation on the OpenAI Platform is the documented default.
+  tunnel-provision:
+    profiles: ["provision"]
+    image: ghcr.io/openai/tunnel-client:v0.0.15
+    entrypoint: ["/usr/bin/tunnel-client"]
+    environment:
+      OPENAI_ADMIN_KEY_FILE: /run/secrets/openai_admin_key
+    command:
+      - admin
+      - tunnels
+      - create
+      - --admin-key=file:/run/secrets/openai_admin_key
+      - --name=discord-reader
+      - --organization-id=${OPENAI_ORG_ID:-}
+      - --workspace-id=${OPENAI_WORKSPACE_ID:-}
+      - --json
+    secrets:
+      - openai_admin_key
+    networks:
+      - egress
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+
+volumes:
+  reader-runtime:
+  reader-data:
+
+networks:
+  # Internal-only: discord-mcp lives here and can reach nothing else.
+  backend:
+    internal: true
+
+  # Outbound internet: used by discord-reader (Discord API) and
+  # tunnel-client (api.openai.com) only.
+  egress:
+
+
+secrets:
+  discord_token:
+    file: ./secrets/discord_token
+
+  openai_tunnel_api_key:
+    file: ./secrets/openai_tunnel_api_key
+
+  # Only used by the optional `provision` profile. Leave the file absent in
+  # normal operation.
+  openai_admin_key:
+    file: ./secrets/openai_admin_key

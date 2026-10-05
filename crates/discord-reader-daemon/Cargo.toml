@@ -1,0 +1,30 @@
+[package]
+name = "discord-reader-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Discord credential holder: read-only Discord access over a Unix socket."
+
+[lib]
+name = "discord_reader_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "discord-reader-daemon"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = "0.1"
+discord-api = { path = "../discord-api" }
+discord-store = { path = "../discord-store" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

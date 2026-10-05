@@ -1,0 +1,52 @@
+[Unit]
+Description=Discord read-only reader daemon (Discord credential holder)
+Documentation=https://github.com/openai/discord-reader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=discord-reader
+Group=discord-reader
+
+# Discord credential: provided through systemd credentials, never argv/env.
+# Create /etc/discord-reader/token (mode 0400, root:root) with the token.
+LoadCredential=discord-token:/etc/discord-reader/token
+
+Environment=DISCORD_READER_SOCKET=/run/discord-reader/reader.sock
+Environment=DATABASE_URL=/var/lib/discord-reader/discord.sqlite3
+Environment=DISCORD_TOKEN_KIND=user
+Environment=RUST_LOG=info
+
+ExecStart=/usr/local/bin/discord-reader-daemon
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=3
+
+RuntimeDirectory=discord-reader
+RuntimeDirectoryMode=0750
+StateDirectory=discord-reader
+StateDirectoryMode=0750
+UMask=0007
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

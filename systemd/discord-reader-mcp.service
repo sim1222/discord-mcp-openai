@@ -1,0 +1,43 @@
+[Unit]
+Description=Discord read-only MCP server (Streamable HTTP)
+Documentation=https://github.com/openai/discord-reader
+After=discord-reader-daemon.service
+Requires=discord-reader-daemon.service
+
+[Service]
+Type=simple
+User=discord-reader
+Group=discord-reader
+
+# No Discord credential is available to this service at all.
+Environment=DISCORD_READER_SOCKET=/run/discord-reader/reader.sock
+Environment=MCP_LISTEN_ADDR=127.0.0.1:3000
+Environment=RUST_LOG=info
+
+ExecStart=/usr/local/bin/discord-reader-mcp
+Restart=on-failure
+RestartSec=3
+
+UMask=0007
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

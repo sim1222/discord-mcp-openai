@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/discord-api",
+    "crates/discord-store",
+    "crates/discord-reader-daemon",
+    "crates/discord-reader-mcp",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.88"
+
+[workspace.dependencies]
+anyhow = "1"
+axum = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+futures = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "charset", "rustls"] }
+rmcp = { version = "3.5", features = ["server", "macros", "schemars", "transport-streamable-http-server"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+schemars = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "io-util", "signal", "fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1

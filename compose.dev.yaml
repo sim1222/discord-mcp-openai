@@ -1,0 +1,18 @@
+# Development overrides. Deliberately NOT named compose.override.yaml:
+# Docker Compose auto-merges `compose.override.yaml`, which would publish
+# ports in the default (production) run as well.
+#
+# Usage:
+#   docker compose -f docker-compose.yaml -f compose.dev.yaml up -d --build
+#
+# This publishes ports to localhost only, for manual testing of the MCP
+# endpoint and the tunnel health UI. Production runs must not use it.
+
+services:
+  discord-mcp:
+    ports:
+      - "127.0.0.1:3000:3000"
+
+  tunnel-client:
+    ports:
+      - "127.0.0.1:8080:8080"
