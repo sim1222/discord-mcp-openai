@@ -1,5 +1,8 @@
 # discord-reader — Discord read-only MCP server (Rust)
 
+> [!WARNING]
+> This project is 100% AI Generated. Use at your own risk.
+
 自分の Discord ユーザーアカウントで **閲覧できるメッセージだけ** を、MCP クライアント
 (ChatGPT / Dots / ローカルエージェント) から探索できる read-only MCP サーバーです。
 
