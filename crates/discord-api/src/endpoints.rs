@@ -53,6 +53,81 @@ pub enum DiscordRequest {
     },
     /// `GET /users/@me/channels` (DM / group DM listing)
     ListUserDmChannels,
+    /// `GET /users/@me/guilds/{guild.id}/member` (own member in one guild)
+    GetOwnGuildMember { guild_id: String },
+    /// `GET /guilds/{guild.id}/threads/search` (joined threads of one guild,
+    /// includes archived threads; user-account friendly)
+    SearchGuildThreads {
+        guild_id: String,
+        /// `true` = archived, `false` = active. `None` = both.
+        archived: Option<bool>,
+        /// Show threads joined by the current user only.
+        joined: Option<bool>,
+        sort_by: Option<String>,
+        sort_order: Option<String>,
+        limit: u32,
+        /// Pagination cursor: show threads before this thread id.
+        before: Option<String>,
+    },
+    /// `GET /channels/{channel.id}/threads` (active + archived threads of one
+    /// parent channel / forum; user-account friendly)
+    ListChannelThreads {
+        channel_id: String,
+        /// `true` = archived, `false` = active. `None` = both.
+        archived: Option<bool>,
+        /// Show threads joined by the current user only.
+        joined: Option<bool>,
+        sort_by: Option<String>,
+        sort_order: Option<String>,
+        limit: u32,
+        /// Pagination cursor: show threads before this thread id.
+        before: Option<String>,
+    },
+    /// `GET /channels/{channel.id}/messages/search` (user-account message
+    /// search; channel-scoped)
+    SearchChannelMessages {
+        channel_id: String,
+        content: Option<String>,
+        offset: u32,
+        limit: u32,
+        sort_by: Option<String>,
+        sort_order: Option<String>,
+    },
+    /// `GET /channels/{channel.id}/threads/{thread.id}` (one thread's metadata)
+    GetThread { thread_id: String },
+    /// `GET /channels/{channel.id}/messages/{message.id}/events`
+    /// (message-linked scheduled events; user-account accessible)
+    GetMessageEvents {
+        channel_id: String,
+        message_id: String,
+    },
+    /// `GET /channels/{channel.id}/threads/archived/public`
+    ListPublicArchivedThreads {
+        channel_id: String,
+        /// ISO-8601 timestamp cursor: show threads archived before this.
+        before: Option<String>,
+        limit: u32,
+    },
+    /// `GET /channels/{channel.id}/threads/archived/private`
+    ListPrivateArchivedThreads {
+        channel_id: String,
+        before: Option<String>,
+        limit: u32,
+    },
+    /// `GET /channels/{channel.id}/users/@me/threads/archived/private`
+    ListJoinedPrivateArchivedThreads {
+        channel_id: String,
+        before: Option<String>,
+        limit: u32,
+    },
+    /// `GET /channels/{channel.id}/messages/{message.id}/reactions/{emoji}`
+    /// used as a read probe / reaction listing
+    GetReactions {
+        channel_id: String,
+        message_id: String,
+        emoji: String,
+        limit: u32,
+    },
 }
 
 impl DiscordRequest {
@@ -78,6 +153,28 @@ impl DiscordRequest {
                 "GET /channels/{channel.id}/messages/{message.id}".to_string()
             }
             Self::ListUserDmChannels => "GET /users/@me/channels".to_string(),
+            Self::GetOwnGuildMember { .. } => "GET /users/@me/guilds/{guild.id}/member".to_string(),
+            Self::SearchGuildThreads { .. } => "GET /guilds/{guild.id}/threads/search".to_string(),
+            Self::ListChannelThreads { .. } => "GET /channels/{channel.id}/threads".to_string(),
+            Self::SearchChannelMessages { .. } => {
+                "GET /channels/{channel.id}/messages/search".to_string()
+            }
+            Self::GetThread { .. } => "GET /channels/{channel.id}/threads/{thread.id}".to_string(),
+            Self::GetMessageEvents { .. } => {
+                "GET /channels/{channel.id}/messages/{message.id}/events".to_string()
+            }
+            Self::ListPublicArchivedThreads { .. } => {
+                "GET /channels/{channel.id}/threads/archived/public".to_string()
+            }
+            Self::ListPrivateArchivedThreads { .. } => {
+                "GET /channels/{channel.id}/threads/archived/private".to_string()
+            }
+            Self::ListJoinedPrivateArchivedThreads { .. } => {
+                "GET /channels/{channel.id}/users/@me/threads/archived/private".to_string()
+            }
+            Self::GetReactions { .. } => {
+                "GET /channels/{channel.id}/messages/{message.id}/reactions/{emoji}".to_string()
+            }
         }
     }
 
@@ -109,6 +206,65 @@ impl DiscordRequest {
                 snowflake(message_id)?
             ),
             Self::ListUserDmChannels => "/users/@me/channels".to_string(),
+            Self::GetOwnGuildMember { guild_id } => {
+                format!("/users/@me/guilds/{}/member", snowflake(guild_id)?)
+            }
+            Self::SearchGuildThreads { guild_id, .. } => {
+                format!("/guilds/{}/threads/search", snowflake(guild_id)?)
+            }
+            Self::ListChannelThreads { channel_id, .. } => {
+                format!("/channels/{}/threads", snowflake(channel_id)?)
+            }
+            Self::SearchChannelMessages { channel_id, .. } => {
+                format!("/channels/{}/messages/search", snowflake(channel_id)?)
+            }
+            Self::GetThread { thread_id } => {
+                format!(
+                    "/channels/{}/threads/{}",
+                    snowflake(thread_id)?,
+                    snowflake(thread_id)?
+                )
+            }
+            Self::GetMessageEvents {
+                channel_id,
+                message_id,
+            } => format!(
+                "/channels/{}/messages/{}/events",
+                snowflake(channel_id)?,
+                snowflake(message_id)?
+            ),
+            Self::ListPublicArchivedThreads { channel_id, .. } => {
+                format!(
+                    "/channels/{}/threads/archived/public",
+                    snowflake(channel_id)?
+                )
+            }
+            Self::ListPrivateArchivedThreads { channel_id, .. } => {
+                format!(
+                    "/channels/{}/threads/archived/private",
+                    snowflake(channel_id)?
+                )
+            }
+            Self::ListJoinedPrivateArchivedThreads { channel_id, .. } => {
+                format!(
+                    "/channels/{}/users/@me/threads/archived/private",
+                    snowflake(channel_id)?
+                )
+            }
+            Self::GetReactions {
+                channel_id,
+                message_id,
+                emoji,
+                ..
+            } => {
+                let emoji = percent_encode(emoji)?;
+                format!(
+                    "/channels/{}/messages/{}/reactions/{}",
+                    snowflake(channel_id)?,
+                    snowflake(message_id)?,
+                    emoji
+                )
+            }
         };
         Ok(path)
     }
@@ -138,10 +294,90 @@ impl DiscordRequest {
                 push_opt(&mut q, "after", after);
                 push_opt(&mut q, "around", around);
             }
+            Self::SearchGuildThreads { .. } | Self::ListChannelThreads { .. } => {
+                let (archived, joined, sort_by, sort_order, limit, before) = match self {
+                    Self::SearchGuildThreads {
+                        archived,
+                        joined,
+                        sort_by,
+                        sort_order,
+                        limit,
+                        before,
+                        ..
+                    }
+                    | Self::ListChannelThreads {
+                        archived,
+                        joined,
+                        sort_by,
+                        sort_order,
+                        limit,
+                        before,
+                        ..
+                    } => (archived, joined, sort_by, sort_order, limit, before),
+                    _ => unreachable!(),
+                };
+                if let Some(archived) = archived {
+                    q.push((
+                        "archived".into(),
+                        if *archived { "true" } else { "false" }.into(),
+                    ));
+                }
+                if let Some(joined) = joined {
+                    q.push((
+                        "joined".into(),
+                        if *joined { "true" } else { "false" }.into(),
+                    ));
+                }
+                push_opt(&mut q, "sort_by", sort_by);
+                push_opt(&mut q, "sort_order", sort_order);
+                q.push(("limit".into(), limit.to_string()));
+                push_opt(&mut q, "before", before);
+            }
+            Self::SearchChannelMessages {
+                content,
+                offset,
+                limit,
+                sort_by,
+                sort_order,
+                ..
+            } => {
+                push_opt(&mut q, "content", content);
+                q.push(("offset".into(), offset.to_string()));
+                q.push(("limit".into(), limit.to_string()));
+                push_opt(&mut q, "sort_by", sort_by);
+                push_opt(&mut q, "sort_order", sort_order);
+            }
+            Self::ListPublicArchivedThreads { before, limit, .. }
+            | Self::ListPrivateArchivedThreads { before, limit, .. }
+            | Self::ListJoinedPrivateArchivedThreads { before, limit, .. } => {
+                push_opt(&mut q, "before", before);
+                q.push(("limit".into(), limit.to_string()));
+            }
+            Self::GetReactions { limit, .. } => {
+                q.push(("limit".into(), limit.to_string()));
+            }
             _ => {}
         }
         q
     }
+}
+
+/// Percent-encode an emoji/character marker for use in a reaction path
+/// segment. Only unreserved URI characters pass through unchanged.
+fn percent_encode(value: &str) -> Result<String, DiscordError> {
+    if value.is_empty() || value.len() > 64 {
+        return Err(DiscordError::InvalidIdentifier(value.to_string()));
+    }
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    Ok(out)
 }
 
 fn push_opt(q: &mut Vec<(String, String)>, key: &str, value: &Option<String>) {
@@ -194,6 +430,63 @@ mod tests {
                 message_id: "3".into(),
             },
             DiscordRequest::ListUserDmChannels,
+            DiscordRequest::GetOwnGuildMember {
+                guild_id: "1".into(),
+            },
+            DiscordRequest::SearchGuildThreads {
+                guild_id: "1".into(),
+                archived: Some(true),
+                joined: Some(true),
+                sort_by: Some("last_message_time".into()),
+                sort_order: Some("desc".into()),
+                limit: 50,
+                before: Some("3".into()),
+            },
+            DiscordRequest::ListChannelThreads {
+                channel_id: "2".into(),
+                archived: None,
+                joined: None,
+                sort_by: None,
+                sort_order: None,
+                limit: 50,
+                before: None,
+            },
+            DiscordRequest::SearchChannelMessages {
+                channel_id: "2".into(),
+                content: Some("hello".into()),
+                offset: 0,
+                limit: 25,
+                sort_by: None,
+                sort_order: None,
+            },
+            DiscordRequest::GetThread {
+                thread_id: "5".into(),
+            },
+            DiscordRequest::GetMessageEvents {
+                channel_id: "2".into(),
+                message_id: "3".into(),
+            },
+            DiscordRequest::ListPublicArchivedThreads {
+                channel_id: "2".into(),
+                before: None,
+                limit: 50,
+            },
+            DiscordRequest::ListPrivateArchivedThreads {
+                channel_id: "2".into(),
+                before: None,
+                limit: 50,
+            },
+            DiscordRequest::ListJoinedPrivateArchivedThreads {
+                channel_id: "2".into(),
+                before: None,
+                limit: 50,
+            },
+            DiscordRequest::GetReactions {
+                channel_id: "2".into(),
+                message_id: "3".into(),
+                emoji: "😀".into(),
+                limit: 25,
+            },
         ]
     }
 

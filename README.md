@@ -230,18 +230,32 @@ unit は `NoNewPrivileges` / `PrivateTmp` / `ProtectSystem=strict` / `ProtectHom
 
 | tool | 引数 | 概要 |
 | --- | --- | --- |
+| `get_me` | — | 自分の ID / ユーザー名 (`{"me":{...}}`) |
+| `get_capabilities` | — | 認証方式ごとの対応可否・制約の一覧 |
 | `list_guilds` | — | 参加中サーバーの列挙 `{"guilds":[{"id","name"}]}` |
-| `list_channels` | `guild_id` | チャンネル列挙 (id / name / type / parent_id / topic / guild_id) |
+| `list_channels` | `guild_id` | チャンネル列挙 (id / name / kind / parent_id / topic / guild_id / last_message_id / last_activity_at) |
 | `list_dms` | — | DM / Group DM の列挙 (channel_id / participants / last_message_id) |
+| `list_changed_channels` | `guild_id?`, `limit=50`, `cursor?` | 最終投稿 ID が前回同期より新しいチャンネルのみ |
 | `recent_messages` | `channel_id`, `limit=50` (1..=100) | 最近のメッセージ取得 |
 | `messages_before` | `channel_id`, `before_message_id`, `limit=50` | 過去方向ページング |
-| `get_message` | `channel_id`, `message_id` | メッセージ 1 件 |
+| `messages_after` | `channel_id`, `after_message_id`, `limit=50` | 差分取得 (前回以降の新着) |
+| `get_message` | `channel_id`, `message_id` | メッセージ 1 件 (返信先を可能な限り解決して内包) |
 | `message_context` | `channel_id`, `message_id`, `before=20`, `after=20` (各 0..=50) | 指定メッセージと前後の会話 |
-| `search_messages` | `query`, `guild_id?`, `channel_id?`, `author_id?`, `after?`, `before?`, `limit=50`, `refresh?` | SQLite FTS5 による全文検索 |
+| `get_message_raw` | `channel_id`, `message_id` | 元 API レスポンスの原文 + 正規化結果 (空本文調査用) |
+| `get_attachment` | `channel_id`, `message_id` | 添付ファイルのメタデータと取得 URL |
+| `get_message_events` | `channel_id`, `message_id` | メッセージに紐づく予定イベント |
+| `list_mentions` | `guild_id?`, `channel_id?`, `after?`, `before?`, `limit=100`, `refresh?` | 自分宛てメンション受信箱 (direct / reply / role / everyone を区別) |
+| `list_replies` | 同上 | 自分への返信の一覧 |
+| `search_messages` | `query`, `guild_id?`, `channel_id?`, `author_id?`, `after?`, `before?`, `limit=50`, `refresh?`, `next_cursor?` | SQLite FTS5 による全文検索 (キャッシュ対象) |
+| `search_server_side` | `query`, `channel_id`, `offset`, `limit`, `sort?`, `sort_order?`, `next_cursor?` | Discord 検索 (user account ではチャンネル限定) |
 | `read_thread` | `thread_id`, `limit=100` | スレッド読み取り |
-| `list_threads` | `guild_id` | アクティブスレッド列挙 |
+| `list_threads` | `guild_id?`, `channel_id?`, `filter?` (active/archived/joined/all), `limit=50`, `cursor?` | スレッド列挙 (アクティブ / アーカイブ / 参加済み) |
+| `get_member` | `guild_id`, `user_id?` | サーバー内の自分の member / roles |
+| `get_sync_status` | — | チャンネル別の同期位置・確認範囲・キャッシュ状態 |
+| `start_sync` | `scope?`, `guild_id?`, `channel_ids?` | 差分同期ジョブの開始 (新着チャンネルのみ巡回) |
+| `get_sync_progress` | `job_id` | 同期ジョブの進捗 (成功 / 失敗 / 次カーソル) |
 
-メッセージの正規化スキーマ:
+メッセージの正規化スキーマ (v2):
 
 ```json
 {
@@ -251,18 +265,38 @@ unit は `NoNewPrivileges` / `PrivateTmp` / `ProtectSystem=strict` / `ProtectHom
   "author": {"id": "111", "name": "example"},
   "timestamp": "2026-10-05T00:00:00.000000+00:00",
   "edited_timestamp": null,
+  "message_type": 19,
   "content": "message",
-  "reply_to": "42",
+  "content_kind": "text",
+  "mentions": [{"id": "222", "name": "bob"}],
+  "mention_roles": ["333"],
+  "mention_everyone": false,
+  "reply_to": {"message_id": "42", "status": "resolved", "referenced": {"id": "42", "content": "...", "author": {"id": "111", "name": "example"}}},
+  "thread": {"id": "789", "name": "...", "parent_id": "456", "archived": false},
   "attachments": [
     {"filename": "notes.txt", "url": "https://cdn.discordapp.com/...", "content_type": "text/plain", "size": 12345}
   ],
   "embeds": [
     {"title": "title", "description": "desc", "url": "https://..."}
-  ]
+  ],
+  "reactions": [{"name": "👍", "count": 2}],
+  "pinned": false
 }
 ```
 
-添付はファイル名・URL・content type・サイズのみ、Embed はテキストのみ抽出します。
+フィールドの意味と欠損理由:
+
+- `content` は Discord の本文そのまま。空文字は「本当にテキストが無い」場合のみ。
+- `content_kind` は空本文の理由: `text` / `empty` / `attachment_only` /
+  `embed_only` / `system` / `forwarded` / `unknown` (正規化前の原文が非文字列)。
+- `reply_to` は非返信なら `null`。返信なら `status` で参照先の状態を返す:
+  `resolved` (本文を内包) / `deleted` / `forbidden` / `unknown` (未取得)。
+- `mentions` / `mention_roles` / `mention_everyone` は API のまま。ロール名の
+  解決は `get_member` や `list_mentions` の `matched_role_ids` を使う。
+- 添付はメタデータ + URL のみ。ファイル本体の取得は `get_attachment`。
+
+すべての一覧・検索・履歴取得は `next_cursor` / `has_more` を返し、取得した
+確認範囲は `covered_from` / `covered_to` / `has_gaps` で明示します。
 
 ### 受け入れテストの流れ
 
@@ -273,6 +307,42 @@ unit は `NoNewPrivileges` / `PrivateTmp` / `ProtectSystem=strict` / `ProtectHom
 「展軸祭について話していたメッセージを探して」 → search_messages
 「その発言の前後20件を読んで」       → message_context
 ```
+
+### 受け入れ基準 (自分宛て受信箱・差分同期)
+
+1. **未取得サーバーの自分宛てメンションを発見** — `list_mentions`
+   (`refresh: true`) が新着チャンネルだけ取得し、`matched_by: "direct"` を返す。
+2. **返信先を取得** — `list_replies` / `get_message` が
+   `message.reply_to.referenced` に参照先本文と投稿者を内包し、削除済み・
+   権限不足・未取得は `reply_to.status` で区別する。
+3. **ロールメンションの本人適用を判定** — `get_member` のロール一覧と
+   `matched_by: "role"` の `matched_role_ids` を突き合わせて判定できる。
+4. **再起動後に続きから同期** — `messages_after` / `start_sync` が保存済み
+   カーソル (`get_sync_status` の `last_synced_message_id`) から再開する。
+5. **編集・削除・取得不能を新着なしと区別** — 編集は `edited_timestamp`、
+   削除は tombstone (`get_sync_status` の `deletions_observed`)、取得失敗は
+   `channels_failed` の構造化エラーで返り、「新着なし」と混同されない。
+6. **確認済み範囲を数値で提示** — `coverage` の `covered_from` / `covered_to`
+   / `has_gaps` と `get_sync_status` の `cached_messages` / `channels_tracked`。
+
+読むだけの操作では Discord の既読状態が変わらないことは read-only 保証
+(GET のみ・ack API なし) で担保しています。
+
+### 空本文の診断手順
+
+取得は成功したのに `content` が空、という場合の切り分け:
+
+1. 同じメッセージ ID で `get_message_raw` を呼ぶ。`raw` が Discord の
+   元レスポンス、`normalized` が MCP 返却、Discord 画面と三者照合できる。
+2. `raw.content` が本当に空で `fields_present` に `attachments` / `embeds` /
+   `message_snapshots` / `type` があれば、正当なシステム投稿・転送・
+   添付のみの可能性が高い (`content_kind` が `system` / `forwarded` /
+   `attachment_only` / `embed_only` になる)。
+3. `raw.content` に本文があるのに `normalized.content` が空なら正規化の欠落。
+   この場合は不具合として報告してください。
+4. `raw` 自体が取れない (403 / 20002 / transport) なら取得失敗であり、
+   空本文として扱ってはいけない。`error_source` / `discord_code` /
+   `retryable` が原因を返す。
 
 ---
 

@@ -77,12 +77,18 @@ pub fn escape_fts_query(raw: &str) -> String {
 }
 
 const SELECT_COLUMNS: &str = "m.id, m.channel_id, m.guild_id, m.author_id, m.timestamp,
-        m.edited_timestamp, m.content, u.username, u.global_name";
+        m.edited_timestamp, m.content, u.username, u.global_name,
+        m.message_json, m.fetched_at";
+
+// column order must match `row_to_message`: 0..7 base, 7 username, 8 global_name,
+// 9 message_json, 10 fetched_at.
 
 fn row_to_hit(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchHit> {
+    // `SELECT_COLUMNS` yields 11 columns (indices 0-10); the search queries
+    // append the rank as the 12th column (index 11).
     // SQLite FTS5 `bm25()` is "lower is better" (usually negative); flip the
     // sign so callers see "higher is better".
-    let bm25: f64 = row.get(9)?;
+    let bm25: f64 = row.get(11)?;
     Ok(SearchHit {
         message: row_to_message(row)?,
         relevance: -bm25,
@@ -211,15 +217,11 @@ mod tests {
             author: Some(User {
                 id: "7".into(),
                 username: Some("alice".into()),
-                global_name: None,
-                bot: None,
+                ..User::default()
             }),
             content: content.into(),
             timestamp: "2026-10-05T00:00:00.000000+00:00".into(),
-            edited_timestamp: None,
-            attachments: vec![],
-            embeds: vec![],
-            message_reference: None,
+            ..Message::default()
         }
     }
 

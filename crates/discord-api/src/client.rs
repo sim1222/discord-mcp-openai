@@ -16,6 +16,7 @@ use tracing::{debug, instrument};
 
 use crate::{
     endpoints::{DiscordRequest, API_BASE, READ_ONLY_METHOD},
+    error::{ApiError, ClientMetrics},
     rate_limit::{RateLimitError, RateLimiter, DEFAULT_MAX_CONCURRENT_REQUESTS},
 };
 
@@ -119,6 +120,7 @@ pub struct DiscordClient {
     token_kind: TokenKind,
     base: String,
     rate: RateLimiter,
+    metrics: ClientMetrics,
 }
 
 impl fmt::Debug for DiscordClient {
@@ -162,7 +164,13 @@ impl DiscordClient {
             token_kind,
             base,
             rate: RateLimiter::new(max_concurrent_requests),
+            metrics: ClientMetrics::default(),
         })
+    }
+
+    /// Request / rate-limit counters for diagnostics and tool output.
+    pub fn metrics(&self) -> &ClientMetrics {
+        &self.metrics
     }
 
     /// Value of the `Authorization` header. Kept private so the credential
@@ -191,6 +199,7 @@ impl DiscordClient {
             let _guard = self.rate.acquire(&bucket).await?;
 
             debug!(attempt, "dispatching read-only discord request");
+            self.metrics.record_request();
             let response = self
                 .http
                 .get(&url)
@@ -214,6 +223,7 @@ impl DiscordClient {
                 if wait > Duration::from_secs(60) {
                     return Err(DiscordError::RateLimited);
                 }
+                self.metrics.record_wait(&bucket, wait);
                 sleep(wait).await;
                 continue;
             }
@@ -238,6 +248,15 @@ impl DiscordClient {
         } else {
             Err(DiscordError::Transport("request attempts exhausted".into()))
         }
+    }
+
+    /// Execute and, on failure, return a structured [`ApiError`] with the
+    /// request's operation (`bucket_key`) attached.
+    #[allow(clippy::result_large_err)]
+    pub async fn execute_for(&self, req: &DiscordRequest) -> Result<Value, ApiError> {
+        self.execute(req.clone())
+            .await
+            .map_err(|error| ApiError::from_discord_error(&error, Some(req.bucket_key())))
     }
 }
 

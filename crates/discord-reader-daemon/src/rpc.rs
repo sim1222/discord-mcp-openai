@@ -146,6 +146,120 @@ pub struct SearchParams {
     /// network traffic.
     #[serde(default)]
     pub refresh: bool,
+    /// Offset into server-side search results (`search_server_side` only).
+    #[serde(default)]
+    pub offset: u32,
+    /// Resume cursor returned by a previous `search_server_side` call.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    /// Server-side sort: `timestamp` or `relevance`.
+    #[serde(default)]
+    pub sort: Option<String>,
+    /// `desc` (newest first) or `asc`.
+    #[serde(default)]
+    pub sort_order: Option<String>,
+}
+
+/// Filters for `list_mentions` / `list_replies`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct InboxFilter {
+    #[serde(default)]
+    pub guild_id: Option<String>,
+    #[serde(default)]
+    pub channel_id: Option<String>,
+    /// ISO-8601 lower bound on message timestamp.
+    #[serde(default)]
+    pub after: Option<String>,
+    /// ISO-8601 upper bound on message timestamp.
+    #[serde(default)]
+    pub before: Option<String>,
+    #[serde(default = "default_limit")]
+    pub limit: u32,
+    /// When true, refresh targeted channels from Discord first.
+    #[serde(default)]
+    pub refresh: bool,
+    /// Server-side search cursor (`search_server_side` integration).
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+}
+
+/// Parameters for `messages_after`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AfterParams {
+    pub channel_id: String,
+    /// Return messages newer than this message id (exclusive).
+    pub after_message_id: String,
+    #[serde(default = "default_limit")]
+    pub limit: u32,
+}
+
+/// Parameters for `list_changed_channels`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ChangedChannelsParams {
+    #[serde(default)]
+    pub guild_id: Option<String>,
+    #[serde(default = "default_limit")]
+    pub limit: u32,
+    /// Resume cursor from a previous call.
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+/// Parameters for `get_message_raw`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MessageParams2 {
+    pub channel_id: String,
+    pub message_id: String,
+}
+
+/// Parameters for `get_message_events`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MessageEventsParams {
+    pub channel_id: String,
+    pub message_id: String,
+}
+
+/// Parameters for `get_member`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemberParams {
+    pub guild_id: String,
+    #[serde(default)]
+    pub user_id: Option<String>,
+}
+
+/// Parameters for `list_threads`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ThreadsParams {
+    pub guild_id: Option<String>,
+    #[serde(default)]
+    pub channel_id: Option<String>,
+    /// `active`, `archived`, `joined` or `all`.
+    #[serde(default)]
+    pub filter: Option<String>,
+    #[serde(default)]
+    pub include_archived: Option<bool>,
+    #[serde(default = "default_limit")]
+    pub limit: u32,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+/// Parameters for `start_sync`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SyncStartParams {
+    /// `mentions`, `replies`, `changed_channels` or `all`.
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub guild_id: Option<String>,
+    #[serde(default)]
+    pub channel_ids: Option<Vec<String>>,
+}
+
+/// Parameters for `get_sync_progress`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SyncProgressParams {
+    pub job_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -176,16 +290,31 @@ fn default_context_window() -> u32 {
 #[async_trait::async_trait]
 pub trait ReaderApi: Send + Sync {
     async fn ping(&self) -> Result<Value, RpcError>;
+    async fn get_me(&self) -> Result<Value, RpcError>;
+    async fn get_capabilities(&self) -> Result<Value, RpcError>;
     async fn list_guilds(&self) -> Result<Value, RpcError>;
     async fn list_channels(&self, params: GuildIdParams) -> Result<Value, RpcError>;
+    async fn list_dms(&self) -> Result<Value, RpcError>;
     async fn recent_messages(&self, params: ChannelParams) -> Result<Value, RpcError>;
     async fn messages_before(&self, params: BeforeParams) -> Result<Value, RpcError>;
+    async fn messages_after(&self, params: AfterParams) -> Result<Value, RpcError>;
     async fn get_message(&self, params: MessageParams) -> Result<Value, RpcError>;
+    async fn get_message_raw(&self, params: MessageParams) -> Result<Value, RpcError>;
     async fn message_context(&self, params: ContextParams) -> Result<Value, RpcError>;
     async fn search_messages(&self, params: SearchParams) -> Result<Value, RpcError>;
+    async fn search_server_side(&self, params: SearchParams) -> Result<Value, RpcError>;
+    async fn list_mentions(&self, params: InboxFilter) -> Result<Value, RpcError>;
+    async fn list_replies(&self, params: InboxFilter) -> Result<Value, RpcError>;
     async fn read_thread(&self, params: ThreadParams) -> Result<Value, RpcError>;
-    async fn list_threads(&self, params: GuildIdParams) -> Result<Value, RpcError>;
-    async fn list_dms(&self) -> Result<Value, RpcError>;
+    async fn list_threads(&self, params: ThreadsParams) -> Result<Value, RpcError>;
+    async fn list_changed_channels(&self, params: ChangedChannelsParams)
+        -> Result<Value, RpcError>;
+    async fn get_sync_status(&self) -> Result<Value, RpcError>;
+    async fn start_sync(&self, params: SyncStartParams) -> Result<Value, RpcError>;
+    async fn get_sync_progress(&self, params: SyncProgressParams) -> Result<Value, RpcError>;
+    async fn get_member(&self, params: MemberParams) -> Result<Value, RpcError>;
+    async fn get_message_events(&self, params: MessageEventsParams) -> Result<Value, RpcError>;
+    async fn get_attachment(&self, params: MessageParams) -> Result<Value, RpcError>;
 }
 
 /* -------------------------------- dispatch -------------------------------- */
@@ -222,11 +351,14 @@ pub async fn dispatch(api: &dyn ReaderApi, request: RpcRequest) -> Option<RpcRes
     let outcome: Result<Value, RpcError> = async {
         match method.as_str() {
             "ping" => api.ping().await,
+            "get_me" => api.get_me().await,
+            "get_capabilities" => api.get_capabilities().await,
             "list_guilds" => api.list_guilds().await,
             "list_channels" => {
                 let p: GuildIdParams = parse(&params)?;
                 api.list_channels(p).await
             }
+            "list_dms" => api.list_dms().await,
             "recent_messages" => {
                 let p: ChannelParams = parse(&params)?;
                 check_limit(p.limit, 100)?;
@@ -237,9 +369,18 @@ pub async fn dispatch(api: &dyn ReaderApi, request: RpcRequest) -> Option<RpcRes
                 check_limit(p.limit, 100)?;
                 api.messages_before(p).await
             }
+            "messages_after" => {
+                let p: AfterParams = parse(&params)?;
+                check_limit(p.limit, 100)?;
+                api.messages_after(p).await
+            }
             "get_message" => {
                 let p: MessageParams = parse(&params)?;
                 api.get_message(p).await
+            }
+            "get_message_raw" => {
+                let p: MessageParams = parse(&params)?;
+                api.get_message_raw(p).await
             }
             "message_context" => {
                 let p: ContextParams = parse(&params)?;
@@ -252,16 +393,57 @@ pub async fn dispatch(api: &dyn ReaderApi, request: RpcRequest) -> Option<RpcRes
                 check_limit(p.limit, 200)?;
                 api.search_messages(p).await
             }
+            "search_server_side" => {
+                let p: SearchParams = parse(&params)?;
+                check_limit(p.limit, 25)?;
+                api.search_server_side(p).await
+            }
+            "list_mentions" => {
+                let p: InboxFilter = parse(&params)?;
+                check_limit(p.limit, 100)?;
+                api.list_mentions(p).await
+            }
+            "list_replies" => {
+                let p: InboxFilter = parse(&params)?;
+                check_limit(p.limit, 100)?;
+                api.list_replies(p).await
+            }
             "read_thread" => {
                 let p: ThreadParams = parse(&params)?;
                 check_limit(p.limit, 100)?;
                 api.read_thread(p).await
             }
             "list_threads" => {
-                let p: GuildIdParams = parse(&params)?;
+                let p: ThreadsParams = parse(&params)?;
+                check_limit(p.limit, 100)?;
                 api.list_threads(p).await
             }
-            "list_dms" => api.list_dms().await,
+            "list_changed_channels" => {
+                let p: ChangedChannelsParams = parse(&params)?;
+                check_limit(p.limit, 100)?;
+                api.list_changed_channels(p).await
+            }
+            "get_sync_status" => api.get_sync_status().await,
+            "start_sync" => {
+                let p: SyncStartParams = parse(&params)?;
+                api.start_sync(p).await
+            }
+            "get_sync_progress" => {
+                let p: SyncProgressParams = parse(&params)?;
+                api.get_sync_progress(p).await
+            }
+            "get_member" => {
+                let p: MemberParams = parse(&params)?;
+                api.get_member(p).await
+            }
+            "get_message_events" => {
+                let p: MessageEventsParams = parse(&params)?;
+                api.get_message_events(p).await
+            }
+            "get_attachment" => {
+                let p: MessageParams = parse(&params)?;
+                api.get_attachment(p).await
+            }
             other => Err(RpcError::method_not_found(other)),
         }
     }
@@ -366,11 +548,20 @@ mod tests {
         async fn ping(&self) -> Result<Value, RpcError> {
             Ok(json!({"ok": true}))
         }
+        async fn get_me(&self) -> Result<Value, RpcError> {
+            Ok(json!({"me": null}))
+        }
+        async fn get_capabilities(&self) -> Result<Value, RpcError> {
+            Ok(json!({}))
+        }
         async fn list_guilds(&self) -> Result<Value, RpcError> {
             Ok(json!({"guilds": [{"id": "1", "name": "ZENVR"}]}))
         }
         async fn list_channels(&self, _p: GuildIdParams) -> Result<Value, RpcError> {
             Ok(json!({"channels": []}))
+        }
+        async fn list_dms(&self) -> Result<Value, RpcError> {
+            Ok(json!({"dms": []}))
         }
         async fn recent_messages(&self, p: ChannelParams) -> Result<Value, RpcError> {
             Ok(json!({"messages": [], "channel_id": p.channel_id, "limit": p.limit}))
@@ -378,7 +569,13 @@ mod tests {
         async fn messages_before(&self, _p: BeforeParams) -> Result<Value, RpcError> {
             Ok(json!({"messages": []}))
         }
+        async fn messages_after(&self, _p: AfterParams) -> Result<Value, RpcError> {
+            Ok(json!({"messages": []}))
+        }
         async fn get_message(&self, _p: MessageParams) -> Result<Value, RpcError> {
+            Ok(json!({"message": null}))
+        }
+        async fn get_message_raw(&self, _p: MessageParams) -> Result<Value, RpcError> {
             Ok(json!({"message": null}))
         }
         async fn message_context(&self, _p: ContextParams) -> Result<Value, RpcError> {
@@ -387,14 +584,44 @@ mod tests {
         async fn search_messages(&self, _p: SearchParams) -> Result<Value, RpcError> {
             Ok(json!({"results": [], "source": "local"}))
         }
+        async fn search_server_side(&self, _p: SearchParams) -> Result<Value, RpcError> {
+            Ok(json!({"results": []}))
+        }
+        async fn list_mentions(&self, _p: InboxFilter) -> Result<Value, RpcError> {
+            Ok(json!({"mentions": []}))
+        }
+        async fn list_replies(&self, _p: InboxFilter) -> Result<Value, RpcError> {
+            Ok(json!({"replies": []}))
+        }
         async fn read_thread(&self, _p: ThreadParams) -> Result<Value, RpcError> {
             Ok(json!({"thread": null, "messages": []}))
         }
-        async fn list_threads(&self, _p: GuildIdParams) -> Result<Value, RpcError> {
+        async fn list_threads(&self, _p: ThreadsParams) -> Result<Value, RpcError> {
             Ok(json!({"threads": []}))
         }
-        async fn list_dms(&self) -> Result<Value, RpcError> {
-            Ok(json!({"dms": []}))
+        async fn list_changed_channels(
+            &self,
+            _p: ChangedChannelsParams,
+        ) -> Result<Value, RpcError> {
+            Ok(json!({"changed_channels": []}))
+        }
+        async fn get_sync_status(&self) -> Result<Value, RpcError> {
+            Ok(json!({}))
+        }
+        async fn start_sync(&self, _p: SyncStartParams) -> Result<Value, RpcError> {
+            Ok(json!({"job_id": "1"}))
+        }
+        async fn get_sync_progress(&self, _p: SyncProgressParams) -> Result<Value, RpcError> {
+            Ok(json!({"progress": null}))
+        }
+        async fn get_member(&self, _p: MemberParams) -> Result<Value, RpcError> {
+            Ok(json!({"member": null}))
+        }
+        async fn get_message_events(&self, _p: MessageEventsParams) -> Result<Value, RpcError> {
+            Ok(json!({"events": []}))
+        }
+        async fn get_attachment(&self, _p: MessageParams) -> Result<Value, RpcError> {
+            Ok(json!({"attachments": []}))
         }
     }
 

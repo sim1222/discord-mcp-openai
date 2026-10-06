@@ -19,10 +19,21 @@ pub struct ReadThreadArgs {
 }
 
 /// Arguments for `list_threads`.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct ListThreadsArgs {
-    /// Guild (server) ID to list active threads for.
-    pub guild_id: String,
+    /// Guild (server) ID to list threads for (whole-guild scope).
+    pub guild_id: Option<String>,
+    /// Parent channel ID to list threads for (channel scope; covers forum
+    /// posts and archived threads of that channel). Required when `guild_id`
+    /// is omitted.
+    pub channel_id: Option<String>,
+    /// Which threads: `active`, `archived`, `joined`, or `all`. Defaults to
+    /// `all` (active plus archived).
+    pub filter: Option<String>,
+    /// How many threads to return, 1-100. Defaults to 50.
+    pub limit: Option<u32>,
+    /// Resume cursor from a previous call's `next_cursor`.
+    pub cursor: Option<String>,
 }
 
 #[tool_router(vis = "pub(crate)", router = threads_router)]
@@ -45,17 +56,33 @@ impl DiscordReaderTools {
         .await
     }
 
-    /// List the active threads of a guild.
+    /// List threads of a guild or of one parent channel, paged.
     ///
-    /// Returns JSON: `{"threads": [{"id", "guild_id", "name", "type",
-    /// "parent_id", "topic"}]}`. Only threads currently active are listed;
-    /// read a specific one with `read_thread`.
+    /// Returns JSON: `{"threads": [{"id", "guild_id", "name", "kind",
+    /// "parent_id", "topic", "archived", "locked", "last_message_id",
+    /// "message_count", "member_count"}], "next_cursor": ..., "has_more":
+    /// bool}`. Covers active, archived and (with `filter: "joined"`) joined
+    /// threads — including forum posts, which are threads and are not visible
+    /// from the parent channel's message list alone. Give `channel_id` to
+    /// scope to one parent channel (this is the reliable path under a user
+    /// account), or `guild_id` for a whole-guild listing. Thread IDs are taken
+    /// from Discord's response; never guess them from message IDs.
     #[tool(name = "list_threads")]
     pub async fn list_threads(
         &self,
         Parameters(args): Parameters<ListThreadsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.call_tool("list_threads", json!({"guild_id": args.guild_id}))
-            .await
+        let limit = limit_or(args.limit, 50, 100)?;
+        self.call_tool(
+            "list_threads",
+            json!({
+                "guild_id": args.guild_id,
+                "channel_id": args.channel_id,
+                "filter": args.filter,
+                "limit": limit,
+                "cursor": args.cursor,
+            }),
+        )
+        .await
     }
 }

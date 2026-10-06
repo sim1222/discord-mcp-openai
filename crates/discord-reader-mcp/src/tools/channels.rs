@@ -20,11 +20,14 @@ pub struct ListChannelsArgs {
 impl DiscordReaderTools {
     /// List the channels of one Discord server.
     ///
-    /// Returns JSON: `{"channels": [{"id", "guild_id", "name", "type",
-    /// "parent_id", "topic"}]}` sorted with categories first. `type` is the
-    /// Discord channel type integer (0 text, 2 voice, 4 category, 5
-    /// announcement, 15 forum, ...). Use a channel `id` with
-    /// `recent_messages`.
+    /// Returns JSON: `{"channels": [{"id", "guild_id", "name", "kind",
+    /// "parent_id", "topic", "last_message_id", "last_activity_at"}]}` sorted
+    /// with categories first. `kind` is the Discord channel type integer (0
+    /// text, 2 voice, 4 category, 5 announcement, 15 forum, ...).
+    /// `last_message_id` is Discord's latest message snowflake and
+    /// `last_activity_at` our timestamp for it when known: together with
+    /// `list_changed_channels` they let you skip quiet channels instead of
+    /// re-reading every one.
     #[tool(name = "list_channels")]
     pub async fn list_channels(
         &self,

@@ -14,8 +14,10 @@
 
 pub mod client;
 pub mod endpoints;
+pub mod error;
 pub mod rate_limit;
 pub mod types;
 
 pub use client::{DiscordClient, DiscordError, SharedDiscordClient, Token, TokenKind};
 pub use endpoints::DiscordRequest;
+pub use error::{ApiError, BucketWait, ClientMetrics, ErrorSource, MetricsSnapshot};

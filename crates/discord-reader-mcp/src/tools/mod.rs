@@ -3,8 +3,11 @@
 
 pub mod channels;
 pub mod guilds;
+pub mod inbox;
 pub mod messages;
+pub mod meta;
 pub mod search;
+pub mod sync;
 pub mod threads;
 
 use std::sync::Arc;
@@ -17,7 +20,7 @@ use rmcp::{
     },
     tool_handler, ErrorData, ServerHandler,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::protocol::{RpcClient, RpcClientError};
 
@@ -34,11 +37,14 @@ impl DiscordReaderTools {
 
     /// Combined router: each tool group lives in its own module.
     pub fn tool_router() -> ToolRouter<Self> {
-        let mut router = Self::guilds_router();
+        let mut router = Self::meta_router();
+        router.merge(Self::guilds_router());
         router.merge(Self::channels_router());
         router.merge(Self::messages_router());
         router.merge(Self::search_router());
+        router.merge(Self::inbox_router());
         router.merge(Self::threads_router());
+        router.merge(Self::sync_router());
         router
     }
 
@@ -66,7 +72,11 @@ impl ServerHandler for DiscordReaderTools {
         info.instructions = Some(
             "Read-only view of Discord servers, channels, messages, threads and DMs. \
              Data is fetched on demand and cached locally; full-text search covers \
-             messages already fetched. This server cannot write to Discord."
+             messages already fetched. Cross-server inbox tools (list_mentions, \
+             list_replies) report the checked range so empty results are meaningful, \
+             and every listing carries next_cursor/has_more and coverage info. \
+             get_capabilities reports what works under the current credential kind. \
+             This server cannot write to Discord and never marks anything read."
                 .to_string(),
         );
         info
@@ -90,7 +100,27 @@ pub(crate) fn json_result(value: &Value) -> Result<CallToolResult, ErrorData> {
 }
 
 /// Render a daemon-side failure as a visible tool error.
+///
+/// When the daemon returned a structured error (JSON-encoded `message` with
+/// `error`/`context` fields: `error_source`, `code`, `http_status`,
+/// `discord_code`, `retryable`, `retry_after_ms`, `operation`), it is passed
+/// through verbatim so callers can decide mechanically whether to retry and
+/// what failed, instead of parsing prose. Failures are never rendered as empty
+/// results: an error is an error, not "nothing there".
 pub(crate) fn remote_error(error: RpcClientError) -> CallToolResult {
+    if let RpcClientError::Remote { code, message } = &error {
+        if let Ok(parsed) = serde_json::from_str::<Value>(message) {
+            if parsed.get("error").is_some() {
+                let text = serde_json::to_string_pretty(&json!({
+                    "error": parsed["error"],
+                    "context": parsed.get("context").cloned().unwrap_or(Value::Null),
+                    "rpc_code": code,
+                }))
+                .unwrap_or_else(|_| message.clone());
+                return CallToolResult::error(vec![ContentBlock::text(text)]);
+            }
+        }
+    }
     CallToolResult::error(vec![ContentBlock::text(format!(
         "discord-reader-daemon error: {error}"
     ))])
@@ -139,16 +169,30 @@ mod tests {
             .collect();
         names.sort();
         let mut expected = [
+            "get_me",
+            "get_capabilities",
             "list_guilds",
             "list_channels",
             "list_dms",
+            "list_changed_channels",
             "recent_messages",
             "messages_before",
+            "messages_after",
             "get_message",
+            "get_message_raw",
             "message_context",
+            "get_attachment",
+            "get_message_events",
+            "list_mentions",
+            "list_replies",
             "search_messages",
+            "search_server_side",
             "read_thread",
             "list_threads",
+            "get_member",
+            "get_sync_status",
+            "start_sync",
+            "get_sync_progress",
         ]
         .map(str::to_string)
         .to_vec();
