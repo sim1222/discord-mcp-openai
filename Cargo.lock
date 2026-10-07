@@ -297,8 +297,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "discord-api",
  "discord-store",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

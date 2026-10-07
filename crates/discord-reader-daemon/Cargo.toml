@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+chrono = { workspace = true }
 async-trait = "0.1"
 discord-api = { path = "../discord-api" }
 discord-store = { path = "../discord-store" }
@@ -28,3 +29,4 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+rusqlite = { workspace = true }

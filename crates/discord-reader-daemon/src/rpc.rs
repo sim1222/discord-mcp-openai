@@ -21,6 +21,8 @@ use tokio::net::{UnixListener, UnixStream};
 /// Maximum accepted RPC request line (1 MiB).
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 
+pub(crate) const CACHE_ERROR: i64 = -32004;
+
 /// Socket file mode: owner + group read/write only.
 #[cfg(unix)]
 pub const SOCKET_MODE: u32 = 0o660;
@@ -38,6 +40,8 @@ pub struct RpcRequest {
 pub struct RpcError {
     pub code: i64,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 impl RpcError {
@@ -45,6 +49,7 @@ impl RpcError {
         Self {
             code,
             message: message.into(),
+            data: None,
         }
     }
 
@@ -58,6 +63,23 @@ impl RpcError {
 
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(-32603, message)
+    }
+
+    /// Structured error data, mirrored in `message` for existing daemon clients.
+    pub fn structured(code: i64, data: Value) -> Self {
+        Self {
+            code,
+            message: data.to_string(),
+            data: Some(data),
+        }
+    }
+
+    fn with_operation(mut self, operation: &str) -> Self {
+        if let Some(data) = self.data.as_mut() {
+            data["error"]["operation"] = Value::String(operation.to_string());
+            self.message = data.to_string();
+        }
+        self
     }
 }
 
@@ -451,7 +473,7 @@ pub async fn dispatch(api: &dyn ReaderApi, request: RpcRequest) -> Option<RpcRes
 
     id.map(|id| match outcome {
         Ok(result) => RpcResponse::ok(Some(id), result),
-        Err(error) => RpcResponse::err(Some(id), error),
+        Err(error) => RpcResponse::err(Some(id), error.with_operation(&method)),
     })
 }
 

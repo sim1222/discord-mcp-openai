@@ -660,6 +660,9 @@ pub struct MessageView {
     /// `text`, `empty`, `attachment_only`, `embed_only`, `system`,
     /// `forwarded` or `unknown` — why `content` is what it is.
     pub content_kind: String,
+    /// `requires_refetch` for legacy/incomplete cache rows; `available` for API metadata.
+    #[serde(default = "available_metadata")]
+    pub metadata_state: String,
     /// `@user` mentions: resolved user ids and names as sent by Discord.
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -702,6 +705,10 @@ pub struct MessageView {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub webhook_id: Option<String>,
+}
+
+fn available_metadata() -> String {
+    "available".to_string()
 }
 
 impl MessageView {
@@ -772,6 +779,7 @@ impl From<&Message> for MessageView {
             message_type: Some(m.kind),
             content: m.content.clone(),
             content_kind: Self::content_kind(m).to_string(),
+            metadata_state: available_metadata(),
             mentions: m
                 .mentions
                 .iter()

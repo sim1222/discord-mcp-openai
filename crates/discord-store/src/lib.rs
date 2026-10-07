@@ -4,6 +4,7 @@
 //! background crawling or backfilling, and the database never stores Discord
 //! credentials.
 
+mod migration;
 pub mod search;
 pub mod sqlite;
 

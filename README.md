@@ -409,6 +409,11 @@ ChatGPT の場合は上記「ChatGPT (Secure MCP Tunnel) セットアップ」�
 ## データベースとキャッシュ
 
 SQLite (`DATABASE_URL`, Docker では `/data/discord.sqlite3`) にキャッシュします。
+
+既存DBは起動時にバックアップを取得してトランザクション内でv2へ移行します。
+旧行のメンション・返信情報は要再取得として区別し、同期範囲は推測しません。
+接続先・バージョン・移行履歴の確認方法と制約は
+[SQLite cache upgrades](docs/database-upgrades.md) を参照してください。
 **credential は保存しません。**
 
 ```sql

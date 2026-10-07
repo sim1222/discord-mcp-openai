@@ -20,6 +20,54 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("search query error: {0}")]
     Search(String),
+    #[error("cache data error: {0}")]
+    Data(String),
+    #[error("cache schema mismatch: {0}")]
+    Schema(String),
+    #[error("cache filesystem error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("database migration failed for {database}: {source}")]
+    Migration {
+        database: String,
+        #[source]
+        source: Box<StoreError>,
+    },
+}
+
+impl StoreError {
+    /// Stable cache error classification for callers deciding whether to retry.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Schema(_) => "CACHE_SCHEMA_MISMATCH",
+            Self::Migration { .. } => "CACHE_MIGRATION_FAILED",
+            Self::Sqlite(error) => {
+                let text = error.to_string();
+                if text.contains("no such column")
+                    || text.contains("no such table")
+                    || text.contains("has no column named")
+                {
+                    "CACHE_SCHEMA_MISMATCH"
+                } else if error.sqlite_error_code() == Some(rusqlite::ErrorCode::SchemaChanged) {
+                    "CACHE_SCHEMA_CHANGED"
+                } else if matches!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+                ) {
+                    "CACHE_BUSY"
+                } else {
+                    "CACHE_SQLITE_ERROR"
+                }
+            }
+            Self::Search(_) => "CACHE_QUERY_ERROR",
+            Self::Data(_) => "CACHE_DATA_ERROR",
+            Self::Io(_) => "CACHE_IO_ERROR",
+        }
+    }
+
+    /// Only transient lock contention is safe to retry automatically.
+    pub fn retryable(&self) -> bool {
+        matches!(self.code(), "CACHE_BUSY" | "CACHE_SCHEMA_CHANGED")
+    }
 }
 
 /// One cached message row, with author information joined in.
@@ -47,6 +95,11 @@ pub struct MessageRow {
 }
 
 impl MessageRow {
+    /// Available normalized metadata, or `None` when retrieval is required.
+    pub fn known_view(&self) -> Option<MessageView> {
+        let view: MessageView = serde_json::from_str(self.message_json.as_deref()?).ok()?;
+        (view.metadata_state == "available").then_some(view)
+    }
     /// Same normalized shape as API-fetched messages.
     ///
     /// When `message_json` is present it is used verbatim (so reply targets,
@@ -55,10 +108,8 @@ impl MessageRow {
     /// `unknown` so callers can tell the row is under-informed rather than
     /// genuinely empty.
     pub fn to_view(&self) -> MessageView {
-        if let Some(json) = &self.message_json {
-            if let Ok(view) = serde_json::from_str::<MessageView>(json) {
-                return view;
-            }
+        if let Some(view) = self.known_view() {
+            return view;
         }
         MessageView {
             id: self.id.clone(),
@@ -82,6 +133,7 @@ impl MessageRow {
             } else {
                 "text".to_string()
             },
+            metadata_state: "requires_refetch".to_string(),
             mentions: Vec::new(),
             mention_roles: Vec::new(),
             mention_everyone: None,
@@ -245,8 +297,12 @@ CREATE TABLE IF NOT EXISTS search_cursors (
 impl Store {
     /// Open (creating if needed) the cache database at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let path = path.as_ref();
         let conn = Connection::open(path)?;
-        Self::init(conn)
+        Self::init(conn).map_err(|source| StoreError::Migration {
+            database: path.display().to_string(),
+            source: Box::new(source),
+        })
     }
 
     /// In-memory database, used by tests.
@@ -254,8 +310,8 @@ impl Store {
         Self::init(Connection::open_in_memory()?)
     }
 
-    fn init(conn: Connection) -> Result<Self, StoreError> {
-        conn.execute_batch(SCHEMA)?;
+    fn init(mut conn: Connection) -> Result<Self, StoreError> {
+        crate::migration::migrate(&mut conn, SCHEMA)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -503,6 +559,47 @@ impl Store {
         Ok(count.max(0) as u64)
     }
 
+    /// Schema version of this verified cache database.
+    pub fn schema_version(&self) -> Result<u32, StoreError> {
+        let conn = self.conn.lock().expect("store lock");
+        Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
+    }
+
+    /// Number of retained messages whose metadata still needs retrieval.
+    pub fn messages_requiring_refetch(&self) -> Result<u64, StoreError> {
+        let conn = self.conn.lock().expect("store lock");
+        let mut stmt = conn.prepare("SELECT message_json FROM messages")?;
+        let mut rows = stmt.query([])?;
+        let mut count = 0;
+        while let Some(row) = rows.next()? {
+            let json: Option<String> = row.get(0)?;
+            if json
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<MessageView>(s).ok())
+                .is_none_or(|v| v.metadata_state != "available")
+            {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Channel IDs known from retained messages, listings, or sync state.
+    pub fn cached_channel_ids(&self, guild_id: Option<&str>) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn.lock().expect("store lock");
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT channel_id FROM (
+                SELECT id AS channel_id, guild_id FROM channels
+                UNION SELECT channel_id, guild_id FROM messages
+                UNION SELECT channel_id, NULL AS guild_id FROM channel_sync
+             ) WHERE (?1 IS NULL OR guild_id = ?1) ORDER BY channel_id",
+        )?;
+        let rows = stmt
+            .query_map([guild_id], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
     /* ------------------------- coverage & sync state ------------------------- */
 
     /// Record that messages `[from_id, to_id]` (inclusive) have been fetched
@@ -691,21 +788,35 @@ impl Store {
         &self,
         limit: u32,
     ) -> Result<Vec<(String, Option<String>)>, StoreError> {
+        self.changed_channels_page(None, None, limit)
+    }
+
+    /// Changed channels after a descending activity/ascending channel-ID cursor.
+    pub fn changed_channels_page(
+        &self,
+        guild_id: Option<&str>,
+        cursor: Option<(&str, &str)>,
+        limit: u32,
+    ) -> Result<Vec<(String, Option<String>)>, StoreError> {
         let conn = self.conn.lock().expect("store lock");
         let mut stmt = conn.prepare(
             "SELECT c.id, c.last_message_id
              FROM channels c
              LEFT JOIN channel_sync s ON s.channel_id = c.id
              WHERE c.last_message_id IS NOT NULL
+               AND (?1 IS NULL OR c.guild_id = ?1)
+               AND (?2 IS NULL OR CAST(c.last_message_id AS INTEGER) < CAST(?2 AS INTEGER)
+                    OR (CAST(c.last_message_id AS INTEGER) = CAST(?2 AS INTEGER) AND c.id > ?3))
                AND (s.last_synced_message_id IS NULL
                     OR CAST(c.last_message_id AS INTEGER) > CAST(s.last_synced_message_id AS INTEGER))
-             ORDER BY CAST(c.last_message_id AS INTEGER) DESC
-             LIMIT ?1",
+             ORDER BY CAST(c.last_message_id AS INTEGER) DESC, c.id
+             LIMIT ?4",
         )?;
         let rows = stmt
-            .query_map(params![limit], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-            })?
+            .query_map(
+                params![guild_id, cursor.map(|c| c.0), cursor.map(|c| c.1), limit],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -718,16 +829,18 @@ impl Store {
         observed_at: &str,
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().expect("store lock");
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO deleted_messages (id, channel_id, observed_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(id) DO UPDATE SET observed_at = excluded.observed_at",
             params![message_id, channel_id, observed_at],
         )?;
-        conn.execute("DELETE FROM messages WHERE id = ?1", params![message_id])?;
-        conn.execute(
+        tx.execute("DELETE FROM messages WHERE id = ?1", params![message_id])?;
+        tx.execute(
             "DELETE FROM messages_fts WHERE message_id = ?1",
             params![message_id],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -936,6 +1049,215 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
     use discord_api::types::MessageReference;
+
+    fn legacy_database(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (id TEXT PRIMARY KEY, channel_id TEXT NOT NULL,
+             guild_id TEXT, author_id TEXT, timestamp TEXT NOT NULL,
+             edited_timestamp TEXT, content TEXT NOT NULL);
+             CREATE TABLE channels (id TEXT PRIMARY KEY, guild_id TEXT, name TEXT,
+             kind INTEGER NOT NULL, parent_id TEXT, topic TEXT);
+             CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT, global_name TEXT);
+             CREATE VIRTUAL TABLE messages_fts USING fts5(message_id UNINDEXED, content, tokenize='trigram');
+             INSERT INTO messages VALUES ('10','200','100','1','2026-10-07T08:30:00Z',NULL,'legacy content');
+             INSERT INTO messages_fts VALUES ('10','legacy content');
+             INSERT INTO channels VALUES ('200','100','general',0,NULL,NULL);",
+        ).unwrap();
+    }
+
+    #[test]
+    fn legacy_upgrade_preserves_rows_backup_and_unknown_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.sqlite3");
+        legacy_database(&path);
+        let store = Store::open(&path).unwrap();
+        let row = store.get_message("10").unwrap().unwrap();
+        assert_eq!(row.content, "legacy content");
+        assert_eq!(row.message_json, None);
+        assert_eq!(row.fetched_at, None);
+        assert_eq!(
+            serde_json::to_value(row.to_view()).unwrap()["metadata_state"],
+            "requires_refetch"
+        );
+        assert!(store.coverage("200").unwrap().is_empty());
+        assert!(store.channel_sync_all(100).unwrap().is_empty());
+        assert!(store.changed_channels(10).unwrap().is_empty());
+        assert_eq!(store.search(&SearchQuery::new("legacy")).unwrap().len(), 1);
+        store
+            .record_coverage("200", "20", "30", "2026-10-07T09:00:00Z", false)
+            .unwrap();
+        let cursor = store.create_search_cursor("legacy", 3).unwrap();
+        drop(store);
+        for _ in 0..2 {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.message_count().unwrap(), 1);
+            assert_eq!(store.search_cursor(cursor).unwrap(), Some(3));
+            assert_eq!(
+                store
+                    .channel_sync("200")
+                    .unwrap()
+                    .unwrap()
+                    .last_synced_message_id
+                    .as_deref(),
+                Some("30")
+            );
+        }
+        let backups: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().contains("backup"))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        let backup = Connection::open(&backups[0]).unwrap();
+        assert!(backup.prepare("SELECT message_json FROM messages").is_err());
+        assert_eq!(
+            backup
+                .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(
+            conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn incompatible_schema_fails_without_partial_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.sqlite3");
+        legacy_database(&path);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("ALTER TABLE messages DROP COLUMN content;")
+            .unwrap();
+        assert!(Store::open(&path).is_err());
+        let conn = Connection::open(&path).unwrap();
+        assert!(conn.prepare("SELECT message_json FROM messages").is_err());
+        assert_eq!(
+            conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn future_schema_and_versioned_schema_drift_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.sqlite3");
+        let store = Store::open(&path).unwrap();
+        drop(store);
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 999).unwrap();
+        assert!(Store::open(&path).is_err());
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        conn.execute_batch("ALTER TABLE messages DROP COLUMN fetched_at;")
+            .unwrap();
+        assert!(Store::open(&path).is_err());
+    }
+
+    #[test]
+    fn migration_backup_includes_uncheckpointed_wal_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.sqlite3");
+        legacy_database(&path);
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+            INSERT INTO messages VALUES ('11','200','100','1','2026-10-07T08:31:00Z',NULL,'wal content');").unwrap();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.message_count().unwrap(), 2);
+        let backup = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.to_string_lossy().contains("backup"))
+            .unwrap();
+        let backup = Connection::open(backup).unwrap();
+        assert_eq!(
+            backup
+                .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn deletion_failure_preserves_message_and_tombstone_atomically() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .insert_message(&message("10", "200", "1", "original content"))
+            .unwrap();
+        store.conn.lock().unwrap().execute_batch("CREATE TRIGGER reject_delete BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
+        assert!(store
+            .record_deletion("10", "200", "2026-10-07T09:00:00Z")
+            .is_err());
+        assert!(store.deletions_after("200", None, 100).unwrap().is_empty());
+        assert!(store.get_message("10").unwrap().is_some());
+        assert_eq!(
+            store.search(&SearchQuery::new("original")).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn edits_and_deletions_survive_file_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.sqlite3");
+        let store = Store::open(&path).unwrap();
+        store
+            .insert_message(&message("10", "200", "1", "original content"))
+            .unwrap();
+        store
+            .insert_message(&message("10", "200", "1", "edited content"))
+            .unwrap();
+        assert!(store
+            .search(&SearchQuery::new("original"))
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.search(&SearchQuery::new("edited")).unwrap().len(), 1);
+        store
+            .record_deletion("10", "200", "2026-10-07T09:00:00Z")
+            .unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.message_count().unwrap(), 0);
+        assert_eq!(store.deletions_after("200", None, 100).unwrap().len(), 1);
+        assert!(store
+            .search(&SearchQuery::new("edited"))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn malformed_cached_metadata_requires_refetch() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .insert_message(&message("10", "200", "1", "retained content"))
+            .unwrap();
+        assert_eq!(store.messages_requiring_refetch().unwrap(), 0);
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE messages SET message_json='{broken' WHERE id='10'",
+                [],
+            )
+            .unwrap();
+        let row = store.get_message("10").unwrap().unwrap();
+        assert!(row.known_view().is_none());
+        assert_eq!(row.to_view().metadata_state, "requires_refetch");
+        assert_eq!(store.messages_requiring_refetch().unwrap(), 1);
+        assert_eq!(row.content, "retained content");
+    }
 
     fn message(id: &str, channel_id: &str, author: &str, content: &str) -> Message {
         Message {

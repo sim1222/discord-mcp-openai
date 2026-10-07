@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use chrono::{DateTime, FixedOffset};
 use discord_api::types::{
     AttachmentView, Channel, ChannelView, DmView, Guild, GuildView, Message, MessageSnapshotView,
     MessageView, Role, User,
@@ -45,7 +46,15 @@ fn api_error(error: discord_api::DiscordError) -> RpcError {
 }
 
 fn store_error(error: discord_store::StoreError) -> RpcError {
-    RpcError::internal(format!("cache error: {error}"))
+    tracing::error!(%error, code = error.code(), "cache operation failed");
+    RpcError::structured(
+        crate::rpc::CACHE_ERROR,
+        json!({"error": {
+            "error_source": "cache", "code": error.code(),
+            "operation": "cache", "retryable": error.retryable(),
+            "message": "cache operation failed; inspect daemon database diagnostics"
+        }}),
+    )
 }
 
 /// Map a structured [`ApiError`] to a machine-readable [`RpcError`].
@@ -77,8 +86,40 @@ struct InboxHit {
     channel_id: String,
     /// Numeric snowflake key for newest-first ordering.
     key: u128,
-    /// ISO timestamp for `after`/`before` window filtering.
-    timestamp: String,
+}
+
+struct InboxWindow {
+    after: Option<DateTime<FixedOffset>>,
+    before: Option<DateTime<FixedOffset>>,
+}
+
+impl InboxWindow {
+    fn from_filter(filter: &InboxFilter) -> Result<Self, RpcError> {
+        Ok(Self {
+            after: filter
+                .after
+                .as_deref()
+                .map(DateTime::parse_from_rfc3339)
+                .transpose()
+                .map_err(|_| RpcError::invalid_params("after must be RFC3339"))?,
+            before: filter
+                .before
+                .as_deref()
+                .map(DateTime::parse_from_rfc3339)
+                .transpose()
+                .map_err(|_| RpcError::invalid_params("before must be RFC3339"))?,
+        })
+    }
+
+    fn contains(&self, timestamp: &str) -> Result<bool, RpcError> {
+        let instant = DateTime::parse_from_rfc3339(timestamp).map_err(|_| {
+            store_error(discord_store::StoreError::Data(
+                "invalid cached message timestamp".into(),
+            ))
+        })?;
+        Ok(self.after.is_none_or(|after| instant >= after)
+            && self.before.is_none_or(|before| instant < before))
+    }
 }
 
 impl DaemonApi {
@@ -130,25 +171,16 @@ impl DaemonApi {
                 // beginning: the backfill is complete.
                 let backfill_complete =
                     before.is_some() && (messages.len() as u32) < limit.min(100);
-                if let Err(error) = self.store.record_coverage(
-                    channel_id,
-                    &min_id,
-                    &max_id,
-                    &now,
-                    backfill_complete,
-                ) {
-                    tracing::warn!(%error, "failed to record coverage");
-                }
-                if let Err(error) =
-                    self.store
-                        .record_channel_sync(channel_id, Some(&max_id), None, &now)
-                {
-                    tracing::warn!(%error, "failed to record channel sync");
-                }
+                self.store
+                    .record_coverage(channel_id, &min_id, &max_id, &now, backfill_complete)
+                    .map_err(store_error)?;
+                self.store
+                    .record_channel_sync(channel_id, None, None, &now)
+                    .map_err(store_error)?;
                 if backfill_complete {
-                    if let Err(error) = self.store.mark_backfill_complete(channel_id, &now) {
-                        tracing::warn!(%error, "failed to mark backfill complete");
-                    }
+                    self.store
+                        .mark_backfill_complete(channel_id, &now)
+                        .map_err(store_error)?;
                 }
             }
         }
@@ -305,23 +337,11 @@ impl DaemonApi {
         &self,
         guild_id: Option<&str>,
         channel_id: Option<&str>,
-    ) -> Vec<String> {
+    ) -> Result<Vec<String>, RpcError> {
         if let Some(channel_id) = channel_id {
-            return vec![channel_id.to_string()];
+            return Ok(vec![channel_id.to_string()]);
         }
-        if let Some(guild_id) = guild_id {
-            if let Ok(channels) = self.store.channels(guild_id) {
-                let ids: Vec<String> = channels.into_iter().map(|c| c.id).collect();
-                if !ids.is_empty() {
-                    return ids;
-                }
-            }
-        }
-        // Fall back to every channel the sync table knows about.
-        self.store
-            .channel_sync_all(500)
-            .map(|rows| rows.into_iter().map(|r| r.channel_id).collect())
-            .unwrap_or_default()
+        self.store.cached_channel_ids(guild_id).map_err(store_error)
     }
 
     /// Classify one message against the current user: `direct`, `reply`,
@@ -333,9 +353,9 @@ impl DaemonApi {
         me_id: &str,
         my_roles: &[String],
         replies_only: bool,
-    ) -> Option<(&'static str, Vec<String>)> {
+    ) -> Result<Option<(&'static str, Vec<String>)>, RpcError> {
         if !replies_only && message.mentions.iter().any(|u| u.id == me_id) {
-            return Some(("direct", Vec::new()));
+            return Ok(Some(("direct", Vec::new())));
         }
         // Reply: the referenced message was authored by me.
         if let Some(reference) = &message.message_reference {
@@ -345,19 +365,18 @@ impl DaemonApi {
                     None => self
                         .store
                         .get_message(ref_id)
-                        .ok()
-                        .flatten()
+                        .map_err(store_error)?
                         .and_then(|row| row.author_id)
                         .map(|id| id == me_id)
                         .unwrap_or(false),
                 };
                 if authored_by_me {
-                    return Some(("reply", Vec::new()));
+                    return Ok(Some(("reply", Vec::new())));
                 }
             }
         }
         if replies_only {
-            return None;
+            return Ok(None);
         }
         // Role mention: intersection with my roles in the message's guild.
         if !message.mention_roles.is_empty() && !my_roles.is_empty() {
@@ -368,13 +387,13 @@ impl DaemonApi {
                 .cloned()
                 .collect();
             if !overlap.is_empty() {
-                return Some(("role", overlap));
+                return Ok(Some(("role", overlap)));
             }
         }
         if message.mention_everyone == Some(true) {
-            return Some(("everyone", Vec::new()));
+            return Ok(Some(("everyone", Vec::new())));
         }
-        None
+        Ok(None)
     }
 
     /// Shared implementation for `list_mentions` / `list_replies`.
@@ -383,14 +402,18 @@ impl DaemonApi {
         params: &InboxFilter,
         replies_only: bool,
     ) -> Result<Value, RpcError> {
+        let window = InboxWindow::from_filter(params)?;
         let me_id = self.me_user_id().await?;
         let channel_ids = self
             .inbox_candidate_channels(params.guild_id.as_deref(), params.channel_id.as_deref())
-            .await;
+            .await?;
 
         let mut hits: Vec<InboxHit> = Vec::new();
         let mut channels_scanned = 0u64;
         let mut channels_skipped = 0u64;
+        let mut messages_requiring_refetch = 0u64;
+        let mut messages_classified = 0u64;
+        let mut refetch_channels = Vec::new();
         let source = if params.refresh {
             "discord+cache"
         } else {
@@ -404,31 +427,41 @@ impl DaemonApi {
                 Some(guild_id) => self.my_role_ids(guild_id).await,
                 None => Vec::new(),
             };
-            let rows = self
-                .store
-                .channel_messages(channel_id, 200, None, None)
-                .map_err(store_error)?;
-            let mut messages: Vec<Message> = Vec::new();
-            for row in &rows {
-                if let Some(json) = &row.message_json {
-                    if let Ok(view) = serde_json::from_str::<MessageView>(json) {
-                        // Rebuild a minimal `Message` from the normalized view.
-                        messages.push(message_from_view(view));
-                    }
-                }
-            }
+            let mut rows = Vec::new();
             if params.refresh {
-                match self.fetch_messages(channel_id, 100, None, None, None).await {
-                    Ok(fresh) => {
-                        messages = fresh;
-                    }
-                    Err(error) => {
-                        // Structured, machine-readable failure; never folded
-                        // into an empty result.
-                        return Err(error);
-                    }
+                self.fetch_messages(channel_id, 100, None, None, None)
+                    .await?;
+            }
+            let mut before = None;
+            loop {
+                let page = self
+                    .store
+                    .channel_messages(channel_id, 200, before.as_deref(), None)
+                    .map_err(store_error)?;
+                let finished = page.len() < 200;
+                before = page.last().map(|row| row.id.clone());
+                rows.extend(page);
+                if finished {
+                    break;
                 }
             }
+            let mut messages: Vec<Message> = Vec::new();
+            let mut unknown = 0u64;
+            for row in &rows {
+                if !window.contains(&row.timestamp)? {
+                    continue;
+                }
+                match row.known_view() {
+                    Some(view) => messages.push(message_from_view(view)),
+                    _ => unknown += 1,
+                }
+            }
+            messages_requiring_refetch += unknown;
+            if unknown > 0 {
+                refetch_channels
+                    .push(json!({"channel_id": channel_id, "messages_requiring_refetch": unknown}));
+            }
+            messages_classified += messages.len() as u64;
             if messages.is_empty() {
                 channels_skipped += 1;
                 continue;
@@ -437,7 +470,7 @@ impl DaemonApi {
             for message in &messages {
                 let Some((matched_by, matched_role_ids)) = self
                     .classify_inbox(message, &me_id, &my_roles, replies_only)
-                    .await
+                    .await?
                 else {
                     continue;
                 };
@@ -448,19 +481,17 @@ impl DaemonApi {
                     guild_id: message.guild_id.clone().or_else(|| guild_id.clone()),
                     channel_id: channel_id.clone(),
                     key: snowflake_num(&message.id),
-                    timestamp: message.timestamp.clone(),
                 });
             }
         }
 
-        // Time-window filtering.
-        if let Some(after) = params.after.as_deref() {
-            hits.retain(|h| h.timestamp.as_str() >= after);
-        }
-        if let Some(before) = params.before.as_deref() {
-            hits.retain(|h| h.timestamp.as_str() < before);
-        }
         // Newest first, capped at `limit`.
+        if let Some(cursor) = params.next_cursor.as_deref() {
+            let cursor = cursor
+                .parse::<u128>()
+                .map_err(|_| RpcError::invalid_params("invalid inbox cursor"))?;
+            hits.retain(|hit| hit.key < cursor);
+        }
         hits.sort_by_key(|hit| std::cmp::Reverse(hit.key));
         let total = hits.len();
         let limit = params.limit.clamp(1, 100) as usize;
@@ -484,7 +515,11 @@ impl DaemonApi {
         let mut covered_to: Option<String> = None;
         let mut channels_checked = 0u64;
         for channel_id in &channel_ids {
-            if let Ok(Some((from, to, _))) = self.store.coverage_envelope(channel_id) {
+            if let Some((from, to, _)) = self
+                .store
+                .coverage_envelope(channel_id)
+                .map_err(store_error)?
+            {
                 channels_checked += 1;
                 covered_from = Some(match covered_from {
                     Some(existing) if snowflake_num(&existing) <= snowflake_num(&from) => existing,
@@ -503,6 +538,9 @@ impl DaemonApi {
                 "channels_scanned": channels_scanned,
                 "channels_skipped": channels_skipped,
                 "source": source,
+                "messages_classified": messages_classified,
+                "messages_requiring_refetch": messages_requiring_refetch,
+                "refetch_channels": refetch_channels,
             },
             "coverage": {
                 "channels_checked": channels_checked,
@@ -511,7 +549,7 @@ impl DaemonApi {
                 "to": covered_to,
                 "complete": false,
             },
-            "next_cursor": Value::Null,
+            "next_cursor": if total > limit { hits.last().map(|h| h.view.id.clone()) } else { None },
             "has_more": total > limit,
         }))
     }
@@ -556,6 +594,10 @@ fn message_from_view(view: MessageView) -> Message {
             guild_id: reference.guild_id.clone(),
             fail_if_not_exists: None,
         });
+        message.referenced_message = reference
+            .referenced
+            .as_deref()
+            .map(|target| Box::new(message_from_view(target.clone())));
     }
     message
 }
@@ -917,10 +959,11 @@ impl ReaderApi for DaemonApi {
     }
 
     async fn messages_after(&self, params: AfterParams) -> Result<Value, RpcError> {
+        let limit = params.limit.clamp(1, 100);
         let mut messages = self
             .fetch_messages(
                 &params.channel_id,
-                params.limit,
+                limit,
                 None,
                 Some(&params.after_message_id),
                 None,
@@ -929,8 +972,14 @@ impl ReaderApi for DaemonApi {
         // Discord returns `after` pages oldest-first; normalize to newest-first.
         self.resolve_replies_capped(&mut messages, 5).await;
         messages.sort_by_key(|m| std::cmp::Reverse(snowflake_num(&m.id)));
+        let next_after_message_id = messages
+            .first()
+            .map(|m| m.id.clone())
+            .unwrap_or_else(|| params.after_message_id.clone());
+        let has_more = messages.len() == limit as usize;
         let views: Vec<MessageView> = messages.iter().map(MessageView::from).collect();
-        Ok(json!({"channel_id": params.channel_id, "messages": views}))
+        Ok(json!({"channel_id": params.channel_id, "messages": views,
+            "next_after_message_id": next_after_message_id, "has_more": has_more}))
     }
 
     async fn get_me(&self) -> Result<Value, RpcError> {
@@ -1101,28 +1150,34 @@ impl ReaderApi for DaemonApi {
         &self,
         params: ChangedChannelsParams,
     ) -> Result<Value, RpcError> {
-        let offset = params
+        let cursor = params
             .cursor
             .as_deref()
-            .and_then(|c| c.parse::<u32>().ok())
-            .unwrap_or(0);
+            .map(|c| {
+                let (last, channel) = c
+                    .split_once(':')
+                    .ok_or_else(|| RpcError::invalid_params("invalid changed-channel cursor"))?;
+                if last.parse::<u64>().is_err() || channel.parse::<u64>().is_err() {
+                    return Err(RpcError::invalid_params("invalid changed-channel cursor"));
+                }
+                Ok((last, channel))
+            })
+            .transpose()?;
+        let limit = params.limit.clamp(1, 100);
         let changed = self
             .store
-            .changed_channels(params.limit.saturating_add(offset))
+            .changed_channels_page(params.guild_id.as_deref(), cursor, limit + 1)
             .map_err(store_error)?;
-        // Optional guild filter: keep channels that belong to the guild.
+        let has_more = changed.len() > limit as usize;
+        let next_cursor = if has_more {
+            changed
+                .get(limit as usize - 1)
+                .and_then(|(channel, last)| last.as_ref().map(|last| format!("{last}:{channel}")))
+        } else {
+            None
+        };
         let mut entries = Vec::new();
-        for (channel_id, last_message_id) in changed {
-            if let Some(guild_id) = params.guild_id.as_deref() {
-                let in_guild = self
-                    .store
-                    .channels(guild_id)
-                    .map(|cs| cs.iter().any(|c| c.id == channel_id))
-                    .unwrap_or(false);
-                if !in_guild {
-                    continue;
-                }
-            }
+        for (channel_id, last_message_id) in changed.into_iter().take(limit as usize) {
             let sync = self.store.channel_sync(&channel_id).map_err(store_error)?;
             let guild = params.guild_id.clone();
             entries.push(json!({
@@ -1135,15 +1190,9 @@ impl ReaderApi for DaemonApi {
                 "backfill": sync.as_ref().map(|s| s.backfill.clone()).unwrap_or_else(|| "partial".into()),
             }));
         }
-        let total = entries.len();
-        let limit = params.limit.clamp(1, 100) as usize;
-        let start = (offset as usize).min(total);
-        let end = (start + limit).min(total);
-        let page: Vec<Value> = entries.into_iter().skip(start).take(end - start).collect();
-        let has_more = end < total;
         Ok(json!({
-            "changed_channels": page,
-            "next_cursor": if has_more { Some(end.to_string()) } else { Option::<String>::None },
+            "changed_channels": entries,
+            "next_cursor": next_cursor,
             "has_more": has_more,
         }))
     }
@@ -1153,12 +1202,15 @@ impl ReaderApi for DaemonApi {
         let coverage: Vec<Value> = rows
             .iter()
             .map(|row| {
-                let envelope = self.store.coverage_envelope(&row.channel_id).ok().flatten();
+                let envelope = self
+                    .store
+                    .coverage_envelope(&row.channel_id)
+                    .map_err(store_error)?;
                 let (covered_from, covered_to, has_gaps) = match envelope {
                     Some((from, to, gaps)) => (Some(from), Some(to), gaps),
                     None => (None, None, false),
                 };
-                json!({
+                Ok(json!({
                     "channel_id": row.channel_id,
                     "covered_from": covered_from,
                     "covered_to": covered_to,
@@ -1169,22 +1221,26 @@ impl ReaderApi for DaemonApi {
                     "last_message_id": row.last_message_id,
                     "last_activity_at": row.last_activity_at,
                     "last_fetched_at": row.last_fetched_at,
-                })
+                }))
             })
-            .collect();
+            .collect::<Result<_, RpcError>>()?;
         let deletions: u64 = rows
             .iter()
             .map(|r| {
                 self.store
                     .deletions_after(&r.channel_id, None, u32::MAX)
                     .map(|d| d.len() as u64)
-                    .unwrap_or(0)
+                    .map_err(store_error)
             })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
             .sum();
         Ok(json!({
             "db_id": format!("discord-cache-{}", std::process::id()),
             "generated_at": discord_store::sqlite::now_iso(),
             "cached_messages": self.store.message_count().map_err(store_error)?,
+            "schema_version": self.store.schema_version().map_err(store_error)?,
+            "messages_requiring_refetch": self.store.messages_requiring_refetch().map_err(store_error)?,
             "channels_tracked": rows.len(),
             "coverage": coverage,
             "deletions_observed": deletions,
@@ -1478,6 +1534,284 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_db_inbox_refetch_and_after_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.sqlite3");
+        rusqlite::Connection::open(&path).unwrap().execute_batch(
+            "CREATE TABLE messages (id TEXT PRIMARY KEY, channel_id TEXT NOT NULL,
+             guild_id TEXT, author_id TEXT, timestamp TEXT NOT NULL,
+             edited_timestamp TEXT, content TEXT NOT NULL);
+             CREATE TABLE channels (id TEXT PRIMARY KEY, guild_id TEXT, name TEXT,
+             kind INTEGER NOT NULL, parent_id TEXT, topic TEXT);
+             INSERT INTO messages VALUES ('10','200','42','7','2026-10-07T08:30:00Z',NULL,'original');
+             INSERT INTO channels VALUES ('200','42','general',0,NULL,NULL);"
+        ).unwrap();
+        let mock = spawn_mock(VecDeque::from([
+            (200, r#"[{"id":"11","channel_id":"200","guild_id":"42","author":{"id":"99"},"content":"mention","timestamp":"2026-10-07T08:31:00Z","mentions":[{"id":"7"}]},{"id":"12","channel_id":"200","guild_id":"42","author":{"id":"99"},"content":"reply","timestamp":"2026-10-07T08:32:00Z","message_reference":{"message_id":"10","channel_id":"200"}},{"id":"13","channel_id":"200","guild_id":"42","author":{"id":"99"},"content":"no match","timestamp":"2026-10-07T08:33:00Z"}]"#.into()),
+            (200, r#"{"id":"10","channel_id":"200","author":{"id":"7"},"content":"original","timestamp":"2026-10-07T08:30:00Z"}"#.into()),
+            (200, "[]".into()),
+        ])).await;
+        let store = Arc::new(Store::open(&path).unwrap());
+        let (base_api, _) = api_for(&mock.base);
+        let api = DaemonApi::new(base_api.client, Arc::clone(&store));
+        *api.me_id.lock().unwrap() = Some("7".into());
+        let filter = InboxFilter {
+            guild_id: None,
+            channel_id: Some("200".into()),
+            after: Some("2026-10-07T08:00:00Z".into()),
+            before: Some("2026-10-07T09:21:00Z".into()),
+            limit: 5,
+            refresh: false,
+            next_cursor: None,
+        };
+        for result in [
+            api.list_mentions(filter.clone()).await.unwrap(),
+            api.list_replies(filter.clone()).await.unwrap(),
+        ] {
+            assert_eq!(result["checked"]["messages_requiring_refetch"], 1);
+            assert_eq!(result["checked"]["messages_classified"], 0);
+            assert_eq!(result["coverage"]["complete"], false);
+        }
+        let status = api.get_sync_status().await.unwrap();
+        let all_channels = api
+            .list_mentions(InboxFilter {
+                channel_id: None,
+                ..filter.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(all_channels["checked"]["messages_requiring_refetch"], 1);
+        assert_eq!(status["cached_messages"], 1);
+        assert_eq!(status["channels_tracked"], 0);
+        assert_eq!(status["schema_version"], 2);
+        assert_eq!(status["messages_requiring_refetch"], 1);
+        assert!(api
+            .list_changed_channels(ChangedChannelsParams {
+                guild_id: Some("42".into()),
+                limit: 5,
+                cursor: None
+            })
+            .await
+            .unwrap()["changed_channels"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let page = api
+            .messages_after(AfterParams {
+                channel_id: "200".into(),
+                after_message_id: "10".into(),
+                limit: 3,
+            })
+            .await
+            .unwrap();
+        assert_eq!(page["next_after_message_id"], "13");
+        assert_eq!(page["messages"].as_array().unwrap().len(), 3);
+        let mentions = api.list_mentions(filter.clone()).await.unwrap();
+        assert_eq!(mentions["mentions"].as_array().unwrap().len(), 2);
+        assert_eq!(mentions["checked"]["messages_requiring_refetch"], 0);
+        assert_eq!(
+            api.list_replies(filter).await.unwrap()["mentions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let empty = api
+            .messages_after(AfterParams {
+                channel_id: "200".into(),
+                after_message_id: "13".into(),
+                limit: 3,
+            })
+            .await
+            .unwrap();
+        assert_eq!(empty["next_after_message_id"], "13");
+        assert_eq!(empty["has_more"], false);
+        drop(api);
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(reopened.message_count().unwrap(), 4);
+        assert_eq!(
+            reopened
+                .channel_sync("200")
+                .unwrap()
+                .unwrap()
+                .last_synced_message_id
+                .as_deref(),
+            Some("13")
+        );
+        assert!(mock
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|r| r.starts_with("GET ")));
+    }
+
+    #[tokio::test]
+    async fn changed_channels_filters_before_paging_and_has_continuation() {
+        let mock = spawn_mock(VecDeque::new()).await;
+        let (api, store) = api_for(&mock.base);
+        for (id, guild, last) in [("1", "other", "900"), ("2", "42", "100"), ("3", "42", "90")] {
+            store
+                .upsert_channel(&Channel {
+                    id: id.into(),
+                    guild_id: Some(guild.into()),
+                    last_message_id: Some(last.into()),
+                    ..Channel::default()
+                })
+                .unwrap();
+        }
+        let first = api
+            .list_changed_channels(ChangedChannelsParams {
+                guild_id: Some("42".into()),
+                limit: 1,
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(first["changed_channels"][0]["channel_id"], "2");
+        assert_eq!(first["has_more"], true);
+        assert_eq!(first["next_cursor"], "100:2");
+        store
+            .record_coverage("2", "100", "100", "2026-10-07T09:00:00Z", false)
+            .unwrap();
+        let second = api
+            .list_changed_channels(ChangedChannelsParams {
+                guild_id: Some("42".into()),
+                limit: 1,
+                cursor: first["next_cursor"].as_str().map(str::to_owned),
+            })
+            .await
+            .unwrap();
+        assert_eq!(second["changed_channels"][0]["channel_id"], "3");
+        assert_eq!(second["has_more"], false);
+    }
+
+    #[tokio::test]
+    async fn inbox_window_compares_instants_with_subseconds_and_offsets() {
+        let mock = spawn_mock(VecDeque::new()).await;
+        let (api, store) = api_for(&mock.base);
+        *api.me_id.lock().unwrap() = Some("7".into());
+        for (id, time) in [
+            ("1", "2026-10-07T08:30:00.000001+00:00"),
+            ("2", "2026-10-07T17:30:00.999999+09:00"),
+            ("3", "2026-10-07T08:30:01Z"),
+        ] {
+            store.insert_message(&serde_json::from_value(json!({"id":id,"channel_id":"200", "author":{"id":"99"},"content":"hi","timestamp":time,"mentions":[{"id":"7"}]})).unwrap()).unwrap();
+        }
+        let result = api
+            .list_mentions(InboxFilter {
+                guild_id: None,
+                channel_id: Some("200".into()),
+                after: Some("2026-10-07T08:30:00Z".into()),
+                before: Some("2026-10-07T08:30:01Z".into()),
+                limit: 5,
+                refresh: false,
+                next_cursor: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(result["mentions"].as_array().unwrap().len(), 2);
+        assert_eq!(result["checked"]["messages_classified"], 2);
+    }
+
+    #[test]
+    fn schema_errors_are_nonretryable_cache_errors() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let sql_error = conn
+            .execute("INSERT INTO missing VALUES (1)", [])
+            .unwrap_err();
+        let rpc = store_error(discord_store::StoreError::Sqlite(sql_error));
+        assert_eq!(rpc.code, -32004);
+        let payload: Value = serde_json::from_str(&rpc.message).unwrap();
+        assert_eq!(payload["error"]["error_source"], "cache");
+        assert_eq!(payload["error"]["code"], "CACHE_SCHEMA_MISMATCH");
+        assert_eq!(payload["error"]["retryable"], false);
+    }
+
+    #[tokio::test]
+    async fn coverage_schema_failure_is_returned_with_rpc_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.sqlite3");
+        let store = Arc::new(Store::open(&path).unwrap());
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TABLE coverage")
+            .unwrap();
+        let mock = spawn_mock(VecDeque::from([(200, r#"[{"id":"11","channel_id":"200","author":{"id":"7"},"content":"new","timestamp":"2026-10-07T08:31:00Z"}]"#.into())])).await;
+        let (base_api, _) = api_for(&mock.base);
+        let api = DaemonApi::new(base_api.client, store);
+        let response = crate::rpc::dispatch(
+            &api,
+            crate::rpc::RpcRequest {
+                id: Some(1),
+                method: "messages_after".into(),
+                params: json!({"channel_id":"200", "after_message_id":"10", "limit":5}),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(response.result.is_none());
+        let error = response.error.unwrap();
+        assert_eq!(error.code, -32004);
+        let payload: Value = serde_json::from_str(&error.message).unwrap();
+        assert_eq!(payload["error"]["operation"], "messages_after");
+        assert_eq!(payload["error"]["retryable"], false);
+        assert_eq!(payload["error"]["code"], "CACHE_SCHEMA_MISMATCH");
+    }
+
+    #[tokio::test]
+    async fn inbox_scans_beyond_200_rows_and_pages_without_claiming_zero() {
+        let mock = spawn_mock(VecDeque::new()).await;
+        let (api, store) = api_for(&mock.base);
+        *api.me_id.lock().unwrap() = Some("7".into());
+        let messages: Vec<Message> = (1..=205)
+            .map(|id| {
+                serde_json::from_value(json!({
+                    "id":id.to_string(), "channel_id":"200", "author":{"id":"99"},
+                    "content":"hello", "timestamp":"2026-10-07T08:30:00Z",
+                    "mentions": if id <= 2 { json!([{"id":"7"}]) } else { json!([]) }
+                }))
+                .unwrap()
+            })
+            .collect();
+        store.insert_messages(&messages).unwrap();
+        let filter = InboxFilter {
+            guild_id: None,
+            channel_id: Some("200".into()),
+            after: Some("2026-10-07T08:00:00Z".into()),
+            before: Some("2026-10-07T09:00:00Z".into()),
+            limit: 1,
+            refresh: false,
+            next_cursor: None,
+        };
+        let first = api.list_mentions(filter.clone()).await.unwrap();
+        assert_eq!(first["mentions"][0]["message"]["id"], "2");
+        assert_eq!(first["next_cursor"], "2");
+        assert_eq!(first["checked"]["messages_classified"], 205);
+        let second = api
+            .list_mentions(InboxFilter {
+                next_cursor: Some("2".into()),
+                ..filter.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(second["mentions"][0]["message"]["id"], "1");
+        assert_eq!(second["has_more"], false);
+        let outside = api
+            .list_mentions(InboxFilter {
+                after: Some("2026-10-07T09:00:00Z".into()),
+                before: None,
+                ..filter
+            })
+            .await
+            .unwrap();
+        assert_eq!(outside["checked"]["messages_classified"], 0);
+        assert_eq!(outside["checked"]["messages_requiring_refetch"], 0);
+        assert_eq!(outside["coverage"]["complete"], false);
+    }
+
+    #[tokio::test]
     async fn list_guilds_is_get_only_and_cached() {
         let mock = spawn_mock(VecDeque::from([(
             200,
@@ -1662,6 +1996,21 @@ mod tests {
             requests[0]
         );
         assert!(!requests[0].contains("before="));
+    }
+
+    #[tokio::test]
+    async fn empty_after_page_does_not_loop_with_zero_direct_limit() {
+        let mock = spawn_mock(VecDeque::from([(200, "[]".into())])).await;
+        let (api, _) = api_for(&mock.base);
+        let result = api
+            .messages_after(AfterParams {
+                channel_id: "200".into(),
+                after_message_id: "10".into(),
+                limit: 0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(result["has_more"], false);
     }
 
     #[tokio::test]
