@@ -37,7 +37,7 @@ Secure MCP Tunnel → ChatGPT
 | 任意 URL なし | URL は `API_BASE + DiscordRequest::path()` からのみ生成。識別子は snowflake (数字) 検証でパストラバーソルを遮断 |
 | credential 分離 | Discord token は `discord-reader-daemon` のみが読む。`discord-mcp` / `tunnel-client` には mount しない |
 | credential 漏洩防止 | `Token` 型は `Debug`/`Display`/`Serialize` を `[REDACTED]` に。ログ・RPC・エラー文言に credential を一切出さない (テストで担保) |
-| 書き込み tool なし | MCP tool は read-only 10 個のみ。tool 名に write 動詞が含まれないことをテストで検証 |
+| 書き込み tool なし | MCP tool は read-only 24 個のみ。tool 名に write 動詞が含まれないことをテストで検証 |
 | 任意 SQL / 任意 FS なし | MCP tool は RPC メソッドのみ経由。SQL も固定ステートメント |
 | ネットワーク分離 | `discord-mcp` は internal network のみ → Internet / Discord / OpenAI に到達不能。`discord-reader` は Discord API、`tunnel-client` は api.openai.com への outbound のみ |
 | rate limit 尊重 | 同時 HTTP リクエスト 4 (設定可)、`X-RateLimit-*` と `Retry-After` を尊重。固定 sleep でのごまかしなし、全チャンネル同時クロールなし |
@@ -235,7 +235,7 @@ unit は `NoNewPrivileges` / `PrivateTmp` / `ProtectSystem=strict` / `ProtectHom
 | `list_guilds` | — | 参加中サーバーの列挙 `{"guilds":[{"id","name"}]}` |
 | `list_channels` | `guild_id` | チャンネル列挙 (活動ID・ID由来の時刻・取得時刻・情報源を含む) |
 | `list_dms` | — | DM / Group DM の列挙 (channel_id / participants / last_message_id) |
-| `list_changed_channels` | `guild_id?`, `limit=50`, `cursor?` | 最終投稿 ID が前回同期より新しいチャンネルのみ |
+| `list_changed_channels` | `guild_id?`, `limit=50`, `cursor?` | 保存済み活動IDと同期カーソルの比較 (未同期・活動更新、HTTPなし) |
 | `recent_messages` | `channel_id`, `limit=50` (1..=100) | 最近のメッセージ取得 |
 | `messages_before` | `channel_id`, `before_message_id`, `limit=50` | 過去方向ページング |
 | `messages_after` | `channel_id`, `after_message_id`, `limit=50` | 差分取得 (前回以降の新着) |
@@ -244,12 +244,12 @@ unit は `NoNewPrivileges` / `PrivateTmp` / `ProtectSystem=strict` / `ProtectHom
 | `get_message_raw` | `channel_id`, `message_id` | 元 API レスポンスの原文 + 正規化結果 (空本文調査用) |
 | `get_attachment` | `channel_id`, `message_id` | 添付ファイルのメタデータと取得 URL |
 | `get_message_events` | `channel_id`, `message_id` | メッセージに紐づく予定イベント |
-| `list_mentions` | `guild_id?`, `channel_id?`, `after?`, `before?`, `limit=100`, `refresh?` | 自分宛てメンション受信箱 (direct / reply / role / everyone を区別) |
+| `list_mentions` | `guild_id?`, `channel_id?`, `after?`, `before?`, `limit=50`, `refresh?`, `next_cursor?` | 自分宛てメンション受信箱 (direct / reply / role / everyone を区別) |
 | `list_replies` | 同上 | 自分への返信の一覧 |
 | `search_messages` | `query`, `guild_id?`, `channel_id?`, `author_id?`, `after?`, `before?`, `limit=50`, `refresh?`, `next_cursor?` | SQLite FTS5 による全文検索 (キャッシュ対象) |
 | `search_server_side` | `query`, `channel_id`, `offset`, `limit`, `sort?`, `sort_order?`, `next_cursor?` | Discord 検索 (user account ではチャンネル限定) |
 | `read_thread` | `thread_id`, `limit=100` | スレッド読み取り |
-| `list_threads` | `guild_id?`, `channel_id?`, `filter?` (active/archived/joined/all), `limit=50`, `cursor?` | スレッド列挙 (アクティブ / アーカイブ / 参加済み) |
+| `list_threads` | `channel_id`, `guild_id?`, `filter?` (active/archived/all), `limit=50`, `cursor?` | 親チャンネルのスレッド検索 (実効上限25件、joined・guild単独は未対応) |
 | `get_member` | `guild_id`, `user_id?` | サーバー内の自分の member / roles |
 | `get_sync_status` | — | チャンネル別の同期位置・確認範囲・キャッシュ状態 |
 | `start_sync` | `scope?`, `guild_id?`, `channel_ids?`, `max_messages?`, `refetch_before?` | 最新ページ取得、または `scope="refetch"` で旧行のメタデータを限定再取得 |
@@ -268,6 +268,7 @@ unit は `NoNewPrivileges` / `PrivateTmp` / `ProtectSystem=strict` / `ProtectHom
   "message_type": 19,
   "content": "message",
   "content_kind": "text",
+  "metadata_state": "available",
   "mentions": [{"id": "222", "name": "bob"}],
   "mention_roles": ["333"],
   "mention_everyone": false,
@@ -295,6 +296,8 @@ unit は `NoNewPrivileges` / `PrivateTmp` / `ProtectSystem=strict` / `ProtectHom
   `unavailable` (その他の取得失敗) / `unknown` (未取得)。
 - `mentions` / `mention_roles` / `mention_everyone` は API のまま。ロール名の
   解決は `get_member` や `list_mentions` の `matched_role_ids` を使う。
+- `metadata_state="requires_refetch"` は旧行等の情報不足です。空のmentionsや
+  返信なしを確認済みと解釈せず、再取得状態と合わせて扱ってください。
 - 添付はメタデータ + URL のみ。`get_attachment` もファイル本体を取得せず、
   添付と転送スナップショット内の添付メタデータを返します。
 
@@ -318,6 +321,58 @@ unit は `NoNewPrivileges` / `PrivateTmp` / `ProtectSystem=strict` / `ProtectHom
 ありません。`last_fetched_at` と一覧の `fetched_at` は今回の取得時刻です。
 `last_message_id_source` は `discord` / `cache` / `unknown` で、`cache` は
 今回のAPIに活動IDがなく保持済みの値を利用したことを示します。
+
+`list_changed_channels` は HTTP を呼ばず、保存済みの活動IDと同期カーソルを
+比較します。先に `list_channels` を呼ぶと活動情報を更新できます。
+`reason="never_synced"` は古いチャンネルでも同期カーソルが未記録の状態、
+`reason="newer_activity"` は観測した活動IDが同期カーソルより新しい状態です。
+取得時刻が今だから新着、という判定ではありません。編集・削除もこの判定だけ
+では検出できません。
+
+### 受信箱の対象と確認範囲
+
+`guild_id` と `channel_id` を同時指定すると両方に一致する投稿だけを扱います。
+所属が判明している別サーバーのチャンネルやDMは `scope_mismatch` になります。
+所属不明の行を指定サーバーの投稿として補完せず、`messages_scope_unverified`
+とcoverageの理由で未確認を示します。チャンネルを省略した場合の対象は
+キャッシュで知られているチャンネルで、サーバー全体の発見・完全性を保証しません。
+
+`after` / `before` はRFC3339の時刻として比較し、両境界を含みます。
+同一時刻の指定は可能で、`after > before` は引数エラーです。
+自分の投稿を一律に除外する仕様はなく、自分宛てと判定できる投稿も対象です。
+
+結果の `coverage.requested_window` が今回の条件、`checked_ranges` /
+`uncovered_ranges` がその条件に対するメッセージIDの確認済み・未証明区間です。
+時刻境界のミリ秒内にある全IDを保守的に含めるため、サブミリ秒の指定でも
+境界ミリ秒全体の取得証拠を要求します。全キャッシュの範囲は別の
+`coverage.cached_history` にあり、今回の時刻範囲の確認証拠とは区別します。
+
+`coverage.complete=true` は、明示した1チャンネルの閉じた時刻範囲をID取得
+証拠がすべて覆い、メタデータ・判定・サーバー所属に未確認がない場合だけです。
+`observation_scope="cached_observations"` であり、最新の編集・削除や全履歴の
+完全性は保証せず、`history_complete` は常にfalseです。
+空結果は `checked.messages_classified` と要再取得・判定不明の件数、
+`coverage.reasons` を合わせて確認してください。詳しい契約は
+[Inbox query contract](docs/inbox-query-contract.md) を参照してください。
+
+### スレッド列挙の範囲
+
+`list_threads` は親チャンネルを指定し、種別0/5/15/16の確認後に
+`GET /channels/{id}/threads/search` を使います。`active` / `archived` / `all`
+を扱い、guild単独・`joined`・未対応の親種別は専用エラーになります。
+実効上限は25件で `effective_limit` を返し、`next_cursor` は同じ親・フィルタ
+のオフセット継続用です。検索中の変更に対する固定スナップショットではありません。
+オフセット上限に達しても最後のページは返し、`has_more=true` /
+`next_cursor=null` / `search_window_exhausted=true` で未取得の続きを示します。
+ルートと上限は [Discord OpenAPI仕様](https://github.com/discord/discord-api-spec/blob/main/specs/openapi.json)
+にある契約に基づきますが、その仕様だけでユーザー認証の可否は証明できません。
+今回のユーザー認証による実機検証は未完了です。
+
+RPC失敗には `data.error` と互換用のJSON文字列 `message` があり、
+`error_source` / `code` / `operation` / `retryable` を確認できます。
+`operation` は呼び出したツール名、外部GETの詳細は `request_operation` です。
+SQLiteスキーマ不整合は `CACHE_SCHEMA_MISMATCH` / RPC `-32004` /
+`retryable=false` として返し、一般的な接続不能と区別します。
 
 ユーザー認証での `get_message`、返信先解決、`message_context` の対象取得、
 `get_message_raw`、`get_attachment` は GET履歴の `around` ページから
@@ -351,6 +406,12 @@ unit は `NoNewPrivileges` / `PrivateTmp` / `ProtectSystem=strict` / `ProtectHom
 明示的な継続には、呼出し側で保存した `next_refetch_before` を使ってください。
 このマップは `scope="refetch"` 専用で、チャンネルID・メッセージIDは数値文字列です。
 
+`max_messages` と `refetch_before` は現在のソースに実装されています。
+クライアントの古いツール定義だけでは稼働環境の実装有無を判断できません。
+更新後に新しい `tools/list` で両プロパティを照合してください。
+`refetch` 以外の同期スコープは対象ごとに最新50件を取得する処理で、
+全履歴バックフィルや指定期間の同期は行いません。
+
 この処理は既存行のメタデータだけを再取得します。取得不能行は要再取得の
 まま保持し、本文から空のmentions等を捏造しません。再取得待ちが0件でも、
 未取得の履歴範囲がないとは限らず、coverageをcompleteにはしません。
@@ -368,18 +429,21 @@ unit は `NoNewPrivileges` / `PrivateTmp` / `ProtectSystem=strict` / `ProtectHom
 
 ### 受け入れ基準 (自分宛て受信箱・差分同期)
 
-1. **未取得サーバーの自分宛てメンションを発見** — `list_mentions`
-   (`refresh: true`) が新着チャンネルだけ取得し、`matched_by: "direct"` を返す。
+以下は実機で照合する受入項目です。ローカルのモックテスト成功を、実機での
+陽性検出・429・編集削除検出・再起動継続の検証済みとは扱いません。
+
+1. **既知の自分宛てメンションを発見** — 対象チャンネルを指定した
+   `list_mentions` が `matched_by: "direct"` を返す。未取得範囲も確認する。
 2. **返信先を取得** — `list_replies` / `get_message` が
    `message.reply_to.referenced` に参照先本文と投稿者を内包し、削除済み・
    権限不足・未取得は `reply_to.status` で区別する。
 3. **ロールメンションの本人適用を判定** — `get_member` のロール一覧と
    `matched_by: "role"` の `matched_role_ids` を突き合わせて判定できる。
-4. **再起動後に続きから同期** — `messages_after` / `start_sync` が保存済み
-   カーソル (`get_sync_status` の `last_synced_message_id`) から再開する。
-5. **編集・削除・取得不能を新着なしと区別** — 編集は `edited_timestamp`、
-   削除は tombstone (`get_sync_status` の `deletions_observed`)、取得失敗は
-   `channels_failed` の構造化エラーで返り、「新着なし」と混同されない。
+4. **再起動後に続きから取得** — 呼出し側が差分の `next_after_message_id`
+   または再取得の `next_refetch_before` を保持して再開し、既存行を保つ。
+5. **編集・削除・取得不能を区別** — 再取得した編集の `edited_timestamp` と
+   取得失敗を確認する。差分ページや最新50件だけで全編集・削除の自動検出を
+   保証しない。削除tombstoneは明示的な観測に対して保持される。
 6. **確認済み範囲を数値で提示** — 差分ページの `covered_from` / `covered_to`、
    `coverage.ranges` / `gaps` / `has_gaps` と `get_sync_status` の
    `cached_messages` / `channels_tracked`。観測範囲と全履歴の網羅は区別する。
@@ -521,12 +585,13 @@ search_messages 要求 → SQLite FTS 検索 → 結果を返却
 ```json
 {"id":1,"method":"recent_messages","params":{"channel_id":"123","limit":50}}
 {"id":1,"result":{"channel_id":"123","messages":[...]}}
-{"id":2,"error":{"code":-32601,"message":"unknown method: send_message"}}
 ```
 
-メソッドは `ping` / `list_guilds` / `list_channels` / `recent_messages` /
-`messages_before` / `get_message` / `message_context` / `search_messages` /
-`read_thread` / `list_threads` / `list_dms` のみ。書き込みメソッドは存在しません。
+公開RPCメソッドは上記のツール一覧に対応します。書き込みメソッドは存在しません。
+失敗時はJSON-RPCの `error.code` と `error.data.error` に原因を返し、
+`error.message` にも同じ構造化情報をJSON文字列として含めます。
+MCPでは `isError=true` の結果内に、`error_source` / `code` / `operation` /
+`retryable` / `message` を返します。
 
 ---
 
@@ -568,8 +633,8 @@ search_messages 要求 → SQLite FTS 検索 → 結果を返却
 - **同時 HTTP リクエスト数**: 4 (`DISCORD_MAX_CONCURRENT_REQUESTS` で変更可)。
 - **`list_guilds`**: Discord API の 1 ページ (最大 200 サーバー) のみ取得。ページング
   パラメータは RPC に持たせていない (参加サーバー数が 200 を超えるケースが稀なため)。
-- **タイムスタンプの比較**: ISO-8601 文字列の辞書順 (Discord の形式 `...+00:00` で
-  正規化済みのため時系列順と一致)。`after` / `before` は包含境界。
+- **受信箱のタイムスタンプ比較**: RFC3339の時刻としてオフセット・秒未満を含め
+  比較する。`after` / `before` は包含境界。
 - **`message_context` の順序**: `before` / `after` とも古い順に整列し、
   `before ++ message ++ after` で会話として読めるようにしている。
 - **`refresh`**: `search_messages` の追加取得は明示オプトイン。想定外の通信を発生させない。
@@ -580,7 +645,7 @@ search_messages 要求 → SQLite FTS 検索 → 結果を返却
 
 - Gateway (WebSocket) イベント受信 (自動化を増やすため意図的に未実装)
 - `list_guilds` のページネーション (`before` / `after`) の MCP 暴露
-- アーカイブ済みスレッド (`/channels/{id}/threads/archived/*`) の列挙
+- 参加済み・非公開スレッド専用の列挙 (archived検索は対応、実機確認は未完了)
 - スレッド全量バックフィル、スレッドメンバー情報
 - 添付ファイル本体の取得 (メタデータのみ対応)
 - Embed のフィールド / 画像 / 動画などの詳細抽出 (テキストのみ対応)

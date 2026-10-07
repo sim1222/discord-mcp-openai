@@ -21,18 +21,21 @@ pub struct ReadThreadArgs {
 /// Arguments for `list_threads`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct ListThreadsArgs {
-    /// Guild (server) ID to list threads for (whole-guild scope).
+    /// Optional guild constraint for the parent channel. Guild-only scope is
+    /// unsupported; provide channel_id.
     pub guild_id: Option<String>,
     /// Parent channel ID to list threads for (channel scope; covers forum
-    /// posts and archived threads of that channel). Required when `guild_id`
-    /// is omitted.
+    /// posts and archived threads of that channel). Required. Supported parent
+    /// kinds are text (0), announcement (5), forum (15), and media (16).
     pub channel_id: Option<String>,
-    /// Which threads: `active`, `archived`, `joined`, or `all`. Defaults to
-    /// `all` (active plus archived).
+    /// Which threads: `active`, `archived`, or `all`. Defaults to `all`.
+    /// `joined` produces an explicit unsupported_filter error.
     pub filter: Option<String>,
-    /// How many threads to return, 1-100. Defaults to 50.
+    /// Requested page size, 1-100. Defaults to 50; Discord search caps each
+    /// page at 25, reported as effective_limit.
     pub limit: Option<u32>,
-    /// Resume cursor from a previous call's `next_cursor`.
+    /// Opaque next_cursor from the same channel/filter. This is an offset
+    /// cursor, not a thread ID; search results can change between requests.
     pub cursor: Option<String>,
 }
 
@@ -56,17 +59,23 @@ impl DiscordReaderTools {
         .await
     }
 
-    /// List threads of a guild or of one parent channel, paged.
+    /// Search threads of one parent channel, paged.
     ///
     /// Returns JSON: `{"threads": [{"id", "guild_id", "name", "kind",
     /// "parent_id", "topic", "archived", "locked", "last_message_id",
     /// "message_count", "member_count"}], "next_cursor": ..., "has_more":
-    /// bool}`. Covers active, archived and (with `filter: "joined"`) joined
-    /// threads — including forum posts, which are threads and are not visible
-    /// from the parent channel's message list alone. Give `channel_id` to
-    /// scope to one parent channel (this is the reliable path under a user
-    /// account), or `guild_id` for a whole-guild listing. Thread IDs are taken
-    /// from Discord's response; never guess them from message IDs.
+    /// bool, "effective_limit": ..., "search_window_exhausted": bool,
+    /// "coverage": {"complete": false, "reasons": [...]}}`.
+    /// Uses GET /channels/{id}/threads/search after checking parent metadata.
+    /// Unsupported parent kinds, guild-only scope, joined filter, unavailable
+    /// indexes and malformed responses return structured errors, not empty
+    /// success. Bot-only and permission failures remain distinct. Continue
+    /// with next_cursor unchanged. Results are search-index observations, not
+    /// proof of all accessible threads; offset paging is not a frozen snapshot.
+    /// At the search offset bound, the final valid page is retained with
+    /// has_more=true, next_cursor=null, search_window_exhausted=true, and a
+    /// coverage reason. This means continuation is unavailable, not completion.
+    /// Thread IDs come from Discord; never derive them from message IDs.
     #[tool(name = "list_threads")]
     pub async fn list_threads(
         &self,

@@ -55,33 +55,16 @@ pub enum DiscordRequest {
     ListUserDmChannels,
     /// `GET /users/@me/guilds/{guild.id}/member` (own member in one guild)
     GetOwnGuildMember { guild_id: String },
-    /// `GET /guilds/{guild.id}/threads/search` (joined threads of one guild,
-    /// includes archived threads; user-account friendly)
-    SearchGuildThreads {
-        guild_id: String,
-        /// `true` = archived, `false` = active. `None` = both.
-        archived: Option<bool>,
-        /// Show threads joined by the current user only.
-        joined: Option<bool>,
-        sort_by: Option<String>,
-        sort_order: Option<String>,
-        limit: u32,
-        /// Pagination cursor: show threads before this thread id.
-        before: Option<String>,
-    },
-    /// `GET /channels/{channel.id}/threads` (active + archived threads of one
-    /// parent channel / forum; user-account friendly)
+    /// `GET /channels/{channel.id}/threads/search` (parent-channel search).
     ListChannelThreads {
         channel_id: String,
         /// `true` = archived, `false` = active. `None` = both.
         archived: Option<bool>,
-        /// Show threads joined by the current user only.
-        joined: Option<bool>,
         sort_by: Option<String>,
         sort_order: Option<String>,
         limit: u32,
-        /// Pagination cursor: show threads before this thread id.
-        before: Option<String>,
+        /// Number of search records already consumed.
+        offset: u32,
     },
     /// `GET /channels/{channel.id}/messages/search` (user-account message
     /// search; channel-scoped)
@@ -154,8 +137,9 @@ impl DiscordRequest {
             }
             Self::ListUserDmChannels => "GET /users/@me/channels".to_string(),
             Self::GetOwnGuildMember { .. } => "GET /users/@me/guilds/{guild.id}/member".to_string(),
-            Self::SearchGuildThreads { .. } => "GET /guilds/{guild.id}/threads/search".to_string(),
-            Self::ListChannelThreads { .. } => "GET /channels/{channel.id}/threads".to_string(),
+            Self::ListChannelThreads { .. } => {
+                "GET /channels/{channel.id}/threads/search".to_string()
+            }
             Self::SearchChannelMessages { .. } => {
                 "GET /channels/{channel.id}/messages/search".to_string()
             }
@@ -209,11 +193,8 @@ impl DiscordRequest {
             Self::GetOwnGuildMember { guild_id } => {
                 format!("/users/@me/guilds/{}/member", snowflake(guild_id)?)
             }
-            Self::SearchGuildThreads { guild_id, .. } => {
-                format!("/guilds/{}/threads/search", snowflake(guild_id)?)
-            }
             Self::ListChannelThreads { channel_id, .. } => {
-                format!("/channels/{}/threads", snowflake(channel_id)?)
+                format!("/channels/{}/threads/search", snowflake(channel_id)?)
             }
             Self::SearchChannelMessages { channel_id, .. } => {
                 format!("/channels/{}/messages/search", snowflake(channel_id)?)
@@ -294,44 +275,24 @@ impl DiscordRequest {
                 push_opt(&mut q, "after", after);
                 push_opt(&mut q, "around", around);
             }
-            Self::SearchGuildThreads { .. } | Self::ListChannelThreads { .. } => {
-                let (archived, joined, sort_by, sort_order, limit, before) = match self {
-                    Self::SearchGuildThreads {
-                        archived,
-                        joined,
-                        sort_by,
-                        sort_order,
-                        limit,
-                        before,
-                        ..
-                    }
-                    | Self::ListChannelThreads {
-                        archived,
-                        joined,
-                        sort_by,
-                        sort_order,
-                        limit,
-                        before,
-                        ..
-                    } => (archived, joined, sort_by, sort_order, limit, before),
-                    _ => unreachable!(),
-                };
+            Self::ListChannelThreads {
+                archived,
+                sort_by,
+                sort_order,
+                limit,
+                offset,
+                ..
+            } => {
                 if let Some(archived) = archived {
                     q.push((
                         "archived".into(),
                         if *archived { "true" } else { "false" }.into(),
                     ));
                 }
-                if let Some(joined) = joined {
-                    q.push((
-                        "joined".into(),
-                        if *joined { "true" } else { "false" }.into(),
-                    ));
-                }
                 push_opt(&mut q, "sort_by", sort_by);
                 push_opt(&mut q, "sort_order", sort_order);
                 q.push(("limit".into(), limit.to_string()));
-                push_opt(&mut q, "before", before);
+                q.push(("offset".into(), offset.to_string()));
             }
             Self::SearchChannelMessages {
                 content,
@@ -433,23 +394,13 @@ mod tests {
             DiscordRequest::GetOwnGuildMember {
                 guild_id: "1".into(),
             },
-            DiscordRequest::SearchGuildThreads {
-                guild_id: "1".into(),
-                archived: Some(true),
-                joined: Some(true),
-                sort_by: Some("last_message_time".into()),
-                sort_order: Some("desc".into()),
-                limit: 50,
-                before: Some("3".into()),
-            },
             DiscordRequest::ListChannelThreads {
                 channel_id: "2".into(),
                 archived: None,
-                joined: None,
                 sort_by: None,
                 sort_order: None,
-                limit: 50,
-                before: None,
+                limit: 25,
+                offset: 0,
             },
             DiscordRequest::SearchChannelMessages {
                 channel_id: "2".into(),

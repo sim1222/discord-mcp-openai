@@ -75,7 +75,34 @@ impl RpcError {
     }
 
     fn with_operation(mut self, operation: &str) -> Self {
+        if !self
+            .data
+            .as_ref()
+            .and_then(|data| data.get("error"))
+            .is_some_and(Value::is_object)
+        {
+            let (code, source) = match self.code {
+                -32602 => ("INVALID_PARAMS", "client"),
+                -32601 => ("METHOD_NOT_FOUND", "client"),
+                -32700 => ("PARSE_ERROR", "client"),
+                -32600 => ("INVALID_REQUEST", "client"),
+                _ => ("INTERNAL_ERROR", "daemon"),
+            };
+            self.data = Some(serde_json::json!({"error": {
+                "error_source": source, "code": code, "operation": operation,
+                "retryable": false, "message": self.message
+            }}));
+        }
         if let Some(data) = self.data.as_mut() {
+            if data["error"].get("error_source").is_none() {
+                data["error"]["error_source"] = Value::String("daemon".into());
+            }
+            if data["error"].get("code").is_none() {
+                data["error"]["code"] = Value::String("INTERNAL_ERROR".into());
+            }
+            if data["error"].get("retryable").is_none() {
+                data["error"]["retryable"] = Value::Bool(false);
+            }
             if let Some(request) = data["error"]["operation"]
                 .as_str()
                 .filter(|value| value.starts_with("GET "))
@@ -83,6 +110,9 @@ impl RpcError {
                 data["error"]["request_operation"] = Value::String(request.to_string());
             }
             data["error"]["operation"] = Value::String(operation.to_string());
+            if data["error"].get("message").is_none() {
+                data["error"]["message"] = Value::String("request failed".into());
+            }
             self.message = data.to_string();
         }
         self
@@ -261,7 +291,7 @@ pub struct ThreadsParams {
     pub guild_id: Option<String>,
     #[serde(default)]
     pub channel_id: Option<String>,
-    /// `active`, `archived`, `joined` or `all`.
+    /// `active`, `archived` or `all`; `joined` returns an unsupported-filter error.
     #[serde(default)]
     pub filter: Option<String>,
     #[serde(default)]
@@ -540,7 +570,10 @@ pub async fn handle_connection(stream: UnixStream, api: Arc<dyn ReaderApi>) -> a
             continue;
         }
         if line.len() > MAX_LINE_BYTES {
-            let response = RpcResponse::err(None, RpcError::new(-32600, "request line too large"));
+            let response = RpcResponse::err(
+                None,
+                RpcError::new(-32600, "request line too large").with_operation("rpc_request"),
+            );
             write_response(&mut write_half, &response).await?;
             continue;
         }
@@ -548,7 +581,8 @@ pub async fn handle_connection(stream: UnixStream, api: Arc<dyn ReaderApi>) -> a
             Ok(request) => dispatch(api.as_ref(), request).await,
             Err(error) => Some(RpcResponse::err(
                 None,
-                RpcError::new(-32700, format!("invalid request: {error}")),
+                RpcError::new(-32700, format!("invalid request: {error}"))
+                    .with_operation("rpc_request"),
             )),
         };
         if let Some(response) = response {
@@ -571,6 +605,34 @@ async fn write_response(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plain_rpc_errors_have_uniform_structured_fields() {
+        for (error, code, source) in [
+            (
+                super::RpcError::invalid_params("invalid cursor"),
+                "INVALID_PARAMS",
+                "client",
+            ),
+            (
+                super::RpcError::internal("unexpected payload"),
+                "INTERNAL_ERROR",
+                "daemon",
+            ),
+            (
+                super::RpcError::method_not_found("unknown"),
+                "METHOD_NOT_FOUND",
+                "client",
+            ),
+        ] {
+            let error = error.with_operation("list_changed_channels");
+            let data = error.data.unwrap();
+            assert_eq!(data["error"]["code"], code);
+            assert_eq!(data["error"]["error_source"], source);
+            assert_eq!(data["error"]["operation"], "list_changed_channels");
+            assert_eq!(data["error"]["retryable"], false);
+            assert!(data["error"]["message"].is_string());
+        }
+    }
     #[test]
     fn rpc_operation_retains_actual_message_request() {
         let error = super::RpcError::structured(

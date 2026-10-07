@@ -28,3 +28,15 @@ silently recorded as emptiness. Users explicitly asked for the distinction.
   across servers.
 - Silent best-effort caching: rejected — it is exactly the ambiguity being
   fixed.
+
+## Amendment (2026-10-07)
+
+The original blanket envelope claims are superseded by per-tool evidence
+contracts. Exact-message observations do not certify a contiguous interval,
+and cached activity probes do not certify message retrieval. Inbox queries
+separate the requested time window, checked and uncovered ID intervals,
+classification uncertainty, and whole-cache history. Bounded explicit-channel
+windows can be complete only with full conservative ID evidence and certain
+classification; that describes cached observations, not live edit/deletion
+monitoring or complete history. Migration does not infer coverage from old
+rows. See the [inbox query contract](../inbox-query-contract.md).

@@ -165,6 +165,32 @@ pub struct CoverageRange {
     pub to_id: String,
 }
 
+/// Cached evidence of a channel's server association.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelGuild {
+    Unknown,
+    NoGuild,
+    Guild(String),
+}
+
+impl ChannelGuild {
+    /// The known guild ID, if this evidence identifies one.
+    pub fn id(&self) -> Option<&str> {
+        match self {
+            Self::Guild(id) => Some(id),
+            _ => None,
+        }
+    }
+}
+
+/// One consistent cache observation of a channel and its retrieval evidence.
+#[derive(Debug)]
+pub struct ChannelSnapshot {
+    pub guild: ChannelGuild,
+    pub messages: Vec<MessageRow>,
+    pub coverage: Vec<CoverageRange>,
+}
+
 /// Per-channel sync cursor and last-observed activity.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ChannelSyncRow {
@@ -568,6 +594,55 @@ impl Store {
         Ok(rows)
     }
 
+    /// Observe retained messages, guild association and coverage in one read transaction.
+    pub fn channel_snapshot(&self, channel_id: &str) -> Result<ChannelSnapshot, StoreError> {
+        let conn = self.conn.lock().expect("store lock");
+        let tx = conn.unchecked_transaction()?;
+        let association = tx
+            .query_row(
+                "SELECT guild_id,kind FROM channels WHERE id=?1",
+                params![channel_id],
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, u8>(1)?)),
+            )
+            .optional()?;
+        let guild = match association {
+            Some((Some(id), _)) => ChannelGuild::Guild(id),
+            Some((None, 1 | 3)) => ChannelGuild::NoGuild,
+            _ => ChannelGuild::Unknown,
+        };
+        let messages = {
+            let mut stmt = tx.prepare(
+                "SELECT m.id,m.channel_id,m.guild_id,m.author_id,m.timestamp,
+                m.edited_timestamp,m.content,u.username,u.global_name,m.message_json,m.fetched_at
+                FROM messages m LEFT JOIN users u ON u.id=m.author_id
+                WHERE m.channel_id=?1 ORDER BY CAST(m.id AS INTEGER) DESC",
+            )?;
+            let rows = stmt
+                .query_map(params![channel_id], row_to_message)?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        let coverage = {
+            let mut stmt=tx.prepare("SELECT from_id,to_id FROM coverage WHERE channel_id=?1 ORDER BY CAST(from_id AS INTEGER)")?;
+            let rows = stmt
+                .query_map(params![channel_id], |row| {
+                    Ok(CoverageRange {
+                        channel_id: channel_id.to_owned(),
+                        from_id: row.get(0)?,
+                        to_id: row.get(1)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        tx.commit()?;
+        Ok(ChannelSnapshot {
+            guild,
+            messages,
+            coverage,
+        })
+    }
+
     /// Full-text search over cached messages.
     pub fn search(&self, query: &SearchQuery) -> Result<Vec<SearchHit>, StoreError> {
         let conn = self.conn.lock().expect("store lock");
@@ -659,6 +734,23 @@ impl Store {
             )
             .optional()?
             .flatten())
+    }
+
+    /// Distinguish server membership evidence from known DMs and unknown channels.
+    pub fn channel_guild(&self, channel_id: &str) -> Result<ChannelGuild, StoreError> {
+        let conn = self.conn.lock().expect("store lock");
+        let row = conn
+            .query_row(
+                "SELECT guild_id, kind FROM channels WHERE id = ?1",
+                params![channel_id],
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, u8>(1)?)),
+            )
+            .optional()?;
+        Ok(match row {
+            Some((Some(id), _)) => ChannelGuild::Guild(id),
+            Some((None, 1 | 3)) => ChannelGuild::NoGuild,
+            _ => ChannelGuild::Unknown,
+        })
     }
 
     /// Record a queried ID interval while advancing cursors only to observed messages.
@@ -1368,6 +1460,74 @@ mod tests {
         assert_eq!(row.guild_id.as_deref(), Some("42"));
         assert_eq!(row.known_view().unwrap().guild_id.as_deref(), Some("42"));
         assert_eq!(row.content, "fresh");
+    }
+
+    #[test]
+    fn channel_association_distinguishes_unknown_guild_and_direct_messages() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.channel_guild("200").unwrap(), ChannelGuild::Unknown);
+        for (kind, guild, expected) in [
+            (0, Some("42"), ChannelGuild::Guild("42".into())),
+            (1, None, ChannelGuild::NoGuild),
+            (3, None, ChannelGuild::NoGuild),
+            (0, None, ChannelGuild::Unknown),
+        ] {
+            let store = Store::open_in_memory().unwrap();
+            let channel = serde_json::from_value(
+                serde_json::json!({"id":"200","type":kind,"guild_id":guild}),
+            )
+            .unwrap();
+            store.upsert_channel(&channel).unwrap();
+            assert_eq!(store.channel_guild("200").unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn channel_snapshot_keeps_rows_and_coverage_consistent_during_wal_updates() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.sqlite3");
+        let store = Store::open(&path).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let writer_done = Arc::clone(&done);
+        let writer = std::thread::spawn(move || {
+            let mut conn = rusqlite::Connection::open(path).unwrap();
+            conn.busy_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            for id in 1..=100 {
+                let tx = conn.transaction().unwrap();
+                tx.execute("INSERT INTO messages(id,channel_id,timestamp,content) VALUES(?1,'200','2026-10-07T08:00:00Z','')",[id.to_string()]).unwrap();
+                tx.execute("DELETE FROM coverage WHERE channel_id='200'", [])
+                    .unwrap();
+                tx.execute(
+                    "INSERT INTO coverage(channel_id,from_id,to_id) VALUES('200','1',?1)",
+                    [id.to_string()],
+                )
+                .unwrap();
+                tx.commit().unwrap();
+            }
+            writer_done.store(true, Ordering::SeqCst);
+        });
+        loop {
+            let snapshot = store.channel_snapshot("200").unwrap();
+            assert_eq!(
+                snapshot.messages.len(),
+                snapshot
+                    .coverage
+                    .first()
+                    .map(|range| range.to_id.parse::<usize>().unwrap())
+                    .unwrap_or(0)
+            );
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        writer.join().unwrap();
+        assert_eq!(store.channel_snapshot("200").unwrap().messages.len(), 100);
     }
 
     #[test]

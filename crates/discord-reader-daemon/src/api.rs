@@ -120,7 +120,7 @@ struct InboxWindow {
 
 impl InboxWindow {
     fn from_filter(filter: &InboxFilter) -> Result<Self, RpcError> {
-        Ok(Self {
+        let window = Self {
             after: filter
                 .after
                 .as_deref()
@@ -133,7 +133,15 @@ impl InboxWindow {
                 .map(DateTime::parse_from_rfc3339)
                 .transpose()
                 .map_err(|_| RpcError::invalid_params("before must be RFC3339"))?,
-        })
+        };
+        if let (Some(after), Some(before)) = (window.after, window.before) {
+            if after > before {
+                return Err(RpcError::invalid_params(
+                    "after must not be later than before",
+                ));
+            }
+        }
+        Ok(window)
     }
 
     fn contains(&self, timestamp: &str) -> Result<bool, RpcError> {
@@ -143,7 +151,7 @@ impl InboxWindow {
             ))
         })?;
         Ok(self.after.is_none_or(|after| instant >= after)
-            && self.before.is_none_or(|before| instant < before))
+            && self.before.is_none_or(|before| instant <= before))
     }
 }
 
@@ -379,6 +387,21 @@ impl DaemonApi {
         channel_id: Option<&str>,
     ) -> Result<Vec<String>, RpcError> {
         if let Some(channel_id) = channel_id {
+            if let Some(wanted) = guild_id {
+                let association = self.store.channel_guild(channel_id).map_err(store_error)?;
+                if association != discord_store::sqlite::ChannelGuild::Unknown
+                    && association.id() != Some(wanted)
+                {
+                    return Err(RpcError::structured(
+                        -32602,
+                        json!({"error":{
+                            "error_source":"client","code":"scope_mismatch","retryable":false,
+                            "operation":"inbox_scope","message":"channel does not belong to the requested guild",
+                            "channel_id":channel_id,"expected_guild_id":wanted,"actual_guild_id":association.id()
+                        }}),
+                    ));
+                }
+            }
             return Ok(vec![channel_id.to_string()]);
         }
         self.store.cached_channel_ids(guild_id).map_err(store_error)
@@ -480,8 +503,11 @@ impl DaemonApi {
         let mut messages_classified = 0u64;
         let mut messages_unresolved = 0u64;
         let mut messages_with_known_metadata = 0u64;
+        let mut messages_out_of_scope = 0u64;
+        let mut messages_scope_unverified = 0u64;
         let mut refetch_channels = Vec::new();
         let mut role_memberships = HashMap::new();
+        let mut coverage_evidence = Vec::new();
         let source = if params.refresh {
             "discord+cache"
         } else {
@@ -489,39 +515,55 @@ impl DaemonApi {
         };
 
         for channel_id in &channel_ids {
-            let guild_id = match &params.guild_id {
-                Some(guild_id) => Some(guild_id.clone()),
-                None => self
-                    .store
-                    .channel_guild_id(channel_id)
-                    .map_err(store_error)?,
-            };
-            let mut rows = Vec::new();
+            let classified_before = messages_classified;
+            let unresolved_before = messages_unresolved;
+            let scope_unverified_before = messages_scope_unverified;
             if params.refresh {
                 self.fetch_messages(channel_id, 100, None, None, None)
                     .await?;
             }
-            let mut before = None;
-            loop {
-                let page = self
-                    .store
-                    .channel_messages(channel_id, 200, before.as_deref(), None)
-                    .map_err(store_error)?;
-                let finished = page.len() < 200;
-                before = page.last().map(|row| row.id.clone());
-                rows.extend(page);
-                if finished {
-                    break;
-                }
-            }
+            let snapshot = self
+                .store
+                .channel_snapshot(channel_id)
+                .map_err(store_error)?;
+            let guild_id = snapshot.guild.id().map(str::to_owned);
+            let mut guild_scope_confirmed =
+                params.guild_id.is_none() || guild_id.as_deref() == params.guild_id.as_deref();
+            let rows = snapshot.messages;
             let mut messages: Vec<Message> = Vec::new();
             let mut unknown = 0u64;
             for row in &rows {
                 if !window.contains(&row.timestamp)? {
                     continue;
                 }
-                match row.known_view() {
-                    Some(view) => messages.push(message_from_view(view)),
+                let view = row.known_view();
+                let actual_guild = row
+                    .guild_id
+                    .as_deref()
+                    .or_else(|| view.as_ref().and_then(|view| view.guild_id.as_deref()))
+                    .or(guild_id.as_deref())
+                    .map(str::to_owned);
+                if let Some(wanted) = params.guild_id.as_deref() {
+                    match actual_guild.as_deref() {
+                        Some(actual) if actual != wanted => {
+                            messages_out_of_scope += 1;
+                            continue;
+                        }
+                        None => {
+                            messages_scope_unverified += 1;
+                            continue;
+                        }
+                        _ => {
+                            guild_scope_confirmed = true;
+                        }
+                    }
+                }
+                match view {
+                    Some(view) => {
+                        let mut message = message_from_view(view);
+                        message.guild_id = actual_guild;
+                        messages.push(message);
+                    }
                     _ => unknown += 1,
                 }
             }
@@ -533,9 +575,9 @@ impl DaemonApi {
             messages_with_known_metadata += messages.len() as u64;
             if messages.is_empty() {
                 channels_skipped += 1;
-                continue;
+            } else {
+                channels_scanned += 1;
             }
-            channels_scanned += 1;
             for message in &messages {
                 let (hit, unresolved) = self
                     .classify_inbox(
@@ -563,6 +605,19 @@ impl DaemonApi {
                     key: snowflake_num(&message.id),
                 });
             }
+            coverage_evidence.push(crate::inbox_coverage::ChannelEvidence {
+                channel_id: channel_id.clone(),
+                ranges: snapshot
+                    .coverage
+                    .into_iter()
+                    .map(|range| (range.from_id, range.to_id))
+                    .collect(),
+                messages_classified: messages_classified - classified_before,
+                messages_requiring_refetch: unknown,
+                messages_unresolved: messages_unresolved - unresolved_before,
+                guild_unverified: !guild_scope_confirmed
+                    || messages_scope_unverified > scope_unverified_before,
+            });
         }
 
         // Newest first, capped at `limit`.
@@ -590,27 +645,20 @@ impl DaemonApi {
             })
             .collect();
 
-        // Coverage summary over the scanned channels.
-        let mut covered_from: Option<String> = None;
-        let mut covered_to: Option<String> = None;
-        let mut channels_checked = 0u64;
-        for channel_id in &channel_ids {
-            if let Some((from, to, _)) = self
-                .store
-                .coverage_envelope(channel_id)
-                .map_err(store_error)?
-            {
-                channels_checked += 1;
-                covered_from = Some(match covered_from {
-                    Some(existing) if snowflake_num(&existing) <= snowflake_num(&from) => existing,
-                    _ => from,
-                });
-                covered_to = Some(match covered_to {
-                    Some(existing) if snowflake_num(&existing) >= snowflake_num(&to) => existing,
-                    _ => to,
-                });
+        let coverage = crate::inbox_coverage::evaluate(
+            window.after.map(|time| time.with_timezone(&Utc)),
+            window.before.map(|time| time.with_timezone(&Utc)),
+            &coverage_evidence,
+            params.channel_id.is_some(),
+        )
+        .map_err(|error| match error {
+            crate::inbox_coverage::CoverageError::InvalidWindow => {
+                RpcError::invalid_params(error.to_string())
             }
-        }
+            crate::inbox_coverage::CoverageError::InvalidRange => {
+                store_error(discord_store::StoreError::Data(error.to_string()))
+            }
+        })?;
 
         Ok(json!({
             "mentions": entries,
@@ -620,17 +668,13 @@ impl DaemonApi {
                 "source": source,
                 "messages_classified": messages_classified,
                 "messages_with_known_metadata": messages_with_known_metadata,
+                "messages_out_of_scope":messages_out_of_scope,
+                "messages_scope_unverified":messages_scope_unverified,
                 "messages_unresolved": messages_unresolved,
                 "messages_requiring_refetch": messages_requiring_refetch,
                 "refetch_channels": refetch_channels,
             },
-            "coverage": {
-                "channels_checked": channels_checked,
-                "channels_total_known": channel_ids.len(),
-                "from": covered_from,
-                "to": covered_to,
-                "complete": false,
-            },
+            "coverage": coverage,
             "next_cursor": if total > limit { hits.last().map(|h| h.view.id.clone()) } else { None },
             "has_more": total > limit,
         }))
@@ -971,71 +1015,25 @@ impl ReaderApi for DaemonApi {
     }
 
     async fn list_threads(&self, params: ThreadsParams) -> Result<Value, RpcError> {
-        // Map the friendly `filter` to the archived/joined query flags.
-        // `GetGuildActiveThreads` is bot-only (20002) for user accounts, so we
-        // route through the user-account friendly thread listings instead.
-        let filter = params.filter.as_deref().unwrap_or("all");
-        let archived = match filter {
-            "archived" => Some(true),
-            "active" => Some(false),
-            _ => params.include_archived,
-        };
-        let joined = match filter {
-            "joined" => Some(true),
-            _ => None,
-        };
-        let cursor = params.cursor.clone();
-
-        let value = if let Some(channel_id) = params.channel_id.clone() {
-            self.client
-                .execute_for(&DiscordRequest::ListChannelThreads {
-                    channel_id,
-                    archived,
-                    joined,
-                    sort_by: None,
-                    sort_order: None,
-                    limit: params.limit.clamp(1, 100),
-                    before: cursor,
-                })
-                .await
-                .map_err(|api| rpc_error_from_api(api, None))?
-        } else if let Some(guild_id) = params.guild_id.clone() {
-            self.client
-                .execute_for(&DiscordRequest::SearchGuildThreads {
-                    guild_id,
-                    archived,
-                    joined,
-                    sort_by: None,
-                    sort_order: None,
-                    limit: params.limit.clamp(1, 100),
-                    before: cursor,
-                })
-                .await
-                .map_err(|api| rpc_error_from_api(api, None))?
-        } else {
-            return Err(RpcError::invalid_params("guild_id or channel_id required"));
-        };
-
-        let empty = Vec::new();
-        let threads = value
-            .get("threads")
-            .and_then(|t| t.as_array())
-            .unwrap_or(&empty);
-        let has_more = value
-            .get("has_more")
-            .and_then(|h| h.as_bool())
-            .unwrap_or(false);
-
+        use crate::thread_listing::{DiscordThreadListing, ThreadListing, ThreadQuery};
+        let query = ThreadQuery::new(
+            params.channel_id.as_deref(),
+            params.guild_id.as_deref(),
+            params.filter.as_deref(),
+            params.include_archived,
+            params.limit,
+            params.cursor.as_deref(),
+        )
+        .map_err(|error| RpcError::structured(-32006, json!({"error":error.payload()})))?;
+        let page = DiscordThreadListing::new(Arc::clone(&self.client))
+            .list(&query)
+            .await
+            .map_err(|error| RpcError::structured(-32006, json!({"error":error.payload()})))?;
         let mut entries = Vec::new();
-        let mut next_cursor: Option<String> = None;
-        for thread in threads {
-            match serde_json::from_value::<Channel>(thread.clone()) {
-                Ok(channel) => {
-                    if let Err(error) = self.store.upsert_channel(&channel) {
-                        tracing::warn!(%error, "failed to cache thread");
-                    }
-                    let meta = channel.thread_metadata.as_ref();
-                    entries.push(json!({
+        for channel in page.threads {
+            self.store.upsert_channel(&channel).map_err(store_error)?;
+            let meta = channel.thread_metadata.as_ref();
+            entries.push(json!({
                         "id": channel.id,
                         "guild_id": channel.guild_id,
                         "name": channel.name,
@@ -1047,18 +1045,17 @@ impl ReaderApi for DaemonApi {
                         "last_message_id": channel.last_message_id,
                         "message_count": channel.message_count,
                         "member_count": channel.member_count,
-                    }));
-                    next_cursor = Some(channel.id.clone());
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "skipping malformed thread entry");
-                }
-            }
+            }));
         }
         Ok(json!({
             "threads": entries,
-            "next_cursor": if has_more { next_cursor } else { None },
-            "has_more": has_more,
+            "next_cursor": page.next_cursor,
+            "has_more": page.has_more,
+            "effective_limit": page.effective_limit,
+            "search_window_exhausted":page.search_window_exhausted,
+            "source": "discord_thread_search",
+            "coverage": {"complete":false, "scope":"parent_channel", "notes":"search index results do not prove complete thread discovery",
+                "reasons":if page.search_window_exhausted {vec!["search_window_exhausted"]} else {Vec::<&str>::new()}},
         }))
     }
 
@@ -1136,24 +1133,27 @@ impl ReaderApi for DaemonApi {
                 "list_dms": {"supported": true},
                 "recent_messages": {"supported": true},
                 "messages_before": {"supported": true},
-                "messages_after": {"supported": true},
-                "get_message": {"supported": true, "notes": "reply targets resolved via GET message"},
+                "messages_after": {"supported": true, "continuation_argument":"after_message_id", "continuation_field":"next_after_message_id", "boundary":"exclusive", "page_bounds":["covered_from","covered_to"]},
+                "get_message": {"supported": true, "notes": "user authentication uses exact ID selection from GET message list with around"},
                 "get_message_raw": {"supported": true, "notes": "returns verbatim wire payload"},
                 "message_context": {"supported": true},
                 "search_messages": {"supported": true, "notes": "local FTS over cached messages"},
                 "search_server_side": {"supported": "partial", "notes": "channel-scoped for user accounts"},
-                "list_mentions": {"supported": true},
-                "list_replies": {"supported": true},
+                "list_mentions": {"supported": true,"time_bounds":"inclusive","guild_and_channel":"intersection","includes_self_posts":true,"coverage_basis":"cached_observations"},
+                "list_replies": {"supported": true,"time_bounds":"inclusive","guild_and_channel":"intersection","includes_self_posts":true,"coverage_basis":"cached_observations"},
                 "read_thread": {"supported": true},
-                "list_threads": {"supported": "partial", "notes": "per-channel/user-account endpoints; GetGuildActiveThreads is bot-only (20002)"},
-                "list_changed_channels": {"supported": true},
+                "list_threads": {"supported": "partial", "requires":"channel_id", "filters":["active","archived","all"], "effective_limit_max":25,"notes": "GET parent channel threads/search; user authentication requires live acceptance, guild-wide and joined scopes unsupported"},
+                "list_changed_channels": {"supported": true,"source":"cache","live_checked":false,"refresh_method":"list_channels","notes":"never_synced is not recent new activity"},
                 "get_sync_status": {"supported": true},
-                "start_sync": {"supported": true},
+                "start_sync": {"supported": true,"scopes":["changed_channels","all","mentions","replies","refetch"],"period_filter_supported":false,
+                    "refetch":{"attempt_limit":{"argument":"max_messages","default":100,"min":1,"max":1000},"resume_field":"next_refetch_before","resume_argument":"refetch_before","restart":"successful rows persist; retain cursor client-side and start a new job"},
+                    "recent_scopes":{"page_size":50,"history_complete":false,"notes":"one newest page per cached target; not full backfill or edit/deletion monitoring"}},
                 "get_sync_progress": {"supported": true},
                 "get_member": {"supported": "partial", "notes": "only self member is fetchable with a user account + GET-only"},
                 "get_message_events": {"supported": true},
                 "get_attachment": {"supported": true}
             },
+            "tool_contract_revision":3,
             "limitations": [
                 "read-only: only GET requests are issued; no write operations exist",
                 "GetGuildActiveThreads is bot-only (20002) for user accounts; list_threads uses per-channel/thread-search endpoints",
@@ -1312,10 +1312,23 @@ impl ReaderApi for DaemonApi {
         let mut entries = Vec::new();
         for (channel_id, last_message_id) in changed.into_iter().take(limit as usize) {
             let sync = self.store.channel_sync(&channel_id).map_err(store_error)?;
-            let guild = params.guild_id.clone();
+            let guild = self
+                .store
+                .channel_guild_id(&channel_id)
+                .map_err(store_error)?;
+            let reason = if sync
+                .as_ref()
+                .and_then(|row| row.last_synced_message_id.as_ref())
+                .is_none()
+            {
+                "never_synced"
+            } else {
+                "newer_activity"
+            };
             entries.push(json!({
                 "channel_id": channel_id,
                 "guild_id": guild,
+                "reason":reason,
                 "last_message_id": last_message_id,
                 "last_synced_message_id": sync.as_ref().and_then(|s| s.last_synced_message_id.clone()),
                 "last_activity_at": sync.as_ref().and_then(|s| s.last_activity_at.clone()),
@@ -1325,6 +1338,8 @@ impl ReaderApi for DaemonApi {
         }
         Ok(json!({
             "changed_channels": entries,
+            "freshness":{"source":"cache","live_checked":false,"refresh_method":"list_channels",
+                "last_fetched_at_semantics":"latest recorded channel metadata or message fetch; not a live activity probe"},
             "next_cursor": next_cursor,
             "has_more": has_more,
         }))
@@ -2178,8 +2193,367 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(result["mentions"].as_array().unwrap().len(), 2);
-        assert_eq!(result["checked"]["messages_classified"], 2);
+        assert_eq!(result["mentions"].as_array().unwrap().len(), 3);
+        assert_eq!(result["checked"]["messages_classified"], 3);
+    }
+
+    #[test]
+    fn inbox_time_bounds_are_inclusive_at_the_same_instant_and_millisecond_neighbors() {
+        for equal in ["2026-09-30T09:05:16.669Z", "2026-09-30T09:05:16.669+00:00"] {
+            for (after, before, expected) in [
+                ("2026-09-30T09:05:16.668Z", equal, true),
+                (equal, equal, true),
+                (equal, "2026-09-30T09:05:16.670Z", true),
+                (
+                    "2026-09-30T09:05:16.670Z",
+                    "2026-09-30T09:05:16.671Z",
+                    false,
+                ),
+                (
+                    "2026-09-30T09:05:16.667Z",
+                    "2026-09-30T09:05:16.668Z",
+                    false,
+                ),
+            ] {
+                let window = InboxWindow::from_filter(&InboxFilter {
+                    after: Some(after.into()),
+                    before: Some(before.into()),
+                    ..Default::default()
+                })
+                .unwrap();
+                assert_eq!(window.contains(equal).unwrap(), expected);
+            }
+        }
+        assert!(InboxWindow::from_filter(&InboxFilter {
+            after: Some("2026-09-30T09:05:17Z".into()),
+            before: Some("2026-09-30T09:05:16Z".into()),
+            ..Default::default()
+        })
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn inbox_guild_filter_intersects_channel_without_inventing_membership() {
+        let mock = spawn_mock(VecDeque::new()).await;
+        let (api, store) = api_for(&mock.base);
+        *api.me_id.lock().unwrap() = Some("7".into());
+        for value in [
+            json!({"id":"10","guild_id":"42","mention_roles":["555"]}),
+            json!({"id":"11"}),
+            json!({"id":"12","guild_id":"43"}),
+        ] {
+            let mut value = value;
+            value["channel_id"] = json!("200");
+            value["timestamp"] = json!("2026-09-30T09:05:16.669Z");
+            value["mentions"] = json!([{"id":"7"}]);
+            store
+                .insert_message(&serde_json::from_value(value).unwrap())
+                .unwrap();
+        }
+        let filter = InboxFilter {
+            channel_id: Some("200".into()),
+            guild_id: Some("43".into()),
+            limit: 5,
+            ..Default::default()
+        };
+        let result = api.list_mentions(filter.clone()).await.unwrap();
+        assert_eq!(result["mentions"].as_array().unwrap().len(), 1);
+        assert_eq!(result["mentions"][0]["message"]["id"], "12");
+        assert_eq!(result["mentions"][0]["guild_id"], "43");
+        assert_eq!(result["checked"]["messages_out_of_scope"], 1);
+        assert_eq!(result["checked"]["messages_scope_unverified"], 1);
+        let replies = api.list_replies(filter).await.unwrap();
+        assert!(replies["mentions"].as_array().unwrap().is_empty());
+        let no_guild = api
+            .list_mentions(InboxFilter {
+                channel_id: Some("200".into()),
+                limit: 5,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let unknown = no_guild["mentions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["message"]["id"] == "11")
+            .unwrap();
+        assert!(unknown["guild_id"].is_null());
+        assert!(mock.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn inbox_rejects_known_channel_guild_mismatch_without_discord_requests() {
+        let mock = spawn_mock(VecDeque::new()).await;
+        let (api, store) = api_for(&mock.base);
+        *api.me_id.lock().unwrap() = Some("7".into());
+        for (kind, guild) in [(0, Some("42")), (1, None)] {
+            store
+                .upsert_channel(
+                    &serde_json::from_value(json!({"id":"200","type":kind,"guild_id":guild}))
+                        .unwrap(),
+                )
+                .unwrap();
+            for replies_only in [false, true] {
+                let filter = InboxFilter {
+                    channel_id: Some("200".into()),
+                    guild_id: Some("43".into()),
+                    limit: 5,
+                    ..Default::default()
+                };
+                let result = if replies_only {
+                    api.list_replies(filter).await
+                } else {
+                    api.list_mentions(filter).await
+                };
+                assert_eq!(
+                    result.unwrap_err().data.unwrap()["error"]["code"],
+                    "scope_mismatch"
+                );
+            }
+        }
+        assert!(mock.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn inbox_requested_window_distinguishes_confirmed_zero_from_outside_cache() {
+        let mock = spawn_mock(VecDeque::new()).await;
+        let (api, store) = api_for(&mock.base);
+        *api.me_id.lock().unwrap() = Some("7".into());
+        let start = DateTime::parse_from_rfc3339("2026-09-30T09:05:16.669Z").unwrap();
+        let from = ((start.timestamp_millis() - 1_420_070_400_000) as u64) << 22;
+        let to = from | ((1 << 22) - 1);
+        store
+            .record_coverage(
+                "200",
+                &from.to_string(),
+                &to.to_string(),
+                "2026-10-07T11:00:00Z",
+                false,
+            )
+            .unwrap();
+        let filter = InboxFilter {
+            channel_id: Some("200".into()),
+            after: Some(start.to_rfc3339()),
+            before: Some(start.to_rfc3339()),
+            limit: 5,
+            ..Default::default()
+        };
+        for replies_only in [false, true] {
+            let result = if replies_only {
+                api.list_replies(filter.clone()).await
+            } else {
+                api.list_mentions(filter.clone()).await
+            }
+            .unwrap();
+            assert!(result["mentions"].as_array().unwrap().is_empty());
+            assert_eq!(result["coverage"]["complete"], true);
+            assert_eq!(result["coverage"]["history_complete"], false);
+            assert_eq!(
+                result["coverage"]["requested_window"]["before_inclusive"],
+                true
+            );
+            assert!(result["coverage"]["uncovered_ranges"]
+                .as_array()
+                .unwrap()
+                .is_empty());
+        }
+        let outside = api
+            .list_mentions(InboxFilter {
+                after: Some("2026-10-01T00:00:00Z".into()),
+                before: Some("2026-10-01T00:01:00Z".into()),
+                ..filter
+            })
+            .await
+            .unwrap();
+        assert_eq!(outside["coverage"]["complete"], false);
+        assert_eq!(outside["coverage"]["channels_checked"], 0);
+        assert_eq!(outside["checked"]["channels_scanned"], 0);
+        assert_eq!(outside["checked"]["channels_skipped"], 1);
+        assert!(!outside["coverage"]["cached_history"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            outside["coverage"]["uncovered_ranges"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn inbox_includes_self_posts_and_replies_at_equal_inclusive_bounds() {
+        let mock = spawn_mock(VecDeque::new()).await;
+        let (api, store) = api_for(&mock.base);
+        *api.me_id.lock().unwrap() = Some("7".into());
+        let time = "2026-09-30T09:05:16.669Z";
+        for raw in [
+            json!({"id":"9","channel_id":"200","author":{"id":"7"},"timestamp":"2026-09-30T09:00:00Z"}),
+            json!({"id":"10","channel_id":"200","author":{"id":"7"},"timestamp":time,"mentions":[{"id":"7"}],"message_reference":{"message_id":"9","type":0}}),
+            json!({"id":"11","channel_id":"200","author":{"id":"7"},"timestamp":time,"mention_everyone":true}),
+        ] {
+            store
+                .insert_message(&serde_json::from_value(raw).unwrap())
+                .unwrap();
+        }
+        let filter = InboxFilter {
+            channel_id: Some("200".into()),
+            after: Some(time.into()),
+            before: Some("2026-09-30T09:05:16.669+00:00".into()),
+            limit: 5,
+            ..Default::default()
+        };
+        let mentions = api.list_mentions(filter.clone()).await.unwrap();
+        assert_eq!(mentions["mentions"].as_array().unwrap().len(), 2);
+        assert_eq!(mentions["mentions"][0]["matched_by"], "everyone");
+        let replies = api.list_replies(filter).await.unwrap();
+        assert_eq!(replies["mentions"].as_array().unwrap().len(), 1);
+        assert_eq!(replies["mentions"][0]["matched_by"], "reply");
+        assert!(mock.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn changed_channels_is_a_cached_probe_with_actual_guild_and_unsynced_reason() {
+        let mock = spawn_mock(VecDeque::new()).await;
+        let (api, store) = api_for(&mock.base);
+        for (id, last) in [("200", "300"), ("201", "100")] {
+            store
+                .upsert_channel(
+                    &serde_json::from_value(
+                        json!({"id":id,"guild_id":"42","type":0,"last_message_id":last}),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        store
+            .record_coverage("200", "90", "100", "2026-10-07T11:00:00Z", false)
+            .unwrap();
+        for _ in 0..3 {
+            let result = api
+                .list_changed_channels(ChangedChannelsParams {
+                    guild_id: None,
+                    limit: 5,
+                    cursor: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(result["freshness"]["source"], "cache");
+            assert_eq!(result["freshness"]["live_checked"], false);
+            assert_eq!(result["changed_channels"][0]["guild_id"], "42");
+            assert_eq!(result["changed_channels"][0]["reason"], "newer_activity");
+            assert_eq!(result["changed_channels"][1]["reason"], "never_synced");
+        }
+        assert!(mock.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn capabilities_publish_current_cursor_and_sync_contracts() {
+        let mock = spawn_mock(VecDeque::new()).await;
+        let (api, _) = api_for(&mock.base);
+        let value = api.get_capabilities().await.unwrap();
+        assert_eq!(value["tool_contract_revision"], 3);
+        assert_eq!(
+            value["methods"]["messages_after"]["continuation_argument"],
+            "after_message_id"
+        );
+        assert_eq!(
+            value["methods"]["messages_after"]["continuation_field"],
+            "next_after_message_id"
+        );
+        assert_eq!(
+            value["methods"]["start_sync"]["refetch"]["attempt_limit"]["default"],
+            100
+        );
+        assert_eq!(
+            value["methods"]["start_sync"]["refetch"]["resume_argument"],
+            "refetch_before"
+        );
+        assert_eq!(value["methods"]["list_threads"]["requires"], "channel_id");
+        assert!(mock.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn inbox_guild_only_inventory_is_unproven_even_with_complete_cached_channel_window() {
+        let mock = spawn_mock(VecDeque::new()).await;
+        let (api, store) = api_for(&mock.base);
+        *api.me_id.lock().unwrap() = Some("7".into());
+        store
+            .upsert_channel(
+                &serde_json::from_value(json!({"id":"200","guild_id":"42","type":0})).unwrap(),
+            )
+            .unwrap();
+        let time = DateTime::parse_from_rfc3339("2026-09-30T09:05:16.669Z").unwrap();
+        let from = ((time.timestamp_millis() - 1_420_070_400_000) as u64) << 22;
+        store
+            .record_coverage(
+                "200",
+                &from.to_string(),
+                &(from | ((1 << 22) - 1)).to_string(),
+                "2026-10-07T11:00:00Z",
+                true,
+            )
+            .unwrap();
+        let result = api
+            .list_mentions(InboxFilter {
+                guild_id: Some("42".into()),
+                after: Some(time.to_rfc3339()),
+                before: Some(time.to_rfc3339()),
+                limit: 5,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(result["coverage"]["complete"], false);
+        assert_eq!(result["coverage"]["channels_checked"], 1);
+        assert!(result["coverage"]["uncovered_ranges"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(result["coverage"]["reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("unknown_channel_inventory")));
+    }
+
+    #[tokio::test]
+    async fn inbox_refresh_is_not_a_complete_requested_period_backfill() {
+        let time = DateTime::parse_from_rfc3339("2026-09-30T09:05:16.669Z").unwrap();
+        let id = (((time.timestamp_millis() - 1_420_070_400_000) as u64) << 22) + 100;
+        let body=serde_json::to_string(&json!([{"id":id.to_string(),"channel_id":"200","timestamp":time.to_rfc3339(),"author":{"id":"99"},"mentions":[{"id":"7"}]}])).unwrap();
+        let mock = spawn_mock(VecDeque::from([(200, body)])).await;
+        let (api, _) = api_for(&mock.base);
+        *api.me_id.lock().unwrap() = Some("7".into());
+        let result = api
+            .list_mentions(InboxFilter {
+                channel_id: Some("200".into()),
+                after: Some("2026-09-30T09:05:16.660Z".into()),
+                before: Some("2026-09-30T09:05:16.680Z".into()),
+                limit: 5,
+                refresh: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(result["mentions"].as_array().unwrap().len(), 1);
+        assert_eq!(result["checked"]["messages_classified"], 1);
+        assert_eq!(result["coverage"]["complete"], false);
+        assert_eq!(
+            result["coverage"]["checked_ranges"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            result["coverage"]["uncovered_ranges"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -2705,8 +3079,12 @@ mod tests {
 
     #[tokio::test]
     async fn list_threads_with_channel_id_hits_channel_threads_endpoint() {
-        let thread = r#"{"threads":[{"id":"300","guild_id":"42","name":"topic-a","type":11,"parent_id":"200","message_count":3,"member_count":2,"thread_metadata":{"archived":false,"locked":false}}]}"#;
-        let mock = spawn_mock(VecDeque::from([(200, thread.to_string())])).await;
+        let thread = r#"{"threads":[{"id":"300","guild_id":"42","name":"topic-a","type":11,"parent_id":"200","message_count":3,"member_count":2,"thread_metadata":{"archived":false,"locked":false}}],"has_more":false}"#;
+        let mock = spawn_mock(VecDeque::from([
+            (200, r#"{"id":"200","guild_id":"42","type":0}"#.into()),
+            (200, thread.to_string()),
+        ]))
+        .await;
         let (api, store) = api_for(&mock.base);
 
         let result = api
@@ -2715,7 +3093,7 @@ mod tests {
                 channel_id: Some("200".into()),
                 filter: Some("active".into()),
                 include_archived: None,
-                limit: 50,
+                limit: 1,
                 cursor: None,
             })
             .await
@@ -2725,19 +3103,159 @@ mod tests {
 
         let requests = mock.requests.lock().unwrap().clone();
         assert!(
-            requests[0].contains("/channels/200/threads"),
+            requests[1].contains("/channels/200/threads/search"),
             "must hit the per-channel thread listing, got: {}",
-            requests[0]
+            requests[1]
         );
         assert!(
-            !requests[0].contains("/threads/active"),
+            !requests[1].contains("/threads/active"),
             "must not use the bot-only active-threads endpoint, got: {}",
-            requests[0]
+            requests[1]
         );
-        assert!(requests[0].contains("archived=false"));
+        assert!(requests[1].contains("archived=false"));
+        assert!(requests[1].contains("limit=1"));
+        assert!(requests[1].contains("offset=0"));
         // Threads are cached.
         let cached = store.channel_sync("300");
         assert!(cached.is_ok());
+    }
+
+    #[tokio::test]
+    async fn list_threads_reports_unsupported_parent_kind_before_search() {
+        let mock = spawn_mock(VecDeque::from([(200, r#"{"id":"200","type":4}"#.into())])).await;
+        let (api, _) = api_for(&mock.base);
+        let error = api
+            .list_threads(ThreadsParams {
+                channel_id: Some("200".into()),
+                filter: Some("active".into()),
+                limit: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.data.unwrap()["error"]["code"],
+            "unsupported_channel_kind"
+        );
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_threads_final_window_page_is_returned_with_incomplete_reason() {
+        let mock=spawn_mock(VecDeque::from([
+            (200,r#"{"id":"200","guild_id":"42","type":0}"#.into()),
+            (200,r#"{"threads":[{"id":"300","type":11,"parent_id":"200","thread_metadata":{"archived":false}}],"has_more":true}"#.into()),
+        ])).await;
+        let (api, _) = api_for(&mock.base);
+        let page = api
+            .list_threads(ThreadsParams {
+                channel_id: Some("200".into()),
+                filter: Some("active".into()),
+                limit: 1,
+                cursor: Some("threads:200:active:9975".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page["threads"][0]["id"], "300");
+        assert_eq!(page["next_cursor"], Value::Null);
+        assert_eq!(page["has_more"], true);
+        assert_eq!(page["search_window_exhausted"], true);
+        assert_eq!(page["coverage"]["complete"], false);
+        assert_eq!(
+            page["coverage"]["reasons"],
+            json!(["search_window_exhausted"])
+        );
+        assert!(mock.requests.lock().unwrap()[1].contains("offset=9975"));
+    }
+
+    #[tokio::test]
+    async fn list_threads_pages_by_consumed_offset_and_preserves_failures() {
+        let metadata = r#"{"id":"200","guild_id":"42","type":0}"#;
+        let mock = spawn_mock(VecDeque::from([
+            (200, metadata.into()),
+            (200,r#"{"threads":[{"id":"300","type":11,"parent_id":"200","thread_metadata":{"archived":false}}],"has_more":true}"#.into()),
+            (200, metadata.into()),
+            (200,r#"{"threads":[{"id":"299","type":11,"parent_id":"200","thread_metadata":{"archived":false}}],"has_more":false}"#.into()),
+        ])).await;
+        let (api, _) = api_for(&mock.base);
+        let first = api
+            .list_threads(ThreadsParams {
+                channel_id: Some("200".into()),
+                filter: Some("active".into()),
+                limit: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(first["next_cursor"], "threads:200:active:1");
+        let second = api
+            .list_threads(ThreadsParams {
+                channel_id: Some("200".into()),
+                filter: Some("active".into()),
+                limit: 1,
+                cursor: Some(first["next_cursor"].as_str().unwrap().into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(first["threads"][0]["id"], "300");
+        assert_eq!(second["threads"][0]["id"], "299");
+        assert_eq!(second["has_more"], false);
+        assert!(mock.requests.lock().unwrap()[3].contains("offset=1"));
+
+        for (status, body, expected) in [
+            (403, r#"{"code":20002,"message":"bot only"}"#, "bot_only"),
+            (
+                403,
+                r#"{"code":50013,"message":"missing permissions"}"#,
+                "forbidden",
+            ),
+            (
+                400,
+                r#"{"code":50035,"message":"Invalid Form Body","errors":{"limit":{"_errors":[{"code":"NUMBER_TYPE_MAX","message":"Must be 25 or fewer"}]}}}"#,
+                "invalid_request",
+            ),
+            (200, r#"{"code":110000,"retry_after":2}"#, "index_not_ready"),
+            (202, r#"{"code":110000,"retry_after":2}"#, "index_not_ready"),
+            (200, r#"{}"#, "invalid_response"),
+        ] {
+            let mock = spawn_mock(VecDeque::from([
+                (200, metadata.into()),
+                (status, body.into()),
+            ]))
+            .await;
+            let (api, _) = api_for(&mock.base);
+            let error = api
+                .list_threads(ThreadsParams {
+                    channel_id: Some("200".into()),
+                    filter: Some("active".into()),
+                    limit: 1,
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err();
+            let error = error.data.unwrap()["error"].clone();
+            assert_eq!(error["code"], expected);
+            if matches!(status, 400 | 403) {
+                assert_eq!(error["operation"],"GET /channels/200/threads/search?archived=false&sort_by=creation_time&sort_order=desc&limit=1&offset=0");
+                assert_eq!(error["retryable"], false);
+            }
+            if status == 202 {
+                assert_eq!(error["retryable"], true);
+                assert_eq!(error["discord_code"], 110000);
+            }
+            if status == 400 {
+                assert_eq!(error["details"][0]["path"], "limit");
+                assert_eq!(error["details"][0]["code"], "NUMBER_TYPE_MAX");
+            }
+            assert!(mock
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| request.starts_with("GET ")));
+        }
     }
 
     #[tokio::test]

@@ -13,14 +13,13 @@ One on-demand retrieval of data from Discord. Fetching never marks anything read
 _Avoid_: crawl, sync, poll (for a single retrieval)
 
 **Coverage**:
-The span of message IDs in a channel that we have confirmed we fetched
-contiguously from Discord. Coverage is stated as `covered_from` / `covered_to`
-plus `has_gaps`; it is knowledge, not optimism.
+Message-ID intervals in a channel supported by contiguous retrieval
+observations. Coverage is evidence of retrieval, not a claim of current live state.
 _Avoid_: history, backlog
 
 **Gap**:
-A hole between two coverage ranges: message IDs we know we never fetched. A
-gap means "unknown", never "nothing there".
+An interval without confirmed retrieval evidence. A gap means "unknown",
+never "nothing there" or proof that a message was lost.
 _Avoid_: hole, missing (too vague)
 
 **Backfill**:
@@ -29,14 +28,29 @@ backfill is `complete` only when we have reached the channel's first message.
 _Avoid_: history scan
 
 **Differential sync**:
-Resuming from a cursor and retrieving only what changed since: new messages
-(after a message ID), edits and deletions. Distinguished from a full re-read.
+Observing changes since a prior reading position. Only actually observed new
+messages, edits or deletions count as changes; a recent-page refresh is not a complete history comparison.
 _Avoid_: incremental fetch, delta
 
 **Cursor**:
-A resumable position for paging or differential sync — typically the highest
-message ID confirmed so far. Cursors survive process restarts.
+A resumable position within a specific listing or retrieval scope. Keeping
+that position does not imply that an interrupted job restarts automatically.
 _Avoid_: offset, bookmark
+
+**Requested-window completeness**:
+Retrieval evidence covers the specified channels and time bounds, and the
+relevant observations can be classified without uncertainty. This does not imply complete history or current live state.
+_Avoid_: fully synced (does not specify scope)
+
+**Activity probe**:
+A comparison of observed channel activity with prior reading progress.
+Unobserved or never-read activity is not necessarily recent activity.
+_Avoid_: new-message check (implies freshness)
+
+**Metadata refetch**:
+Retrieving missing addressing information for retained messages. It is
+distinct from discovering older messages through backfill.
+_Avoid_: full resync
 
 **Tombstone**:
 A recorded deletion: a message ID we observed being removed, kept so a later
@@ -48,7 +62,7 @@ _Avoid_: delete marker
 **Inbox**:
 The cross-server set of messages directed at the current user: direct
 mentions, replies to their messages, role mentions that apply to them, and
-@everyone/@here. `list_mentions` and `list_replies` are inbox views.
+@everyone/@here. Authorship alone does not exclude a message addressed to this account.
 _Avoid_: feed, notifications (Discord's notification state is out of scope)
 
 **Match kind**:
@@ -66,17 +80,15 @@ Discord restricts to one kind (e.g. bot-only search) are declared, not guessed.
 _Avoid_: auth mode
 
 **Capability**:
-A declared, per-method statement of what works under the current credential
-kind, with notes where Discord limits it. `get_capabilities` is the source of
-truth; tool errors carry the same classification.
+Declared support and limitations of a reader operation under a credential
+kind. A capability does not prove current permissions or successful live acceptance.
 _Avoid_: feature flag
 
 ### Failure
 
 **Error source**:
-Which layer failed: `discord`, `transport`, `rate_limit`, or `client`. A
-cancellation or timeout is `transport`/`client`, never "no data" and never
-"channel forbidden".
+The origin of a reading failure, such as Discord, transport, input validation
+or the cache. A failed observation never means a completed empty observation.
 _Avoid_: error type (too generic)
 
 **Retryable**:

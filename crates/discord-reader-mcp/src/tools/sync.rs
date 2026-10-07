@@ -47,15 +47,17 @@ pub struct SyncProgressArgs {
 
 #[tool_router(vis = "pub(crate)", router = sync_router)]
 impl DiscordReaderTools {
-    /// List channels with new activity since the last sync.
+    /// List cached channels whose last observed message has not been synced.
     ///
     /// Returns JSON: `{"changed_channels": [{"channel_id", "guild_id",
     /// "last_message_id", "last_synced_message_id", "last_activity_at",
-    /// "last_fetched_at", "backfill"}], "next_cursor": ..., "has_more":
-    /// bool}`. This is a cheap probe (no message bodies fetched): it compares
-    /// each channel's Discord-reported `last_message_id` against the sync
-    /// cursor. Use it to decide which channels are worth reading instead of
-    /// re-reading every channel.
+    /// "last_fetched_at", "backfill", "reason"}], "next_cursor": ..., "has_more":
+    /// bool}`. This cache-only probe makes no Discord requests. First refresh
+    /// `list_channels` to update the observed `last_message_id`; the result
+    /// is relative to the local sync cursor, not a live new-message feed.
+    /// `reason: "never_synced"` includes old channels without a sync cursor;
+    /// `reason: "newer_activity"` means observed activity exceeds that cursor.
+    /// Listing freshness does not establish complete history or inbox coverage.
     #[tool(name = "list_changed_channels")]
     pub async fn list_changed_channels(
         &self,
@@ -99,7 +101,9 @@ impl DiscordReaderTools {
     /// Lookup failures remain pending
     /// and appear as `done_with_gaps`; historical coverage is not inferred.
     /// Other scopes fetch latest messages from known channels, with
-    /// `changed_channels` restricted to activity. Returns `{"job_id": ...}`.
+    /// `changed_channels` restricted to cached unsynced activity. Refresh
+    /// channel listings first. This is a recent snapshot, not a history crawl.
+    /// Returns `{"job_id": ...}`.
     /// Job IDs expire when the daemon restarts.
     #[tool(name = "start_sync")]
     pub async fn start_sync(

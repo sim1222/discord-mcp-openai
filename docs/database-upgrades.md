@@ -51,14 +51,41 @@ when reading previously stored v2 JSON). Invalid cached JSON requires retrieval
 as well. Missing mentions or replies on incomplete rows do not mean confirmed
 absence.
 
-`list_mentions` and `list_replies` report `messages_classified`,
-`messages_requiring_refetch`, and `refetch_channels` in `checked`, for the
-requested time window. They scan retained history, page matches by exclusive
-message-ID cursor, and keep `coverage.complete=false`. Refreshing a recent page
-does not erase the unknown status of older retained rows.
-RFC3339 timestamps are compared as instants, including subseconds and offsets.
+`list_mentions` and `list_replies` report classified, known-metadata,
+requiring-refetch, unresolved-classification, and unverified-scope counts in
+`checked`, for the requested time window. They scan retained history and page
+matches by exclusive message-ID cursor. Refreshing a recent page does not erase
+the unknown status of older retained rows. Missing role membership and unknown
+reply authors remain unresolved; successful `roles=[]` is a known empty set.
+RFC3339 timestamps are compared as instants, including subseconds and offsets;
+both time boundaries are inclusive. Equal bounds are valid, reversed bounds
+are rejected. Self-authored messages are not categorically excluded.
 Channel discovery includes retained messages even without sync history or a
-cached channel listing. Invalid timestamps return a cache data error.
+cached channel listing, but does not establish a complete live inventory.
+Guild and channel filters intersect. A known conflicting guild or known DM
+fails with `scope_mismatch`; unknown guild associations are not filled from the
+search argument and remain unverified. Invalid timestamps return a cache data
+error. See [Inbox query contract](inbox-query-contract.md).
+
+`coverage.requested_window` identifies the current query. Its conservative
+snowflake bounds include every possible ID in each boundary millisecond.
+`checked_ranges` and `uncovered_ranges` are intersections and subtractions of
+confirmed ID intervals, labelled `representation: "message_id"`; they do not
+fabricate timestamp observations. `cached_history` separately describes
+retained whole-cache ranges. A closed requested window can be complete only for
+explicit channel scope, full ID interval coverage, and certain metadata,
+classification, and guild scope. Open bounds and cached-only channel discovery
+cannot be complete. `observation_scope: "cached_observations"` does not certify
+current live edits or deletions; `history_complete` remains false.
+Each channel's messages, guild association, and coverage evidence are read in
+one SQLite read transaction. This consistent per-channel observation does not
+freeze other channels, subsequent inbox pages, or Discord itself.
+Role-member GET requests and reply-author cache lookups occur outside the
+target-message transaction; those classification dependencies can be newer.
+Valid timestamps beyond the snowflake horizon are accepted with clamped ID
+bounds, disclosed by `requested_id_window.clamped` and per-bound flags. Their
+time conditions are retained, and `window_outside_snowflake_horizon` prevents
+`complete=true` even when all representable IDs are covered.
 
 `get_sync_status` exposes `schema_version` and the total
 `messages_requiring_refetch`. `cached_messages` counts retained rows;
@@ -67,6 +94,12 @@ channel with cached messages. Thus 18,384 cached messages with zero tracked
 channels and empty coverage is possible for a legacy cache and is not proof of
 data loss.
 
+`list_changed_channels` makes no HTTP requests; it probes stored activity and
+sync cursors. Refresh the activity observation with `list_channels` first when
+needed. `reason: "never_synced"` means no sync cursor, even for an old channel;
+`reason: "newer_activity"` means an observed activity ID exceeds that cursor.
+The listing's current retrieval time does not make old activity new. Neither
+reason proves edit or deletion detection.
 Changed-channel paging filters by guild and uses the last activity ID/channel
 ID pair as a cursor, probing one additional row for continuation. Synchronizing
 a returned channel does not shift the next page. This is a changing activity
@@ -155,6 +188,35 @@ an exhausted selected range with pending rows elsewhere is `done_with_gaps`.
 A zero remaining count proves metadata
 availability only for retained rows in scope, not complete channel history.
 
+`max_messages` and `refetch_before` exist in the current source. Old client
+discovery alone cannot establish whether a deployment exposes them. After
+updating, inspect a fresh `tools/list` schema for both properties. Other sync
+scopes fetch the latest 50 messages per selected channel; they do not backfill
+all history or support a requested time period.
+
+## Parent-scoped thread search
+
+`list_threads` requires a parent `channel_id` and verifies channel kinds
+0 (text), 5 (announcement), 15 (forum), or 16 (media). It searches
+`GET /channels/{id}/threads/search` for `active`, `archived`, or `all`;
+guild-only scope, `joined`, and unsupported parent kinds return explicit
+failures. Optional guild scope must match the observed parent.
+
+The effective page limit is at most 25, returned as `effective_limit`.
+Continuation uses a parent/filter-scoped consumed-offset cursor with a maximum
+offset of 9975. Search results can change between requests; no immutable
+snapshot or full history is promised. Permission, bot-only, rate-limit, search
+index, and malformed-result failures remain errors rather than empty results.
+When the final supported page still reports more upstream results, the page is
+returned with `has_more=true`, `next_cursor=null`,
+`search_window_exhausted=true`, and the corresponding coverage reason.
+Unavailable continuation is not proof that the listing is complete.
+Endpoint shape and limits do not establish compatibility with the particular
+user credential; live verification is still pending. The route, page limit,
+and offset bound follow the [Discord OpenAPI specification](https://github.com/discord/discord-api-spec/blob/main/specs/openapi.json)
+entry for `/channels/{channel_id}/threads/search`. That specification is not
+evidence of compatibility with a user credential.
+
 ## Failures and validation limits
 
 Cache failures use RPC code `-32004`, `error_source: "cache"`, a stable code,
@@ -163,6 +225,14 @@ the RPC method as `operation`, and `retryable`. Schema mismatches are
 retryable. Startup migration errors identify the database in local diagnostics.
 Structured cache data is also in the JSON-RPC `data` field, with the existing
 JSON-encoded `message` retained for compatibility with deployed MCP clients.
+All dispatched errors use `data.error` with `error_source`, `code`, `operation`,
+`retryable`, and `message`. `operation` names the invoked RPC method;
+`request_operation` retains external GET context when present. Local argument
+errors use `INVALID_PARAMS` from `client`; unexpected daemon failures use
+`INTERNAL_ERROR`. MCP transport failures use retryable `DAEMON_UNAVAILABLE` or
+`DAEMON_TIMEOUT`; invalid RPC responses use nonretryable `RPC_PROTOCOL_ERROR`.
+Discord bad requests remain nonretryable `invalid_request`, and bounded
+validation details omit submitted values.
 RPC errors do not expose filesystem paths. Coverage writes fail the request
 instead of logging a warning and returning apparent success. Deletion of a
 cached message, its FTS row, and its tombstone update is transactional.
@@ -176,5 +246,6 @@ lookup, exact selection, raw preservation, bot-only versus permissions errors,
 deleted-reference null versus absence, bounded metadata refetch, and continuation
 from durable pending rows. Live verification of these updated message routes,
 user-authenticated threads, raw messages, attachments/events, sync jobs,
-positive inbox examples, and requested-window coverage remains separate from
+positive inbox examples, actual role membership, 429 handling, observed edits
+and deletions, restart continuation, and requested-window coverage remains separate from
 the local regression suite. No production refetch is performed by these tests.

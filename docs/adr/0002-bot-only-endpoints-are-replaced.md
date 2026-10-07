@@ -30,3 +30,19 @@ for either working user-auth methods or explicit capability declarations.
   `list_threads` accepts `channel_id` for exactly this reason.
 - A bot token would unlock the simpler guild-wide endpoints; the capability
   table should change if credential kind ever changes.
+
+## Amendment (2026-10-07)
+
+The earlier thread-route and user-accessibility claims in the Decision section
+are superseded. `list_threads` now uses only `GET /channels/{id}/threads/search`
+after checking the parent channel type. It exposes offset paging with an
+effective page size of at most 25 and offsets up to 9975. Guild-only scope and
+the `joined` filter return explicit `unsupported_scope` and
+`unsupported_filter` errors. The final valid search page is retained even when
+the offset bound prevents continuation.
+
+The official API specification establishes this route and its query limits,
+not user-token compatibility. That compatibility needs separate live
+acceptance; no route is described as proven merely because local mocks pass.
+See the [current retrieval contract](../database-upgrades.md) and
+[official API specification](https://github.com/discord/discord-api-spec/blob/main/specs/openapi.json).

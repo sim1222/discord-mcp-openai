@@ -15,8 +15,8 @@ use std::sync::Arc;
 use rmcp::{
     handler::server::router::tool::ToolRouter,
     model::{
-        CallToolResult, ContentBlock, Implementation, InitializeResult, ProtocolVersion,
-        ServerCapabilities,
+        CallToolResponse, CallToolResult, ContentBlock, Implementation, InitializeResult,
+        ProtocolVersion, ServerCapabilities,
     },
     tool_handler, ErrorData, ServerHandler,
 };
@@ -59,13 +59,48 @@ impl DiscordReaderTools {
     ) -> Result<CallToolResult, ErrorData> {
         match self.client.call(method, params).await {
             Ok(value) => json_result(&value),
-            Err(error) => Ok(remote_error(error)),
+            Err(error) => Ok(remote_error(method, error)),
         }
     }
 }
 
 #[tool_handler]
 impl ServerHandler for DiscordReaderTools {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let operation = request.name.to_string();
+        let call = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        match Self::tool_router().call(call).await {
+            Ok(CallToolResponse::Complete(result)) if result.is_error == Some(true) => {
+                let text = result
+                    .content
+                    .first()
+                    .and_then(|content| content.as_text())
+                    .map(|content| content.text.as_str())
+                    .unwrap_or("tool failed");
+                if serde_json::from_str::<Value>(text)
+                    .ok()
+                    .and_then(|value| value.get("error").cloned())
+                    .is_some()
+                {
+                    Ok(result.into())
+                } else {
+                    let error = if text.starts_with("failed to deserialize parameters:") {
+                        ErrorData::invalid_params("invalid tool arguments", None)
+                    } else {
+                        ErrorData::internal_error("tool failed", None)
+                    };
+                    Ok(tool_error(&operation, error).into())
+                }
+            }
+            Ok(result) => Ok(result),
+            Err(error) => Ok(tool_error(&operation, error).into()),
+        }
+    }
+
     fn get_info(&self) -> InitializeResult {
         let mut info = InitializeResult::new(ServerCapabilities::builder().enable_tools().build());
         info.server_info = Implementation::new("discord-reader-mcp", env!("CARGO_PKG_VERSION"));
@@ -73,8 +108,10 @@ impl ServerHandler for DiscordReaderTools {
             "Read-only view of Discord servers, channels, messages, threads and DMs. \
              Data is fetched on demand and cached locally; full-text search covers \
              messages already fetched. Cross-server inbox tools (list_mentions, \
-             list_replies) report the checked range so empty results are meaningful, \
-             and every listing carries next_cursor/has_more and coverage info. \
+             list_replies) report metadata and coverage limits; an incomplete empty \
+             result cannot prove there are no messages. Consult each tool's paging \
+             contract. list_changed_channels compares cached activity with local \
+             sync cursors; refresh list_channels first for a current observation. \
              get_capabilities reports what works under the current credential kind. \
              This server cannot write to Discord and never marks anything read."
                 .to_string(),
@@ -107,23 +144,68 @@ pub(crate) fn json_result(value: &Value) -> Result<CallToolResult, ErrorData> {
 /// through verbatim so callers can decide mechanically whether to retry and
 /// what failed, instead of parsing prose. Failures are never rendered as empty
 /// results: an error is an error, not "nothing there".
-pub(crate) fn remote_error(error: RpcClientError) -> CallToolResult {
-    if let RpcClientError::Remote { code, message } = &error {
-        if let Ok(parsed) = serde_json::from_str::<Value>(message) {
-            if parsed.get("error").is_some() {
-                let text = serde_json::to_string_pretty(&json!({
-                    "error": parsed["error"],
-                    "context": parsed.get("context").cloned().unwrap_or(Value::Null),
-                    "rpc_code": code,
-                }))
-                .unwrap_or_else(|_| message.clone());
-                return CallToolResult::error(vec![ContentBlock::text(text)]);
-            }
+pub(crate) fn remote_error(operation: &str, error: RpcClientError) -> CallToolResult {
+    let (mut payload, rpc_code) = match error {
+        RpcClientError::Remote {
+            code,
+            message,
+            data,
+        } => {
+            let payload = data.filter(|value| value.get("error").is_some_and(Value::is_object)).or_else(|| serde_json::from_str::<Value>(&message).ok().filter(|value| value.get("error").is_some_and(Value::is_object))).unwrap_or_else(|| {
+                let (name, source) = if code == -32602 { ("INVALID_PARAMS", "client") } else if code == -32601 { ("METHOD_NOT_FOUND", "client") } else { ("INTERNAL_ERROR", "daemon") };
+                json!({"error":{"error_source":source,"code":name,"retryable":false,"message":message}})
+            });
+            (payload, Some(code))
         }
+        RpcClientError::Connect { .. } => (
+            json!({"error":{"error_source":"transport","code":"DAEMON_UNAVAILABLE","retryable":true,"message":"cannot connect to Discord reader daemon"}}),
+            None,
+        ),
+        RpcClientError::Timeout => (
+            json!({"error":{"error_source":"transport","code":"DAEMON_TIMEOUT","retryable":true,"message":"Discord reader daemon call timed out"}}),
+            None,
+        ),
+        RpcClientError::Protocol(_) => (
+            json!({"error":{"error_source":"protocol","code":"RPC_PROTOCOL_ERROR","retryable":false,"message":"invalid Discord reader daemon response"}}),
+            None,
+        ),
+    };
+    if let Some(request) = payload["error"]["operation"]
+        .as_str()
+        .filter(|value| value.starts_with("GET "))
+    {
+        payload["error"]["request_operation"] = json!(request.to_string());
     }
-    CallToolResult::error(vec![ContentBlock::text(format!(
-        "discord-reader-daemon error: {error}"
-    ))])
+    payload["error"]["operation"] = json!(operation);
+    if payload["error"].get("error_source").is_none() {
+        payload["error"]["error_source"] = json!("daemon");
+    }
+    if payload["error"].get("code").is_none() {
+        payload["error"]["code"] = json!("INTERNAL_ERROR");
+    }
+    if payload["error"].get("retryable").is_none() {
+        payload["error"]["retryable"] = json!(false);
+    }
+    if payload["error"].get("message").is_none() {
+        payload["error"]["message"] = json!("request failed");
+    }
+    if let Some(code) = rpc_code {
+        payload["rpc_code"] = json!(code);
+    }
+    CallToolResult::error(vec![ContentBlock::text(
+        serde_json::to_string_pretty(&payload).expect("JSON error payload"),
+    )])
+}
+
+fn tool_error(operation: &str, error: ErrorData) -> CallToolResult {
+    let invalid = error.code == rmcp::model::ErrorCode::INVALID_PARAMS;
+    let payload = json!({"error":{
+        "error_source":if invalid { "client" } else { "mcp" }, "code":if invalid { "INVALID_PARAMS" } else { "INTERNAL_ERROR" },
+        "operation":operation, "retryable":false, "message":error.message
+    }, "rpc_code":error.code.0});
+    CallToolResult::error(vec![ContentBlock::text(
+        serde_json::to_string_pretty(&payload).expect("JSON error payload"),
+    )])
 }
 
 /// Validate an optional limit argument.
@@ -156,6 +238,120 @@ pub(crate) fn window_or(value: Option<u32>, default: u32) -> Result<u32, ErrorDa
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn result_json(result: &CallToolResult) -> Value {
+        let rendered = serde_json::to_value(result).unwrap();
+        serde_json::from_str(rendered["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn remote_errors_prefer_data_and_retain_legacy_message_compatibility() {
+        let result = remote_error(
+            "get_message",
+            RpcClientError::Remote {
+                code: -32005,
+                message: "human detail".into(),
+                data: Some(
+                    json!({"error":{"error_source":"discord","code":"bot_only","operation":"get_message","retryable":false,"message":"bot endpoint","discord_code":20002},"context":{"channel_id":"200"}}),
+                ),
+            },
+        );
+        let value = result_json(&result);
+        assert_eq!(value["error"]["discord_code"], 20002);
+        assert_eq!(value["context"]["channel_id"], "200");
+        let legacy = remote_error(
+            "list_changed_channels",
+            RpcClientError::Remote {
+                code: -32602,
+                message: "invalid cursor".into(),
+                data: None,
+            },
+        );
+        assert_eq!(result_json(&legacy)["error"]["code"], "INVALID_PARAMS");
+        assert_eq!(
+            result_json(&legacy)["error"]["operation"],
+            "list_changed_channels"
+        );
+    }
+
+    #[test]
+    fn local_validation_and_transport_errors_are_structured() {
+        let result = tool_error("recent_messages", limit_or(Some(0), 50, 100).unwrap_err());
+        let value = result_json(&result);
+        assert_eq!(value["error"]["code"], "INVALID_PARAMS");
+        assert_eq!(value["error"]["operation"], "recent_messages");
+        assert_eq!(value["error"]["retryable"], false);
+        let timeout = result_json(&remote_error("start_sync", RpcClientError::Timeout));
+        assert_eq!(timeout["error"]["code"], "DAEMON_TIMEOUT");
+        assert_eq!(timeout["error"]["retryable"], true);
+    }
+
+    #[test]
+    fn current_start_sync_discovery_advertises_refetch_arguments() {
+        let tool = DiscordReaderTools::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "start_sync")
+            .unwrap();
+        let properties = tool.input_schema["properties"].as_object().unwrap();
+        assert!(properties.contains_key("max_messages"));
+        assert!(properties.contains_key("refetch_before"));
+        assert!(tool
+            .description
+            .as_deref()
+            .unwrap()
+            .contains("refetch_before"));
+    }
+
+    #[tokio::test]
+    async fn mcp_calls_render_limit_and_argument_type_failures_as_structured_tool_errors() {
+        use futures::{channel::mpsc, StreamExt};
+        let (sender, incoming) = mpsc::unbounded::<rmcp::model::ClientJsonRpcMessage>();
+        let (outgoing, mut receiver) = mpsc::unbounded::<rmcp::model::ServerJsonRpcMessage>();
+        let tools =
+            DiscordReaderTools::new(Arc::new(RpcClient::new("/nonexistent/discord-reader.sock")));
+        let server = tokio::spawn(async move {
+            rmcp::serve_server(tools, (outgoing, incoming))
+                .await
+                .unwrap()
+                .waiting()
+                .await
+                .unwrap()
+        });
+        sender.unbounded_send(serde_json::from_value(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"regression","version":"1"}}})).unwrap()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), receiver.next())
+            .await
+            .unwrap()
+            .unwrap();
+        sender
+            .unbounded_send(
+                serde_json::from_value(
+                    json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        for (id, arguments) in [
+            (2, json!({"channel_id":"200","limit":0})),
+            (3, json!({"channel_id":"200","limit":"not a number"})),
+        ] {
+            sender.unbounded_send(serde_json::from_value(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"recent_messages","arguments":arguments}})).unwrap()).unwrap();
+            let response = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.next())
+                .await
+                .unwrap()
+                .unwrap();
+            let response = serde_json::to_value(response).unwrap();
+            assert_eq!(response["result"]["isError"], true);
+            let payload: Value =
+                serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(payload["error"]["code"], "INVALID_PARAMS");
+            assert_eq!(payload["error"]["operation"], "recent_messages");
+            assert_eq!(payload["error"]["retryable"], false);
+        }
+        drop(sender);
+        server.abort();
+    }
 
     /// The tool surface must stay strictly read-only: no write verbs may ever
     /// appear as tool names.

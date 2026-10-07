@@ -26,7 +26,11 @@ pub enum RpcClientError {
     #[error("rpc call timed out")]
     Timeout,
     #[error("daemon returned error {code}: {message}")]
-    Remote { code: i64, message: String },
+    Remote {
+        code: i64,
+        message: String,
+        data: Option<Value>,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -48,6 +52,8 @@ struct RpcResponse {
 struct RpcErrorPayload {
     code: i64,
     message: String,
+    #[serde(default)]
+    data: Option<Value>,
 }
 
 /// Client for the daemon's Unix socket RPC.
@@ -117,6 +123,7 @@ impl RpcClient {
                 return Err(RpcClientError::Remote {
                     code: error.code,
                     message: error.message,
+                    data: error.data,
                 });
             }
             response.result.ok_or_else(|| {
@@ -192,7 +199,7 @@ mod tests {
         let client = RpcClient::new(path);
         let error = client.call("send_message", json!({})).await.unwrap_err();
         match error {
-            RpcClientError::Remote { code, message } => {
+            RpcClientError::Remote { code, message, .. } => {
                 assert_eq!(code, -32601);
                 assert!(message.contains("unknown method"));
             }
@@ -206,5 +213,21 @@ mod tests {
         let client = RpcClient::new("/nonexistent/discord-reader.sock");
         let error = client.call("ping", json!({})).await.unwrap_err();
         assert!(matches!(error, RpcClientError::Connect { .. }));
+    }
+
+    #[tokio::test]
+    async fn structured_error_data_survives_the_rpc_client() {
+        let (path, handle) = spawn_stub(|request| Some(serde_json::json!({"id":request["id"],"error":{"code":-32602,"message":"invalid cursor","data":{"error":{"error_source":"client","code":"INVALID_PARAMS","operation":"list_changed_channels","retryable":false,"message":"invalid cursor"}}}}).to_string())).await;
+        let error = RpcClient::new(path)
+            .call("list_changed_channels", json!({"cursor":"invalid"}))
+            .await
+            .unwrap_err();
+        match error {
+            RpcClientError::Remote {
+                data: Some(data), ..
+            } => assert_eq!(data["error"]["operation"], "list_changed_channels"),
+            other => panic!("unexpected error: {other}"),
+        }
+        handle.abort();
     }
 }

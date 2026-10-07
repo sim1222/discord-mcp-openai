@@ -49,6 +49,9 @@ pub struct ApiError {
     /// Discord error `message` from the response body, when present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discord_message: Option<String>,
+    /// Bounded field paths and validation codes, without submitted values.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
     /// Whether retrying the same request may succeed later.
     pub retryable: bool,
     /// Suggested wait before retrying, in milliseconds.
@@ -74,6 +77,7 @@ impl ApiError {
                     (404, _) => "not_found",
                     (403, _) => "forbidden",
                     (429, _) => "rate_limited",
+                    (400, _) => "invalid_request",
                     _ => "discord_error",
                 };
                 let retryable = matches!(status, 429 | 500 | 502 | 503 | 504);
@@ -83,10 +87,18 @@ impl ApiError {
                     http_status: Some(status),
                     discord_code,
                     discord_message,
+                    details: (discord_code == Some(50035))
+                        .then(|| validation_details(body))
+                        .flatten(),
                     retryable,
                     retry_after_ms: None,
                     operation,
-                    message: error.to_string(),
+                    message: format!(
+                        "Discord request failed (HTTP {status}, code {})",
+                        discord_code
+                            .map(|code| code.to_string())
+                            .unwrap_or_else(|| "unknown".into())
+                    ),
                 }
             }
             DiscordError::RateLimited => Self {
@@ -95,6 +107,7 @@ impl ApiError {
                 http_status: None,
                 discord_code: None,
                 discord_message: None,
+                details: None,
                 retryable: true,
                 retry_after_ms: None,
                 operation,
@@ -106,6 +119,7 @@ impl ApiError {
                 http_status: None,
                 discord_code: None,
                 discord_message: None,
+                details: None,
                 retryable: !matches!(inner, crate::rate_limit::RateLimitError::ShuttingDown),
                 retry_after_ms: None,
                 operation,
@@ -117,6 +131,7 @@ impl ApiError {
                 http_status: None,
                 discord_code: None,
                 discord_message: None,
+                details: None,
                 retryable: true,
                 retry_after_ms: None,
                 operation,
@@ -128,6 +143,7 @@ impl ApiError {
                 http_status: None,
                 discord_code: None,
                 discord_message: None,
+                details: None,
                 retryable: false,
                 retry_after_ms: None,
                 operation,
@@ -142,6 +158,7 @@ impl ApiError {
                 http_status: None,
                 discord_code: None,
                 discord_message: None,
+                details: None,
                 retryable: false,
                 retry_after_ms: None,
                 operation,
@@ -149,6 +166,68 @@ impl ApiError {
             },
         }
     }
+}
+
+fn validation_details(body: &str) -> Option<serde_json::Value> {
+    fn collect(
+        value: &serde_json::Value,
+        path: &str,
+        depth: usize,
+        visited: &mut usize,
+        errors: &mut Vec<serde_json::Value>,
+    ) {
+        if depth > 8 || *visited >= 256 || errors.len() >= 16 {
+            return;
+        }
+        *visited += 1;
+        let Some(object) = value.as_object() else {
+            return;
+        };
+        if let Some(entries) = object.get("_errors").and_then(|value| value.as_array()) {
+            for entry in entries.iter().take(16 - errors.len()) {
+                if let Some(code) =
+                    entry
+                        .get("code")
+                        .and_then(|value| value.as_str())
+                        .filter(|code| {
+                            code.len() <= 64
+                                && code.bytes().all(|byte| {
+                                    byte.is_ascii_uppercase()
+                                        || byte.is_ascii_digit()
+                                        || byte == b'_'
+                                })
+                        })
+                {
+                    errors.push(serde_json::json!({"path":path,"code":code,"message":"Discord rejected this field."}));
+                }
+            }
+        }
+        for (key, value) in object {
+            if key == "_errors"
+                || key.len() > 64
+                || !key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                continue;
+            }
+            let next = if path.is_empty() {
+                key.clone()
+            } else {
+                format!("{path}.{key}")
+            };
+            if next.len() <= 256 {
+                collect(value, &next, depth + 1, visited, errors);
+            }
+            if *visited >= 256 || errors.len() >= 16 {
+                break;
+            }
+        }
+    }
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let mut errors = Vec::new();
+    collect(value.get("errors")?, "", 0, &mut 0, &mut errors);
+    (!errors.is_empty()).then_some(serde_json::Value::Array(errors))
 }
 
 /// Parse a Discord error body: `{"message": "...", "code": 50001}`.
@@ -240,6 +319,35 @@ mod tests {
     use super::*;
 
     const SECRET: &str = "SECRET-USER-TOKEN-DO-NOT-LEAK";
+
+    #[test]
+    fn bad_request_preserves_bounded_validation_paths_without_raw_response_fields() {
+        let error = DiscordError::Api {
+            status: 400,
+            body: serde_json::json!({"code":50035,"message":"Invalid Form Body","token":SECRET,"errors":{"limit":{"_errors":[{"code":"NUMBER_TYPE_MAX","message":"must be less than 100","value":SECRET}]}}}).to_string(),
+        };
+        let api = ApiError::from_discord_error(
+            &error,
+            Some("GET /channels/{id}/threads/archived/public".into()),
+        );
+        assert_eq!(api.code, "invalid_request");
+        assert!(!api.retryable);
+        let details = api.details.unwrap();
+        assert_eq!(details[0]["path"], "limit");
+        assert_eq!(details[0]["code"], "NUMBER_TYPE_MAX");
+        assert!(details[0]["message"].is_string());
+        assert!(!details.to_string().contains(SECRET));
+    }
+
+    #[test]
+    fn validation_details_are_bounded_and_do_not_echo_submitted_message_values() {
+        let entries: Vec<_> = (0..100).map(|_| serde_json::json!({"code":"BASE_TYPE_REQUIRED","message":SECRET,"value":SECRET})).collect();
+        let error = DiscordError::Api { status:400, body:serde_json::json!({"code":50035,"message":"Invalid Form Body","errors":{"before":{"_errors":entries}}}).to_string() };
+        let api = ApiError::from_discord_error(&error, None);
+        let payload = serde_json::to_value(api).unwrap();
+        assert_eq!(payload["details"].as_array().unwrap().len(), 16);
+        assert!(!payload.to_string().contains(SECRET));
+    }
 
     #[test]
     fn api_errors_carry_discord_codes() {
