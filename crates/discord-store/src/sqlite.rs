@@ -402,11 +402,31 @@ impl Store {
     /// Insert with an explicit fetch timestamp (used by tests and by the
     /// daemon's observed-at bookkeeping).
     pub fn insert_message_at(&self, message: &Message, fetched_at: &str) -> Result<(), StoreError> {
-        let view = MessageView::from(message);
-        let message_json = serde_json::to_string(&view)
-            .map_err(|e| StoreError::Search(format!("cannot serialize message view: {e}")))?;
         let conn = self.conn.lock().expect("store lock");
         let tx = conn.unchecked_transaction()?;
+        let mut view = MessageView::from(message);
+        if view.guild_id.is_none() {
+            view.guild_id = tx
+                .query_row(
+                    "SELECT guild_id FROM messages WHERE id = ?1 AND channel_id = ?2",
+                    params![message.id, message.channel_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten();
+            if view.guild_id.is_none() {
+                view.guild_id = tx
+                    .query_row(
+                        "SELECT guild_id FROM channels WHERE id = ?1",
+                        params![message.channel_id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()?
+                    .flatten();
+            }
+        }
+        let message_json = serde_json::to_string(&view)
+            .map_err(|e| StoreError::Search(format!("cannot serialize message view: {e}")))?;
         tx.execute(
             "INSERT INTO messages
                 (id, channel_id, guild_id, author_id, timestamp, edited_timestamp, content,
@@ -424,7 +444,7 @@ impl Store {
             params![
                 message.id,
                 message.channel_id,
-                message.guild_id,
+                view.guild_id,
                 message.author.as_ref().map(|a| a.id.clone()),
                 message.timestamp,
                 message.edited_timestamp,
@@ -478,7 +498,7 @@ impl Store {
     pub fn channels(&self, guild_id: &str) -> Result<Vec<ChannelView>, StoreError> {
         let conn = self.conn.lock().expect("store lock");
         let mut stmt = conn.prepare(
-            "SELECT id, guild_id, name, kind, parent_id, topic
+            "SELECT id, guild_id, name, kind, parent_id, topic, last_message_id
              FROM channels WHERE guild_id = ?1
              ORDER BY
                 CASE WHEN parent_id IS NULL THEN 0 ELSE 1 END,
@@ -495,6 +515,7 @@ impl Store {
                     kind: row.get(3)?,
                     parent_id: row.get(4)?,
                     topic: row.get(5)?,
+                    last_message_id: row.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -618,6 +639,39 @@ impl Store {
         fetched_at: &str,
         backfill_complete: bool,
     ) -> Result<(), StoreError> {
+        self.record_page_coverage(
+            channel_id,
+            (from_id, to_id),
+            (from_id, to_id),
+            fetched_at,
+            backfill_complete,
+        )
+    }
+
+    /// Resolve a cached channel's guild without implying current membership.
+    pub fn channel_guild_id(&self, channel_id: &str) -> Result<Option<String>, StoreError> {
+        let conn = self.conn.lock().expect("store lock");
+        Ok(conn
+            .query_row(
+                "SELECT guild_id FROM channels WHERE id = ?1",
+                params![channel_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Record a queried ID interval while advancing cursors only to observed messages.
+    pub fn record_page_coverage(
+        &self,
+        channel_id: &str,
+        interval: (&str, &str),
+        observed: (&str, &str),
+        fetched_at: &str,
+        backfill_complete: bool,
+    ) -> Result<(), StoreError> {
+        let (from_id, to_id) = interval;
+        let (observed_from, observed_to) = observed;
         let conn = self.conn.lock().expect("store lock");
         let tx = conn.unchecked_transaction()?;
         tx.execute(
@@ -640,10 +694,13 @@ impl Store {
             .optional()?;
         let (last_synced, oldest_synced) = match current {
             Some((last, old)) => (
-                max_id(last.as_deref(), to_id),
-                min_id(old.as_deref(), from_id),
+                max_id(last.as_deref(), observed_to),
+                min_id(old.as_deref(), observed_from),
             ),
-            None => (Some(to_id.to_string()), Some(from_id.to_string())),
+            None => (
+                Some(observed_to.to_string()),
+                Some(observed_from.to_string()),
+            ),
         };
         let backfill = if backfill_complete {
             "complete".to_string()
@@ -1275,6 +1332,7 @@ mod tests {
             attachments: vec![],
             embeds: vec![],
             message_reference: Some(MessageReference {
+                kind: None,
                 message_id: Some("999".into()),
                 channel_id: None,
                 guild_id: None,
@@ -1295,6 +1353,21 @@ mod tests {
         assert_eq!(row.content, "hello world");
         assert_eq!(row.author_name.as_deref(), Some("user1"));
         assert_eq!(store.message_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn refetch_without_guild_preserves_retained_context_in_columns_and_view() {
+        let store = Store::open_in_memory().unwrap();
+        let mut original = message("10", "200", "7", "old");
+        original.guild_id = Some("42".into());
+        store.insert_message(&original).unwrap();
+        original.guild_id = None;
+        original.content = "fresh".into();
+        store.insert_message(&original).unwrap();
+        let row = store.get_message("10").unwrap().unwrap();
+        assert_eq!(row.guild_id.as_deref(), Some("42"));
+        assert_eq!(row.known_view().unwrap().guild_id.as_deref(), Some("42"));
+        assert_eq!(row.content, "fresh");
     }
 
     #[test]

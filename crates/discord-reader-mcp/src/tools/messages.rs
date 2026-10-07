@@ -136,6 +136,10 @@ impl DiscordReaderTools {
     /// Fetch one message by ID.
     ///
     /// Returns JSON: `{"message": {...}}` in the normalized message shape.
+    /// User authentication selects the exact ID from an around-message GET
+    /// history page. `message_not_observed` means the target was not returned;
+    /// it does not establish deletion. Discord `bot_only` and `forbidden`
+    /// failures remain distinct structured errors.
     #[tool(name = "get_message")]
     pub async fn get_message(
         &self,
@@ -156,7 +160,9 @@ impl DiscordReaderTools {
     /// target message replies to another, the referenced message is resolved
     /// inline in `message.reply_to.referenced` where possible, with
     /// `reply_to.status` telling whether it was `resolved`, `deleted`,
-    /// `forbidden` or `unknown`.
+    /// `forbidden`, `bot_only`, `not_observed`, `unavailable` or `unknown`.
+    /// Only an explicit deleted-reference observation proves `deleted`;
+    /// absence from a lookup page is `not_observed`.
     #[tool(name = "message_context")]
     pub async fn message_context(
         &self,
@@ -178,11 +184,17 @@ impl DiscordReaderTools {
 
     /// Fetch messages posted after a given message ID (differential sync).
     ///
-    /// Returns JSON: `{"channel_id": "...", "messages": [...], "next_cursor":
-    /// ..., "has_more": bool, "covered_from": ..., "covered_to": ...}`.
-    /// Messages newer than `after_message_id`, newest first. Pass the highest
-    /// message ID you have already seen to resume where a previous call left
-    /// off; this is the cheap way to catch up without re-reading a channel.
+    /// Returns JSON: `{"channel_id": "...", "messages": [...],
+    /// "next_after_message_id": "...", "has_more": bool,
+    /// "covered_from": ..., "covered_to": ..., "coverage":
+    /// {"ranges": [...], "gaps": [...], "has_gaps": bool, "complete": false}}`.
+    /// The boundary is exclusive; results are newest first. Continue by
+    /// passing `next_after_message_id` as `after_message_id` (not next_cursor).
+    /// It is the highest returned ID, or the input ID on an empty page.
+    /// A full page conservatively sets has_more=true; the next may be empty.
+    /// covered_from/to are this page's minimum/maximum observed IDs, null
+    /// when empty. Coverage ranges are stored observations, not proof of
+    /// complete history; gaps identify unproven intervals between them.
     #[tool(name = "messages_after")]
     pub async fn messages_after(
         &self,

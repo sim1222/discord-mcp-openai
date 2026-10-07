@@ -221,6 +221,8 @@ pub struct EmbedField {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MessageReference {
+    #[serde(default, rename = "type")]
+    pub kind: Option<u8>,
     #[serde(default = "d")]
     pub message_id: Option<String>,
     #[serde(default = "d")]
@@ -529,6 +531,8 @@ impl From<&Reaction> for ReactionView {
 /// Resolved reference to another message (reply target).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MessageRefView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_type: Option<u8>,
     pub message_id: String,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -537,7 +541,8 @@ pub struct MessageRefView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guild_id: Option<String>,
     /// `resolved` (the referenced message body is inline in `referenced`),
-    /// `deleted`, `forbidden` or `unknown` when we could not resolve it.
+    /// Otherwise `deleted`, `forbidden`, `bot_only`, `not_observed`,
+    /// `unavailable` or `unknown`.
     pub status: String,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -747,14 +752,18 @@ impl From<&Message> for MessageView {
             r.message_id.clone().map(|id| {
                 let status = if m.referenced_message.is_some() {
                     "resolved"
-                } else if m.referenced_message_status.as_deref() == Some("deleted") {
-                    "deleted"
-                } else if m.referenced_message_status.as_deref() == Some("forbidden") {
-                    "forbidden"
                 } else {
-                    "unknown"
+                    match m.referenced_message_status.as_deref() {
+                        Some("deleted") => "deleted",
+                        Some("forbidden") => "forbidden",
+                        Some("bot_only") => "bot_only",
+                        Some("not_observed") => "not_observed",
+                        Some("unavailable") => "unavailable",
+                        _ => "unknown",
+                    }
                 };
                 MessageRefView {
+                    reference_type: r.kind,
                     message_id: id,
                     channel_id: r.channel_id.clone(),
                     guild_id: r.guild_id.clone(),
@@ -842,6 +851,9 @@ pub struct ChannelView {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
+    /// Last message ID observed from Discord; null means it has not been reported.
+    #[serde(default)]
+    pub last_message_id: Option<String>,
 }
 
 impl From<&Channel> for ChannelView {
@@ -853,6 +865,7 @@ impl From<&Channel> for ChannelView {
             kind: c.kind,
             parent_id: c.parent_id.clone(),
             topic: c.topic.clone(),
+            last_message_id: c.last_message_id.clone(),
         }
     }
 }
@@ -938,6 +951,7 @@ mod tests {
                 fields: vec![],
             }],
             message_reference: Some(MessageReference {
+                kind: Some(0),
                 message_id: Some("42".into()),
                 channel_id: Some("456".into()),
                 guild_id: Some("789".into()),

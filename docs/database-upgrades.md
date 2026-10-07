@@ -77,6 +77,84 @@ the input on an empty page). A full page sets `has_more=true` conservatively;
 the next page may be empty. A message page never replaces Discord's observed
 channel `last_message_id` with its own maximum.
 
+## User-authenticated message observation
+
+The `MessageLookup` boundary observes one exact channel/message pair without
+writing coverage, history cursors, or deletion tombstones. With user credentials,
+`get_message`, `get_message_raw`, `get_attachment`, the focal message in
+`message_context`, and reply resolution use `GET /channels/{id}/messages` with
+`around={message_id}` and select only the matching ID and channel. Bot
+credentials use the direct single-message GET route. Raw retrieval preserves
+unknown fields from the selected wire object and reports the actual operation.
+
+An absent target produces structured `message_not_observed`, not a declaration
+of deletion. HTTP 403 with Discord code 20002 is `bot_only`; other permission
+failures are `forbidden`. Reply views distinguish `resolved`, `deleted`,
+`forbidden`, `bot_only`, `not_observed`, `unavailable`, and `unknown`. A missing
+`referenced_message` field leaves reference state unknown; explicit null on a
+reply establishes a deleted reference and avoids an unnecessary lookup.
+Forwarded references do not receive that deleted-reply inference. These wire
+semantics follow the [Discord message reference](https://github.com/discord/discord-api-docs/blob/main/developers/resources/message.mdx).
+Neither a missing around target nor an unknown-channel response creates a
+tombstone or removes retained data. All remote operations remain GET-only.
+
+## Activity and differential-page contracts
+
+`list_channels` returns explicit nullable `last_message_id` and
+`last_activity_at`, plus `last_fetched_at`, listing-level `fetched_at`, and
+`last_message_id_source` (`discord`, `cache`, or `unknown`). Null activity is
+unknown or inapplicable, not proof that a channel is empty. A cached source
+indicates retained activity evidence when the fresh channel object lacks it.
+Activity time is derived from the message snowflake and describes creation,
+not an edit or deletion. The observed activity also feeds
+`list_changed_channels` and must agree with its cached channel record.
+
+`messages_after` formally uses `next_after_message_id`, not `next_cursor`.
+Pass it as the next call's exclusive `after_message_id`. Results are newest
+first and continuation is the maximum observed ID, retaining the input on an
+empty page. Page `covered_from`/`covered_to` are minimum/maximum observed
+message IDs, or null for an empty page. Nested `coverage.ranges` and
+`coverage.gaps` describe recorded observations and unproven intervals between
+them; `coverage.has_gaps` reports those gaps. `coverage.complete` remains false.
+No internal gap does not prove coverage outside the recorded ranges, and an
+empty differential response alone is not a historical completeness certificate.
+
+## Bounded legacy metadata refetch
+
+REST message responses that omit `guild_id` preserve the retained row's guild
+context (or the cached channel's guild). Both the SQL column and normalized
+message metadata retain it, so refetch does not remove guild search/scan targets.
+
+`start_sync` with `scope: "refetch"` processes retained rows whose metadata is
+unknown, including rows with invalid cached JSON. Optional `guild_id` filters
+known cached associations; optional `channel_ids` selects explicit targets.
+`max_messages` bounds network lookup attempts per job (default 100, range
+1..1000). It retrieves exact messages through `MessageLookup`, persists
+successful full metadata, and leaves unavailable rows pending. It does not
+synthesize empty mentions, infer deletion, advance history cursors, or add
+coverage from isolated observations.
+
+`get_sync_progress` reports `attempted`, `refetched`, `remaining`,
+`remaining_channels`, `next_refetch_before`, and structured `failures` (also
+`channels_failed`).
+Remaining is initially unknown and can be null after a cache failure. States
+are `running`, `done`, `paused` (attempt bound reached with work pending),
+`done_with_gaps` (unavailable rows remain), or `failed` (cache failure).
+Successful row updates survive restart. Job IDs and live progress are in memory;
+restart requires a new `start_sync` with the same target filters. The durable
+pending rows form the continuation queue, so already refreshed rows are skipped.
+To advance past attempted unavailable rows, pass the returned per-channel
+`next_refetch_before` map as `start_sync.refetch_before`. Values are exclusive
+message-ID boundaries; they advance only for attempted rows. The client must
+retain this map across a daemon restart. Omitting it retries all pending rows
+newest first, including earlier failures. Both map keys (channel IDs) and values
+must be positive numeric ID strings, and the argument is valid only for
+`scope: "refetch"`. Advancing a boundary neither confirms nor deletes skipped
+unavailable rows. Their counts remain in `remaining` and `remaining_channels`;
+an exhausted selected range with pending rows elsewhere is `done_with_gaps`.
+A zero remaining count proves metadata
+availability only for retained rows in scope, not complete channel history.
+
 ## Failures and validation limits
 
 Cache failures use RPC code `-32004`, `error_source: "cache"`, a stable code,
@@ -93,6 +171,10 @@ Regression tests cover fresh and populated legacy databases, backup/WAL,
 rollback, repeated opens, preserved cursors, unknown metadata, known mentions
 and replies, changed-channel paging, after boundaries, edits/deletions, and
 GET-only mock requests. These are local automated tests, not live Discord
-verification. Live verification of user-authenticated replies/threads, raw
-messages, attachments/events, sync jobs, and requested-window coverage remains
-separate from the database fix.
+verification. Mock tests additionally exercise user-authenticated around
+lookup, exact selection, raw preservation, bot-only versus permissions errors,
+deleted-reference null versus absence, bounded metadata refetch, and continuation
+from durable pending rows. Live verification of these updated message routes,
+user-authenticated threads, raw messages, attachments/events, sync jobs,
+positive inbox examples, and requested-window coverage remains separate from
+the local regression suite. No production refetch is performed by these tests.

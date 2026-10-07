@@ -21,13 +21,16 @@ impl DiscordReaderTools {
     /// List the channels of one Discord server.
     ///
     /// Returns JSON: `{"channels": [{"id", "guild_id", "name", "kind",
-    /// "parent_id", "topic", "last_message_id", "last_activity_at"}]}` sorted
+    /// "parent_id", "topic", "last_message_id", "last_activity_at",
+    /// "last_fetched_at", "last_message_id_source"}], "fetched_at": "..."}` sorted
     /// with categories first. `kind` is the Discord channel type integer (0
     /// text, 2 voice, 4 category, 5 announcement, 15 forum, ...).
     /// `last_message_id` is Discord's latest message snowflake and
-    /// `last_activity_at` our timestamp for it when known: together with
-    /// `list_changed_channels` they let you skip quiet channels instead of
-    /// re-reading every one.
+    /// `last_activity_at` the creation time derived from that ID, not an edit
+    /// or deletion timestamp. last_message_id and last_activity_at are explicit
+    /// null when unknown or inapplicable. `last_fetched_at` is this listing's
+    /// observation time. `last_message_id_source` is discord, cache (retained
+    /// evidence), or unknown; null does not assert an empty channel.
     #[tool(name = "list_channels")]
     pub async fn list_channels(
         &self,

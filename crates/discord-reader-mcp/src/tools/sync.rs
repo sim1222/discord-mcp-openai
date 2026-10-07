@@ -24,13 +24,18 @@ pub struct ChangedChannelsArgs {
 /// Arguments for `start_sync`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct StartSyncArgs {
-    /// What to sync: `mentions`, `replies`, `changed_channels` or `all`.
+    /// What to sync: `mentions`, `replies`, `changed_channels`, `all` or `refetch`.
     /// Defaults to `changed_channels`.
     pub scope: Option<String>,
     /// Restrict to one guild (server) ID.
     pub guild_id: Option<String>,
     /// Restrict to an explicit list of channel IDs.
     pub channel_ids: Option<Vec<String>>,
+    /// Maximum retained metadata lookups for `refetch`, 1-1000, defaults to 100.
+    pub max_messages: Option<u32>,
+    /// Exclusive per-channel boundaries from `progress.next_refetch_before`.
+    /// Only valid with `scope: "refetch"`; omit to retry every pending row.
+    pub refetch_before: Option<std::collections::HashMap<String, String>>,
 }
 
 /// Arguments for `get_sync_progress`.
@@ -85,13 +90,17 @@ impl DiscordReaderTools {
         self.call_tool("get_sync_status", json!({})).await
     }
 
-    /// Start a resumable differential sync job.
+    /// Start a bounded metadata refresh or recent-message sync job.
     ///
-    /// Fetches recent messages for channels with new activity (not a full
-    /// history crawl), following rate limits. Returns JSON: `{"job_id": ...}`.
-    /// Poll `get_sync_progress` for per-channel success/failure, the next
-    /// cursor and remaining wait. Jobs live for this daemon process; sync
-    /// positions themselves are persisted and survive restarts.
+    /// `scope: "refetch"` refreshes retained messages with unknown metadata,
+    /// up to `max_messages` attempts. Pass `progress.next_refetch_before` as
+    /// `refetch_before` to continue past attempted rows, including failures;
+    /// omit it to retry all pending rows. Updated rows persist across restarts.
+    /// Lookup failures remain pending
+    /// and appear as `done_with_gaps`; historical coverage is not inferred.
+    /// Other scopes fetch latest messages from known channels, with
+    /// `changed_channels` restricted to activity. Returns `{"job_id": ...}`.
+    /// Job IDs expire when the daemon restarts.
     #[tool(name = "start_sync")]
     pub async fn start_sync(
         &self,
@@ -103,6 +112,8 @@ impl DiscordReaderTools {
                 "scope": args.scope,
                 "guild_id": args.guild_id,
                 "channel_ids": args.channel_ids,
+                "max_messages": args.max_messages,
+                "refetch_before": args.refetch_before,
             }),
         )
         .await
@@ -111,9 +122,13 @@ impl DiscordReaderTools {
     /// Read the progress of a sync job started with `start_sync`.
     ///
     /// Returns JSON: `{"progress": {"job_id", "status": "running"|"done"|
-    /// "failed", "channels_total", "channels_done", "channels_failed":
+    /// "paused"|"done_with_gaps"|"failed", "channels_total", "channels_done", "channels_failed":
     /// [{"channel_id", "error": {...}}], "started_at", "finished_at",
-    /// "next_cursor"}}` or `{"progress": null}` when the job id is unknown
+    /// "next_cursor", "attempted", "refetched", "remaining", "remaining_channels",
+    /// "next_refetch_before"}}`.
+    /// Refetch counters are metadata attempts and pending retained rows,
+    /// not claims that historical ranges are complete. `remaining: null`
+    /// means the count is not known. Returns `{"progress": null}` when unknown
     /// (for example after a daemon restart). Failed channels carry a
     /// structured error (`error_source`, `code`, `discord_code`, `retryable`)
     /// and are never counted as "no new messages".

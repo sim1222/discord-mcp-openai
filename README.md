@@ -233,7 +233,7 @@ unit は `NoNewPrivileges` / `PrivateTmp` / `ProtectSystem=strict` / `ProtectHom
 | `get_me` | — | 自分の ID / ユーザー名 (`{"me":{...}}`) |
 | `get_capabilities` | — | 認証方式ごとの対応可否・制約の一覧 |
 | `list_guilds` | — | 参加中サーバーの列挙 `{"guilds":[{"id","name"}]}` |
-| `list_channels` | `guild_id` | チャンネル列挙 (id / name / kind / parent_id / topic / guild_id / last_message_id / last_activity_at) |
+| `list_channels` | `guild_id` | チャンネル列挙 (活動ID・ID由来の時刻・取得時刻・情報源を含む) |
 | `list_dms` | — | DM / Group DM の列挙 (channel_id / participants / last_message_id) |
 | `list_changed_channels` | `guild_id?`, `limit=50`, `cursor?` | 最終投稿 ID が前回同期より新しいチャンネルのみ |
 | `recent_messages` | `channel_id`, `limit=50` (1..=100) | 最近のメッセージ取得 |
@@ -252,7 +252,7 @@ unit は `NoNewPrivileges` / `PrivateTmp` / `ProtectSystem=strict` / `ProtectHom
 | `list_threads` | `guild_id?`, `channel_id?`, `filter?` (active/archived/joined/all), `limit=50`, `cursor?` | スレッド列挙 (アクティブ / アーカイブ / 参加済み) |
 | `get_member` | `guild_id`, `user_id?` | サーバー内の自分の member / roles |
 | `get_sync_status` | — | チャンネル別の同期位置・確認範囲・キャッシュ状態 |
-| `start_sync` | `scope?`, `guild_id?`, `channel_ids?` | 差分同期ジョブの開始 (新着チャンネルのみ巡回) |
+| `start_sync` | `scope?`, `guild_id?`, `channel_ids?`, `max_messages?`, `refetch_before?` | 最新ページ取得、または `scope="refetch"` で旧行のメタデータを限定再取得 |
 | `get_sync_progress` | `job_id` | 同期ジョブの進捗 (成功 / 失敗 / 次カーソル) |
 
 メッセージの正規化スキーマ (v2):
@@ -290,13 +290,71 @@ unit は `NoNewPrivileges` / `PrivateTmp` / `ProtectSystem=strict` / `ProtectHom
 - `content_kind` は空本文の理由: `text` / `empty` / `attachment_only` /
   `embed_only` / `system` / `forwarded` / `unknown` (正規化前の原文が非文字列)。
 - `reply_to` は非返信なら `null`。返信なら `status` で参照先の状態を返す:
-  `resolved` (本文を内包) / `deleted` / `forbidden` / `unknown` (未取得)。
+  `resolved` (本文を内包) / `deleted` (削除の明示的な観測) /
+  `forbidden` / `bot_only` / `not_observed` (取得ページに対象なし) /
+  `unavailable` (その他の取得失敗) / `unknown` (未取得)。
 - `mentions` / `mention_roles` / `mention_everyone` は API のまま。ロール名の
   解決は `get_member` や `list_mentions` の `matched_role_ids` を使う。
-- 添付はメタデータ + URL のみ。ファイル本体の取得は `get_attachment`。
+- 添付はメタデータ + URL のみ。`get_attachment` もファイル本体を取得せず、
+  添付と転送スナップショット内の添付メタデータを返します。
 
-すべての一覧・検索・履歴取得は `next_cursor` / `has_more` を返し、取得した
-確認範囲は `covered_from` / `covered_to` / `has_gaps` で明示します。
+ページングと範囲情報はツールごとの契約です。`messages_after` は専用の
+`next_after_message_id` を返します。次の呼び出しの `after_message_id` に
+その値を渡してください。境界は排他的で、返却は新しい順です。カーソルは
+返却された最大ID、空ページなら入力IDです。`has_more=true` は満杯の
+ページに対する保守的な判定で、次のページが空になる場合があります。
+このツールに `next_cursor` 引数・返却値はありません。
+
+`messages_after.covered_from` / `covered_to` は今回のページの最小・最大
+メッセージIDで、空ページでは両方 `null` です。`coverage.ranges` は保存済みの
+観測範囲、`coverage.gaps` はその間の未証明区間、`coverage.has_gaps` は
+その有無を示します。`coverage.complete` は現在 `false` です。gapがない
+ことや空ページだけでは、境界の外側も含めた全履歴の網羅を保証しません。
+受信箱の `next_cursor` と、差分取得の `next_after_message_id` は別契約です。
+
+`list_channels` は `last_message_id` / `last_activity_at` を明示的に返し、
+不明・適用外なら `null` にします。nullは「投稿がない」の証明ではありません。
+`last_activity_at` はメッセージID由来の作成時刻で、編集・削除時刻では
+ありません。`last_fetched_at` と一覧の `fetched_at` は今回の取得時刻です。
+`last_message_id_source` は `discord` / `cache` / `unknown` で、`cache` は
+今回のAPIに活動IDがなく保持済みの値を利用したことを示します。
+
+ユーザー認証での `get_message`、返信先解決、`message_context` の対象取得、
+`get_message_raw`、`get_attachment` は GET履歴の `around` ページから
+チャンネルとIDが一致するメッセージを選びます。対象が返らない場合は
+`message_not_observed` として報告し、削除済みとは推測しません。通常の
+権限不足とDiscordのBot専用エラー20002は、それぞれ `forbidden` / `bot_only`
+として識別できます。これらの取得は既読変更・送信を行いません。
+
+### 旧キャッシュのメタデータ再取得
+
+`get_sync_status.messages_requiring_refetch` が残っている場合、次のように
+対象を絞って同期ジョブを開始します。1ジョブの取得試行上限は既定100件、
+`max_messages` で1〜1000件を指定できます。
+
+```json
+{"scope":"refetch","channel_ids":["1452089473562316801"],"max_messages":100}
+```
+
+`start_sync` の `job_id` を `get_sync_progress` に渡し、`attempted` /
+`refetched` / `remaining` / `remaining_channels` / `failures` /
+`next_refetch_before` を確認します。
+`paused` は上限に達して未処理が残る状態、`done_with_gaps` は取得不能等が
+残る状態です。`failed` のキャッシュエラーは先に原因を解消してください。
+続きを取得する際は、同じ対象で `next_refetch_before` のマップを
+`start_sync.refetch_before` にそのまま渡します。各チャンネルの値は最後に
+試行したメッセージIDで、それより古い未取得行を取得します。失敗した新しい
+行を飛び越えて進めますが、その行の要再取得状態は保持します。
+`refetch_before` を省略すると、失敗行も含め全残件を新しい順に再試行します。
+保存済みの再取得成功行はどちらの場合も対象から外れます。再起動後も行の更新は
+保持されますが、ジョブIDはプロセス内だけ有効なため新しいジョブを開始します。
+明示的な継続には、呼出し側で保存した `next_refetch_before` を使ってください。
+このマップは `scope="refetch"` 専用で、チャンネルID・メッセージIDは数値文字列です。
+
+この処理は既存行のメタデータだけを再取得します。取得不能行は要再取得の
+まま保持し、本文から空のmentions等を捏造しません。再取得待ちが0件でも、
+未取得の履歴範囲がないとは限らず、coverageをcompleteにはしません。
+本番での全件再取得や陽性メンション・返信の実機検証は別途必要です。
 
 ### 受け入れテストの流れ
 
@@ -322,8 +380,9 @@ unit は `NoNewPrivileges` / `PrivateTmp` / `ProtectSystem=strict` / `ProtectHom
 5. **編集・削除・取得不能を新着なしと区別** — 編集は `edited_timestamp`、
    削除は tombstone (`get_sync_status` の `deletions_observed`)、取得失敗は
    `channels_failed` の構造化エラーで返り、「新着なし」と混同されない。
-6. **確認済み範囲を数値で提示** — `coverage` の `covered_from` / `covered_to`
-   / `has_gaps` と `get_sync_status` の `cached_messages` / `channels_tracked`。
+6. **確認済み範囲を数値で提示** — 差分ページの `covered_from` / `covered_to`、
+   `coverage.ranges` / `gaps` / `has_gaps` と `get_sync_status` の
+   `cached_messages` / `channels_tracked`。観測範囲と全履歴の網羅は区別する。
 
 読むだけの操作では Discord の既読状態が変わらないことは read-only 保証
 (GET のみ・ack API なし) で担保しています。

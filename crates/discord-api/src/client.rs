@@ -134,6 +134,11 @@ impl fmt::Debug for DiscordClient {
 }
 
 impl DiscordClient {
+    /// Return the configured authentication scheme without exposing credentials.
+    pub fn token_kind(&self) -> TokenKind {
+        self.token_kind
+    }
+
     pub fn new(token: Token) -> Result<Self, DiscordError> {
         Self::with_options(
             token,

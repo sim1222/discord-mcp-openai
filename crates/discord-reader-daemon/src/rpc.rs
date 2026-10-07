@@ -76,6 +76,12 @@ impl RpcError {
 
     fn with_operation(mut self, operation: &str) -> Self {
         if let Some(data) = self.data.as_mut() {
+            if let Some(request) = data["error"]["operation"]
+                .as_str()
+                .filter(|value| value.starts_with("GET "))
+            {
+                data["error"]["request_operation"] = Value::String(request.to_string());
+            }
             data["error"]["operation"] = Value::String(operation.to_string());
             self.message = data.to_string();
         }
@@ -269,13 +275,19 @@ pub struct ThreadsParams {
 /// Parameters for `start_sync`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SyncStartParams {
-    /// `mentions`, `replies`, `changed_channels` or `all`.
+    /// `mentions`, `replies`, `changed_channels`, `all` or `refetch`.
     #[serde(default)]
     pub scope: Option<String>,
     #[serde(default)]
     pub guild_id: Option<String>,
     #[serde(default)]
     pub channel_ids: Option<Vec<String>>,
+    /// Bound on metadata lookup attempts for `refetch`, defaults to 100.
+    #[serde(default)]
+    pub max_messages: Option<u32>,
+    /// Exclusive per-channel boundaries from a previous refetch job.
+    #[serde(default)]
+    pub refetch_before: Option<std::collections::HashMap<String, String>>,
 }
 
 /// Parameters for `get_sync_progress`.
@@ -559,6 +571,22 @@ async fn write_response(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rpc_operation_retains_actual_message_request() {
+        let error = super::RpcError::structured(
+            -32005,
+            serde_json::json!({"error": {
+                "code":"bot_only", "operation":"GET /channels/200/messages?limit=1&around=10"
+            }}),
+        )
+        .with_operation("get_message");
+        let data = error.data.unwrap();
+        assert_eq!(data["error"]["operation"], "get_message");
+        assert_eq!(
+            data["error"]["request_operation"],
+            "GET /channels/200/messages?limit=1&around=10"
+        );
+    }
     use super::*;
     use serde_json::json;
 
