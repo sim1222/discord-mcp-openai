@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, FixedOffset, Utc};
+use discord_api::account_observation::AccountObserver;
 use discord_api::types::{
     AttachmentView, Channel, ChannelView, DmView, Guild, GuildView, Message, MessageSnapshotView,
     MessageView, Role, User,
@@ -19,9 +20,10 @@ use serde_json::{json, Value};
 use crate::message_lookup::{parse_message, DiscordMessageLookup, LookupError, MessageLookup};
 use crate::metadata_refetch::{run_refetch, RefetchProgress, RefetchReport, SqliteRefetchCache};
 use crate::rpc::{
-    AfterParams, BeforeParams, ChangedChannelsParams, ChannelParams, ContextParams, GuildIdParams,
-    InboxFilter, MemberParams, MessageEventsParams, MessageParams, ReaderApi, RpcError,
-    SearchParams, SyncProgressParams, SyncStartParams, ThreadParams, ThreadsParams,
+    AccountSyncParams, AfterParams, BeforeParams, ChangedChannelsParams, ChannelParams,
+    ContextParams, GuildIdParams, InboxFilter, InboxStateParams, MemberParams, MessageEventsParams,
+    MessageParams, ReadStateParams, ReaderApi, RpcError, SearchParams, SyncProgressParams,
+    SyncStartParams, ThreadParams, ThreadsParams,
 };
 
 struct SyncJobProgress {
@@ -53,6 +55,8 @@ pub struct DaemonApi {
     me_id: Mutex<Option<String>>,
     /// In-memory job registry for `start_sync` / `get_sync_progress`.
     jobs: Arc<Mutex<HashMap<String, Value>>>,
+    account_sync_lock: Arc<tokio::sync::Mutex<()>>,
+    observation_lock: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for DaemonApi {
@@ -109,6 +113,7 @@ struct InboxHit {
     matched_role_ids: Vec<String>,
     guild_id: Option<String>,
     channel_id: String,
+    channel_kind: Option<u8>,
     /// Numeric snowflake key for newest-first ordering.
     key: u128,
 }
@@ -155,6 +160,42 @@ impl InboxWindow {
     }
 }
 
+fn inbox_query(params: &InboxFilter, replies_only: bool) -> String {
+    json!({"guild_id":params.guild_id,"channel_id":params.channel_id,
+        "after":params.after,"before":params.before,"replies_only":replies_only})
+    .to_string()
+}
+
+fn inbox_snapshot_page(
+    mut response: Value,
+    snapshot_id: &str,
+    offset: usize,
+    limit: u32,
+) -> Result<Value, RpcError> {
+    let entries = response["mentions"].as_array().ok_or_else(|| {
+        store_error(discord_store::StoreError::Data(
+            "invalid inbox snapshot".into(),
+        ))
+    })?;
+    if offset > entries.len() {
+        return Err(RpcError::invalid_params("inbox cursor offset out of range"));
+    }
+    let end = offset
+        .saturating_add(limit.clamp(1, 100) as usize)
+        .min(entries.len());
+    let has_more = end < entries.len();
+    let page = entries[offset..end].to_vec();
+    response["mentions"] = json!(page);
+    response["snapshot_id"] = json!(snapshot_id);
+    response["has_more"] = json!(has_more);
+    response["next_cursor"] = if has_more {
+        json!(format!("{snapshot_id}:{end}"))
+    } else {
+        Value::Null
+    };
+    Ok(response)
+}
+
 impl DaemonApi {
     pub fn new(client: SharedDiscordClient, store: Arc<Store>) -> Self {
         Self {
@@ -162,7 +203,49 @@ impl DaemonApi {
             store,
             me_id: Mutex::new(None),
             jobs: Arc::new(Mutex::new(HashMap::new())),
+            account_sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+            observation_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    fn retain_account_observation(
+        &self,
+        observation: &discord_api::account_observation::AccountObservation,
+    ) -> Result<(), RpcError> {
+        let user = &observation.account_user_id;
+        self.store
+            .save_account_observation(observation)
+            .map_err(store_error)?;
+        let existing_inventory = self.store.account_inventory(user).map_err(store_error)?;
+        let bootstrap = existing_inventory.is_none();
+        let generation = existing_inventory
+            .map(|inventory| inventory.generation)
+            .unwrap_or_else(|| {
+                format!(
+                    "gateway-{}",
+                    Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                )
+            });
+        if bootstrap {
+            self.store
+                .begin_account_inventory(user, &generation, &observation.observed_at)
+                .map_err(store_error)?;
+        }
+        self.store
+            .observe_account_targets(
+                user,
+                &generation,
+                &observation.channels,
+                &observation.observed_at,
+            )
+            .map_err(store_error)?;
+        for channel in &observation.channels {
+            self.store.upsert_channel(channel).map_err(store_error)?;
+        }
+        if bootstrap {
+            self.store.finish_account_inventory(&generation,&observation.observed_at,&json!({"source":"discord_gateway_ready","complete":false,"partial":observation.partial,"inventory_errors":observation.inventory_errors,"reasons":["thread_and_closed_dm_inventory_not_proven"]})).map_err(store_error)?;
+        }
+        Ok(())
     }
 
     async fn fetch_messages(
@@ -492,10 +575,49 @@ impl DaemonApi {
     ) -> Result<Value, RpcError> {
         let window = InboxWindow::from_filter(params)?;
         let me_id = self.me_user_id().await?;
+        let query = inbox_query(params, replies_only);
+        if let Some(cursor) = params.next_cursor.as_deref() {
+            if params.refresh {
+                return Err(RpcError::invalid_params(
+                    "refresh is not allowed when resuming an inbox snapshot",
+                ));
+            }
+            let (snapshot_id, offset) = cursor
+                .split_once(':')
+                .ok_or_else(|| RpcError::invalid_params("invalid inbox snapshot cursor"))?;
+            let offset = offset
+                .parse::<usize>()
+                .map_err(|_| RpcError::invalid_params("invalid inbox snapshot offset"))?;
+            let snapshot = self
+                .store
+                .load_inbox_snapshot(snapshot_id)
+                .map_err(store_error)?
+                .ok_or_else(|| {
+                    RpcError::invalid_params("inbox snapshot is unavailable; start a new scan")
+                })?;
+            if snapshot.account_user_id != me_id || snapshot.query_json != query {
+                return Err(RpcError::invalid_params(
+                    "inbox cursor account or query scope mismatch",
+                ));
+            }
+            let mut response: Value =
+                serde_json::from_str(&snapshot.response_json).map_err(|_| {
+                    store_error(discord_store::StoreError::Data(
+                        "invalid inbox snapshot".into(),
+                    ))
+                })?;
+            response["snapshot_created_at"] = json!(snapshot.created_at);
+            return inbox_snapshot_page(response, snapshot_id, offset, params.limit);
+        }
         let channel_ids = self
             .inbox_candidate_channels(params.guild_id.as_deref(), params.channel_id.as_deref())
             .await?;
 
+        let read_observation = self
+            .store
+            .load_account_observation(&me_id)
+            .map_err(store_error)?;
+        let read_as_of = Utc::now();
         let mut hits: Vec<InboxHit> = Vec::new();
         let mut channels_scanned = 0u64;
         let mut channels_skipped = 0u64;
@@ -593,6 +715,22 @@ impl DaemonApi {
                 } else {
                     messages_classified += 1;
                 }
+                let hit = hit.or_else(|| {
+                    if !replies_only
+                        && message
+                            .author
+                            .as_ref()
+                            .is_some_and(|author| author.id != me_id)
+                    {
+                        match snapshot.kind {
+                            Some(1) => Some(("dm", Vec::new())),
+                            Some(3) => Some(("group_dm", Vec::new())),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                });
                 let Some((matched_by, matched_role_ids)) = hit else {
                     continue;
                 };
@@ -602,6 +740,7 @@ impl DaemonApi {
                     matched_role_ids,
                     guild_id: message.guild_id.clone().or_else(|| guild_id.clone()),
                     channel_id: channel_id.clone(),
+                    channel_kind: snapshot.kind,
                     key: snowflake_num(&message.id),
                 });
             }
@@ -620,30 +759,39 @@ impl DaemonApi {
             });
         }
 
-        // Newest first, capped at `limit`.
-        if let Some(cursor) = params.next_cursor.as_deref() {
-            let cursor = cursor
-                .parse::<u128>()
-                .map_err(|_| RpcError::invalid_params("invalid inbox cursor"))?;
-            hits.retain(|hit| hit.key < cursor);
-        }
         hits.sort_by_key(|hit| std::cmp::Reverse(hit.key));
-        let total = hits.len();
-        let limit = params.limit.clamp(1, 100) as usize;
-        hits.truncate(limit);
 
         let entries: Vec<Value> = hits
             .iter()
             .map(|h| {
-                json!({
+                let workflow=self.store.inbox_workflow(&me_id,&h.channel_id,&h.view.id).map_err(store_error)?;
+                let read=read_observation.as_ref().map(|snapshot|crate::read_state::classify_message_read(snapshot,&h.channel_id,&h.view.id,read_as_of)).unwrap_or(json!({"status":"unknown","reason":"read_state_not_observed"}));
+                Ok(json!({
                     "message": h.view,
                     "matched_by": h.matched_by,
                     "matched_role_ids": h.matched_role_ids,
                     "guild_id": h.guild_id,
                     "channel_id": h.channel_id,
-                })
+                    "message_url": h.guild_id.as_deref().or_else(|| matches!(h.channel_kind, Some(1 | 3)).then_some("@me")).map(|guild| format!("https://discord.com/channels/{}/{}/{}", guild, h.channel_id, h.view.id)),
+                    "read_status": read["status"],
+                    "read_status_reason": read["reason"],
+                    "read_evidence": read,
+                    "notification_status":if workflow.as_ref().and_then(|state|state.notified_at.as_ref()).is_some(){"notified"}else{"not_recorded"},
+                    "action_required":workflow.as_ref().and_then(|state|state.action_required),
+                    "action_evidence":workflow.as_ref().and_then(|state|state.action_evidence.as_deref()),
+                    "completion_status":if workflow.as_ref().and_then(|state|state.completed_at.as_ref()).is_some(){"confirmed_complete"}else{"not_confirmed"},
+                    "workflow":workflow,
+                    "workflow_source":"explicit_local_confirmation",
+                    "discord_mention_notification_count": null,
+                    "reply_notification_status": "unknown",
+                    "reply_notification_reason": "notification_settings_and_delivery_not_observed",
+                    "reply_mentions_authenticated_user": h.view.reply_to.as_ref().map(|_| h.view.mentions.iter().any(|user| user.id == me_id)),
+                    "deletion_status": "unknown",
+                    "deletion_status_reason": "retained_message_without_current_deletion_verification",
+                    "classification_evidence": {"authenticated_user_id":me_id,"matched_user_ids":h.view.mentions.iter().filter(|user| user.id == me_id).map(|user| user.id.clone()).collect::<Vec<_>>(), "matched_role_ids":h.matched_role_ids},
+                }))
             })
-            .collect();
+            .collect::<Result<Vec<_>,RpcError>>()?;
 
         let coverage = crate::inbox_coverage::evaluate(
             window.after.map(|time| time.with_timezone(&Utc)),
@@ -660,7 +808,7 @@ impl DaemonApi {
             }
         })?;
 
-        Ok(json!({
+        let response = json!({
             "mentions": entries,
             "checked": {
                 "channels_scanned": channels_scanned,
@@ -675,9 +823,24 @@ impl DaemonApi {
                 "refetch_channels": refetch_channels,
             },
             "coverage": coverage,
-            "next_cursor": if total > limit { hits.last().map(|h| h.view.id.clone()) } else { None },
-            "has_more": total > limit,
-        }))
+            "snapshot_observed_at": discord_store::sqlite::now_iso(),
+        });
+        let snapshot_id = self
+            .store
+            .save_inbox_snapshot(&me_id, &query, &response.to_string())
+            .map_err(store_error)?;
+        let snapshot = self
+            .store
+            .load_inbox_snapshot(&snapshot_id)
+            .map_err(store_error)?
+            .ok_or_else(|| {
+                store_error(discord_store::StoreError::Data(
+                    "saved inbox snapshot missing".into(),
+                ))
+            })?;
+        let mut response = response;
+        response["snapshot_created_at"] = json!(snapshot.created_at);
+        inbox_snapshot_page(response, &snapshot_id, 0, params.limit)
     }
 }
 
@@ -1121,13 +1284,184 @@ impl ReaderApi for DaemonApi {
         Ok(json!({"me": me}))
     }
 
+    async fn get_read_state(&self, params: ReadStateParams) -> Result<Value, RpcError> {
+        for id in [params.guild_id.as_deref(), params.channel_id.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if id.parse::<u64>().ok().filter(|n| *n > 0).is_none() {
+                return Err(RpcError::invalid_params(
+                    "scope IDs must be numeric strings",
+                ));
+            }
+        }
+        let user = self.me_user_id().await?;
+        let _guard = self.observation_lock.lock().await;
+        let snapshot = if params.refresh {
+            let observation = self.client.observe_account().await.map_err(|error| RpcError::structured(-32005, json!({"error":{"error_source":"gateway","code":match error { discord_api::account_observation::ObservationError::Unsupported => "unsupported", discord_api::account_observation::ObservationError::Timeout => "timeout", discord_api::account_observation::ObservationError::SessionRejected => "session_rejected", _ => "observation_failed" },"operation":"get_read_state","retryable":matches!(error,discord_api::account_observation::ObservationError::Timeout|discord_api::account_observation::ObservationError::Transport),"message":error.to_string(),"discord_mention_count":null}})))?;
+            if observation.account_user_id != user {
+                return Err(RpcError::internal("Gateway account identity mismatch"));
+            }
+            self.retain_account_observation(&observation)?;
+            observation
+        } else {
+            self.store
+                .load_account_observation(&user)
+                .map_err(store_error)?
+                .unwrap_or(discord_api::account_observation::AccountObservation {
+                    account_user_id: user.clone(),
+                    observed_at: String::new(),
+                    version: None,
+                    partial: true,
+                    read_states: Vec::new(),
+                    channels: Vec::new(),
+                    inventory_complete: false,
+                    inventory_errors: vec!["gateway_inventory_unobserved".into()],
+                })
+        };
+        let mut ids = if let Some(channel) = params.channel_id.clone() {
+            vec![channel]
+        } else {
+            self.store
+                .account_targets(&user)
+                .map_err(store_error)?
+                .into_iter()
+                .filter(|target| {
+                    params
+                        .guild_id
+                        .as_ref()
+                        .is_none_or(|guild| target.guild_id.as_ref() == Some(guild))
+                })
+                .map(|target| target.channel_id)
+                .collect::<Vec<_>>()
+        };
+        if params.guild_id.is_none() && params.channel_id.is_none() {
+            ids.extend(
+                snapshot
+                    .read_states
+                    .iter()
+                    .map(|state| state.channel_id.clone()),
+            );
+        }
+        if let (Some(guild), Some(channel)) =
+            (params.guild_id.as_deref(), params.channel_id.as_deref())
+        {
+            let actual = self.store.channel_guild_id(channel).map_err(store_error)?;
+            if actual.as_deref() != Some(guild) {
+                return Err(RpcError::invalid_params(
+                    "channel guild scope is unverified or mismatched",
+                ));
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        let mut response = crate::read_state::render_read_states(&snapshot, &ids);
+        response["scope"]["guild_id"] = json!(params.guild_id);
+        response["discord_guild_badge_count"] = Value::Null;
+        response["guild_badge_reason"] = json!("browser_aggregation_not_reproduced");
+        response["coverage"] =
+            crate::account_sync::account_coverage(&self.store, &user).map_err(store_error)?;
+        Ok(response)
+    }
+
+    async fn record_inbox_state(&self, params: InboxStateParams) -> Result<Value, RpcError> {
+        let state = discord_store::sqlite::workflow::InboxWorkflow {
+            account_user_id: self.me_user_id().await?,
+            channel_id: params.channel_id,
+            message_id: params.message_id,
+            notified_at: params.notified_at,
+            snoozed_until: params.snoozed_until,
+            action_required: params.action_required,
+            action_evidence: params.action_evidence,
+            completed_at: params.completed_at,
+            completion_evidence: params.completion_evidence,
+        };
+        self.store
+            .record_inbox_workflow(&state)
+            .map_err(|error| match error {
+                discord_store::StoreError::Data(message) => RpcError::invalid_params(message),
+                other => store_error(other),
+            })?;
+        Ok(json!({"state":state,"source":"explicit_local_confirmation","discord_modified":false}))
+    }
+
+    async fn get_account_coverage(&self) -> Result<Value, RpcError> {
+        let user = self.me_user_id().await?;
+        Ok(
+            json!({"coverage":crate::account_sync::account_coverage(&self.store,&user).map_err(store_error)?}),
+        )
+    }
+
+    async fn start_account_sync(&self, params: AccountSyncParams) -> Result<Value, RpcError> {
+        let max_targets = params.max_targets.unwrap_or(50);
+        let page_size = params.page_size.unwrap_or(100);
+        if !(1..=1000).contains(&max_targets) || !(1..=100).contains(&page_size) {
+            return Err(RpcError::invalid_params(
+                "max_targets must be 1..1000 and page_size 1..100",
+            ));
+        }
+        let permit = Arc::clone(&self.account_sync_lock)
+            .try_lock_owned()
+            .map_err(|_| RpcError::invalid_params("an account sync job is already running"))?;
+        let user = self.me_user_id().await?;
+        let id = format!(
+            "account-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        crate::account_sync::create_account_job(&self.store, &id, &user).map_err(store_error)?;
+        self.jobs
+            .lock()
+            .expect("jobs lock")
+            .insert(id.clone(), json!({"durable_account_job":true}));
+        let store = Arc::clone(&self.store);
+        let client = Arc::clone(&self.client);
+        let task_id = id.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let _ = crate::account_sync::run_account_sync(
+                client,
+                store,
+                task_id,
+                user,
+                crate::account_sync::AccountSyncOptions {
+                    max_targets,
+                    page_size,
+                    refresh_inventory: params.refresh_inventory,
+                },
+            )
+            .await;
+        });
+        Ok(json!({"job_id":id,"scope":"account","complete":false}))
+    }
+
+    async fn cancel_sync(&self, params: SyncProgressParams) -> Result<Value, RpcError> {
+        let requested = self
+            .store
+            .request_account_cancel(&params.job_id, &discord_store::sqlite::now_iso())
+            .map_err(store_error)?;
+        Ok(
+            json!({"job_id":params.job_id,"cancel_requested":requested,"reason":if requested {Value::Null}else{json!("unknown_or_terminal_account_job")}}),
+        )
+    }
+
     async fn get_capabilities(&self) -> Result<Value, RpcError> {
+        let user = self.me_user_id().await?;
+        let user_auth = self.client.token_kind() == discord_api::TokenKind::User;
         Ok(json!({
-            "auth": "user",
+            "auth": if user_auth {"user"} else {"bot"},
+            "authenticated_user_id":user,
+            "read_state":{"supported":user_auth,"source":"discord_gateway_ready","discord_mention_count_supported":user_auth,"guild_badge_supported":false,"guild_badge_reason":"browser_aggregation_not_reproduced","reason":if user_auth{Value::Null}else{json!("user_authentication_required")}},
+            "events":{"supported":"partial","mode":"on_demand_ready_snapshot","continuous_subscription":false,"reason":"continuous_event_subscription_not_implemented"},
             "methods": {
                 "ping": {"supported": true},
                 "get_me": {"supported": true},
                 "get_capabilities": {"supported": true},
+                "get_read_state":{"supported":user_auth,"source":"discord_gateway_ready","missing_counts":null},
+                "get_account_coverage":{"supported":true,"complete":false},
+                "start_account_sync":{"supported":true,"mode":"bounded_fair_round","automatic_background":false},
+                "cancel_sync":{"supported":true,"scope":"local_account_sync_job"},
+                "record_inbox_state":{"supported":true,"scope":"explicit_local_confirmation","discord_modified":false},
                 "list_guilds": {"supported": true},
                 "list_channels": {"supported": true},
                 "list_dms": {"supported": true},
@@ -1153,7 +1487,7 @@ impl ReaderApi for DaemonApi {
                 "get_message_events": {"supported": true},
                 "get_attachment": {"supported": true}
             },
-            "tool_contract_revision":3,
+            "tool_contract_revision":4,
             "limitations": [
                 "read-only: only GET requests are issued; no write operations exist",
                 "GetGuildActiveThreads is bot-only (20002) for user accounts; list_threads uses per-channel/thread-search endpoints",
@@ -1346,7 +1680,27 @@ impl ReaderApi for DaemonApi {
     }
 
     async fn get_sync_status(&self) -> Result<Value, RpcError> {
-        let rows = self.store.channel_sync_all(500).map_err(store_error)?;
+        let mut rows = self.store.channel_sync_all(u32::MAX).map_err(store_error)?;
+        for id in self.store.cached_channel_ids(None).map_err(store_error)? {
+            if !rows.iter().any(|row| row.channel_id == id) {
+                rows.push(discord_store::sqlite::ChannelSyncRow {
+                    channel_id: id,
+                    last_synced_message_id: None,
+                    oldest_synced_message_id: None,
+                    last_message_id: None,
+                    last_activity_at: None,
+                    last_fetched_at: None,
+                    backfill: "partial".into(),
+                });
+            }
+        }
+        let account_user = self.me_id.lock().expect("me_id lock").clone();
+        let account_coverage = account_user
+            .as_deref()
+            .map(|user| {
+                crate::account_sync::account_coverage(&self.store, user).map_err(store_error)
+            })
+            .transpose()?;
         let coverage: Vec<Value> = rows
             .iter()
             .map(|row| {
@@ -1390,6 +1744,9 @@ impl ReaderApi for DaemonApi {
             "schema_version": self.store.schema_version().map_err(store_error)?,
             "messages_requiring_refetch": self.store.messages_requiring_refetch().map_err(store_error)?,
             "channels_tracked": rows.len(),
+            "scope":"cached_targets",
+            "complete":false,
+            "account_coverage":account_coverage,
             "coverage": coverage,
             "deletions_observed": deletions,
             "metrics": self.client.metrics().snapshot(),
@@ -1555,6 +1912,33 @@ impl ReaderApi for DaemonApi {
     async fn get_sync_progress(&self, params: SyncProgressParams) -> Result<Value, RpcError> {
         let jobs = self.jobs.lock().expect("jobs lock");
         let progress = jobs.get(&params.job_id).cloned();
+        drop(jobs);
+        let local_account_job = progress
+            .as_ref()
+            .is_some_and(|p| p["durable_account_job"] == true);
+        if progress.is_some() && !local_account_job {
+            return Ok(json!({"progress":progress}));
+        }
+        let saved = self
+            .store
+            .account_job(&params.job_id)
+            .map_err(store_error)?;
+        let progress = saved.map(|job| {
+            let mut progress = job.progress;
+            progress["job_id"] = json!(job.job_id);
+            progress["status"] = json!(if !local_account_job
+                && matches!(job.status.as_str(), "pending" | "running")
+            {
+                "interrupted"
+            } else {
+                job.status.as_str()
+            });
+            progress["account_user_id"] = json!(job.account_user_id);
+            progress["cancel_requested"] = json!(job.cancel_requested);
+            progress["restart_resume"] =
+                json!("start_account_sync uses persisted target checkpoints");
+            progress
+        });
         Ok(json!({"progress": progress}))
     }
 
@@ -1938,8 +2322,8 @@ mod tests {
             .unwrap();
         assert_eq!(all_channels["checked"]["messages_requiring_refetch"], 1);
         assert_eq!(status["cached_messages"], 1);
-        assert_eq!(status["channels_tracked"], 0);
-        assert_eq!(status["schema_version"], 2);
+        assert_eq!(status["channels_tracked"], 1);
+        assert_eq!(status["schema_version"], 3);
         assert_eq!(status["messages_requiring_refetch"], 1);
         assert!(api
             .list_changed_channels(ChangedChannelsParams {
@@ -2450,11 +2834,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gateway_refresh_preserves_rest_inventory_generation_and_errors() {
+        let mock = spawn_mock(VecDeque::new()).await;
+        let (api, store) = api_for(&mock.base);
+        let at = Utc::now().to_rfc3339();
+        store
+            .begin_account_inventory("7", "rest-generation", &at)
+            .unwrap();
+        let retained_thread =
+            serde_json::from_value(json!({"id":"300","type":11,"guild_id":"42"})).unwrap();
+        store
+            .observe_account_targets("7", "rest-generation", &[retained_thread], &at)
+            .unwrap();
+        store
+            .finish_account_inventory(
+                "rest-generation",
+                &at,
+                &json!({"failures":[{"source":"threads","code":"forbidden"}]}),
+            )
+            .unwrap();
+        let observation=serde_json::from_value(json!({"account_user_id":"7","observed_at":at,"version":"42","partial":false,"inventory_complete":false,"read_states":[],"channels":[{"id":"200","type":0,"guild_id":"42"}]})).unwrap();
+        api.retain_account_observation(&observation).unwrap();
+        let inventory = store.account_inventory("7").unwrap().unwrap();
+        assert_eq!(inventory.generation, "rest-generation");
+        assert_eq!(inventory.discovery["failures"][0]["code"], "forbidden");
+        assert!(store
+            .account_targets("7")
+            .unwrap()
+            .iter()
+            .all(|target| target.generation == inventory.generation));
+    }
+
+    #[tokio::test]
+    async fn cached_read_state_distinguishes_observed_zero_and_unknown_targets() {
+        let mock = spawn_mock(VecDeque::new()).await;
+        let (api, store) = api_for(&mock.base);
+        *api.me_id.lock().unwrap() = Some("7".into());
+        let at = Utc::now().to_rfc3339();
+        let observation=serde_json::from_value(json!({"account_user_id":"7","observed_at":at,"version":"42","partial":false,"inventory_complete":false,"channels":[],"read_states":[{"channel_id":"200","last_read_message_id":"100","discord_mention_count":0,"observed_at":at,"version":"42","availability":"available","reason":null}]})).unwrap();
+        store.save_account_observation(&observation).unwrap();
+        for (channel, expected) in [("200", json!(0)), ("201", Value::Null)] {
+            let result = api
+                .get_read_state(ReadStateParams {
+                    channel_id: Some(channel.into()),
+                    refresh: false,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(result["read_state"][0]["discord_mention_count"], expected);
+            assert_eq!(result["coverage"]["complete"], false);
+        }
+        assert!(mock.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn account_job_reports_live_progress_and_persists_cursor_after_restart() {
+        let mock=spawn_mock(VecDeque::from([(200,r#"[{"id":"100","channel_id":"200","author":{"id":"8"},"content":"old contact","timestamp":"2026-10-07T08:31:00Z","mentions":[{"id":"7"}]}]"#.into())])).await;
+        let (api, store) = api_for(&mock.base);
+        *api.me_id.lock().unwrap() = Some("7".into());
+        let at = discord_store::sqlite::now_iso();
+        store.begin_account_inventory("7", "g", &at).unwrap();
+        store
+            .observe_account_targets(
+                "7",
+                "g",
+                &[serde_json::from_value(json!({"id":"200","type":0,"guild_id":"42"})).unwrap()],
+                &at,
+            )
+            .unwrap();
+        let started = api
+            .start_account_sync(AccountSyncParams {
+                max_targets: Some(1),
+                page_size: Some(1),
+                refresh_inventory: false,
+            })
+            .await
+            .unwrap();
+        let id = started["job_id"].as_str().unwrap().to_owned();
+        let final_progress = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let p = api
+                    .get_sync_progress(SyncProgressParams { job_id: id.clone() })
+                    .await
+                    .unwrap();
+                assert_ne!(p["progress"]["status"], "interrupted");
+                if p["progress"]["status"] == "finished" {
+                    break p;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(final_progress["progress"]["complete"], false);
+        let restarted = DaemonApi::new(Arc::clone(&api.client), Arc::clone(&store));
+        let resumed = restarted
+            .get_sync_progress(SyncProgressParams { job_id: id })
+            .await
+            .unwrap();
+        assert_eq!(resumed["progress"]["status"], "finished");
+        assert_eq!(
+            store.account_targets("7").unwrap()[0]
+                .backfill_before
+                .as_deref(),
+            Some("100")
+        );
+        assert_eq!(
+            store.account_targets("7").unwrap()[0].next_direction,
+            "incremental"
+        );
+    }
+
+    #[tokio::test]
     async fn capabilities_publish_current_cursor_and_sync_contracts() {
         let mock = spawn_mock(VecDeque::new()).await;
         let (api, _) = api_for(&mock.base);
+        *api.me_id.lock().unwrap() = Some("7".into());
         let value = api.get_capabilities().await.unwrap();
-        assert_eq!(value["tool_contract_revision"], 3);
+        assert_eq!(value["tool_contract_revision"], 4);
         assert_eq!(
             value["methods"]["messages_after"]["continuation_argument"],
             "after_message_id"
@@ -2688,6 +3186,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inbox_snapshot_freezes_pages_and_checks_scope() {
+        let mock = spawn_mock(VecDeque::new()).await;
+        let (api, store) = api_for(&mock.base);
+        *api.me_id.lock().unwrap() = Some("7".into());
+        let message = |id: &str, content: &str| {
+            serde_json::from_value::<Message>(json!({
+                "id":id,"channel_id":"200","author":{"id":"99"},
+                "content":content,"timestamp":"2026-10-07T08:30:00Z","mentions":[{"id":"7"}]
+            }))
+            .unwrap()
+        };
+        store
+            .insert_messages(&[message("3", "first"), message("2", "original")])
+            .unwrap();
+        let filter = InboxFilter {
+            channel_id: Some("200".into()),
+            limit: 1,
+            ..InboxFilter::default()
+        };
+        let first = api.list_mentions(filter.clone()).await.unwrap();
+        assert!(first["snapshot_id"].is_string());
+        let cursor = first["next_cursor"].as_str().unwrap().to_owned();
+        store
+            .insert_messages(&[message("2", "edited"), message("1", "newly cached")])
+            .unwrap();
+        let second = api
+            .list_mentions(InboxFilter {
+                next_cursor: Some(cursor.clone()),
+                ..filter.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(second["snapshot_id"], first["snapshot_id"]);
+        assert_eq!(second["mentions"][0]["message"]["content"], "original");
+        assert_eq!(second["has_more"], false);
+        assert_eq!(second["coverage"], first["coverage"]);
+        assert!(api
+            .list_replies(InboxFilter {
+                next_cursor: Some(cursor.clone()),
+                ..filter.clone()
+            })
+            .await
+            .is_err());
+        assert!(api
+            .list_mentions(InboxFilter {
+                next_cursor: Some(cursor),
+                refresh: true,
+                ..filter
+            })
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn inbox_distinguishes_confirmed_dms_from_unknown_channels() {
+        let mock = spawn_mock(VecDeque::new()).await;
+        let (api, store) = api_for(&mock.base);
+        *api.me_id.lock().unwrap() = Some("7".into());
+        for (channel_id, kind) in [("200", 1), ("201", 3)] {
+            store
+                .upsert_channel(
+                    &serde_json::from_value(json!({"id":channel_id,"type":kind})).unwrap(),
+                )
+                .unwrap();
+        }
+        for (id, channel_id, author_id) in [
+            ("1", "200", "99"),
+            ("2", "201", "99"),
+            ("3", "202", "99"),
+            ("4", "200", "7"),
+        ] {
+            let message: Message = serde_json::from_value(json!({"id":id,"channel_id":channel_id,"author":{"id":author_id},"content":"hi","timestamp":"2026-10-07T08:30:00Z","mentions":[]})).unwrap();
+            store.insert_messages(&[message]).unwrap();
+        }
+        let result = api
+            .list_mentions(InboxFilter {
+                limit: 10,
+                ..InboxFilter::default()
+            })
+            .await
+            .unwrap();
+        let entries = result["mentions"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["matched_by"], "group_dm");
+        assert_eq!(entries[1]["matched_by"], "dm");
+        assert_eq!(
+            entries[1]["message_url"],
+            "https://discord.com/channels/@me/200/1"
+        );
+        assert!(
+            api.list_replies(InboxFilter::default()).await.unwrap()["mentions"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn synthetic_direct_mention_has_unknown_read_state() {
+        let mock = spawn_mock(VecDeque::new()).await;
+        let (api, store) = api_for(&mock.base);
+        *api.me_id.lock().unwrap() = Some("7".into());
+        let message: Message = serde_json::from_value(json!({
+            "id":"1500000000000000100","channel_id":"1500000000000000200",
+            "guild_id":"1500000000000000300","author":{"id":"99","username":"fixture-author"},
+            "content":"fixture","timestamp":"2026-10-07T08:30:00Z","mentions":[{"id":"7"}]
+        }))
+        .unwrap();
+        store.insert_messages(&[message]).unwrap();
+        let result = api
+            .list_mentions(InboxFilter {
+                channel_id: Some("1500000000000000200".into()),
+                ..InboxFilter::default()
+            })
+            .await
+            .unwrap();
+        let entry = &result["mentions"][0];
+        assert_eq!(entry["matched_by"], "direct");
+        assert_eq!(entry["read_status"], "unknown");
+        assert_eq!(entry["message_url"], "https://discord.com/channels/1500000000000000300/1500000000000000200/1500000000000000100");
+        assert_eq!(entry["discord_mention_notification_count"], Value::Null);
+    }
+
+    #[tokio::test]
     async fn inbox_scans_beyond_200_rows_and_pages_without_claiming_zero() {
         let mock = spawn_mock(VecDeque::new()).await;
         let (api, store) = api_for(&mock.base);
@@ -2714,11 +3336,11 @@ mod tests {
         };
         let first = api.list_mentions(filter.clone()).await.unwrap();
         assert_eq!(first["mentions"][0]["message"]["id"], "2");
-        assert_eq!(first["next_cursor"], "2");
+        assert!(first["next_cursor"].as_str().unwrap().contains(':'));
         assert_eq!(first["checked"]["messages_classified"], 205);
         let second = api
             .list_mentions(InboxFilter {
-                next_cursor: Some("2".into()),
+                next_cursor: Some(first["next_cursor"].as_str().unwrap().into()),
                 ..filter.clone()
             })
             .await
@@ -2742,14 +3364,14 @@ mod tests {
     async fn list_guilds_is_get_only_and_cached() {
         let mock = spawn_mock(VecDeque::from([(
             200,
-            r#"[{"id":"42","name":"ZENVR"}]"#.to_string(),
+            r#"[{"id":"42","name":"Example Guild"}]"#.to_string(),
         )]))
         .await;
         let (api, store) = api_for(&mock.base);
 
         let result = api.list_guilds().await.unwrap();
         let text = serde_json::to_string(&result).unwrap();
-        assert!(text.contains("ZENVR"));
+        assert!(text.contains("Example Guild"));
         assert!(
             !text.contains(SECRET),
             "response must not contain the token"
@@ -2766,14 +3388,14 @@ mod tests {
 
         let cached = store.guilds().unwrap();
         assert_eq!(cached.len(), 1);
-        assert_eq!(cached[0].name, "ZENVR");
+        assert_eq!(cached[0].name, "Example Guild");
     }
 
     #[tokio::test]
     async fn recent_messages_are_cached_and_searchable() {
         let mock = spawn_mock(VecDeque::from([(
             200,
-            r#"[{"id":"10","channel_id":"200","guild_id":"42","author":{"id":"7","username":"alice"},"content":"展軸祭の準備をしています","timestamp":"2026-10-05T00:00:00.000000+00:00"}]"#
+            r#"[{"id":"10","channel_id":"200","guild_id":"42","author":{"id":"7","username":"alice"},"content":"会議予定の準備をしています","timestamp":"2026-10-05T00:00:00.000000+00:00"}]"#
                 .to_string(),
         )]))
         .await;
@@ -2786,11 +3408,11 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(serde_json::to_string(&result).unwrap().contains("展軸祭"));
+        assert!(serde_json::to_string(&result).unwrap().contains("会議予定"));
 
         let search = api
             .search_messages(SearchParams {
-                query: "展軸祭".into(),
+                query: "会議予定".into(),
                 guild_id: Some("42".into()),
                 channel_id: None,
                 author_id: None,
@@ -2806,7 +3428,7 @@ mod tests {
             .await
             .unwrap();
         let text = serde_json::to_string(&search).unwrap();
-        assert!(text.contains("展軸祭の準備"), "search must hit the cache");
+        assert!(text.contains("会議予定の準備"), "search must hit the cache");
         assert!(text.contains("local-fts"));
         assert!(!text.contains(SECRET));
     }

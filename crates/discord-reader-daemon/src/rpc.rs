@@ -320,6 +320,41 @@ pub struct SyncStartParams {
     pub refetch_before: Option<std::collections::HashMap<String, String>>,
 }
 
+/// Scope for a read-state observation; IDs are Discord snowflake strings.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ReadStateParams {
+    pub guild_id: Option<String>,
+    pub channel_id: Option<String>,
+    #[serde(default = "default_true")]
+    pub refresh: bool,
+}
+fn default_true() -> bool {
+    true
+}
+
+/// Explicit local notification/action state; replaces the previous state for this message.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InboxStateParams {
+    pub channel_id: String,
+    pub message_id: String,
+    pub notified_at: Option<String>,
+    pub snoozed_until: Option<String>,
+    pub action_required: Option<bool>,
+    pub action_evidence: Option<String>,
+    pub completed_at: Option<String>,
+    pub completion_evidence: Option<String>,
+}
+
+/// Bounds for one fair account synchronization round.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AccountSyncParams {
+    pub max_targets: Option<u32>,
+    pub page_size: Option<u8>,
+    #[serde(default = "default_true")]
+    pub refresh_inventory: bool,
+}
+
 /// Parameters for `get_sync_progress`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SyncProgressParams {
@@ -356,6 +391,23 @@ pub trait ReaderApi: Send + Sync {
     async fn ping(&self) -> Result<Value, RpcError>;
     async fn get_me(&self) -> Result<Value, RpcError>;
     async fn get_capabilities(&self) -> Result<Value, RpcError>;
+    async fn get_read_state(&self, _params: ReadStateParams) -> Result<Value, RpcError> {
+        Err(RpcError::invalid_params("account observations unavailable"))
+    }
+    async fn record_inbox_state(&self, _params: InboxStateParams) -> Result<Value, RpcError> {
+        Err(RpcError::invalid_params("local inbox workflow unavailable"))
+    }
+    async fn get_account_coverage(&self) -> Result<Value, RpcError> {
+        Err(RpcError::invalid_params("account inventory unavailable"))
+    }
+    async fn start_account_sync(&self, _params: AccountSyncParams) -> Result<Value, RpcError> {
+        Err(RpcError::invalid_params(
+            "account synchronization unavailable",
+        ))
+    }
+    async fn cancel_sync(&self, _params: SyncProgressParams) -> Result<Value, RpcError> {
+        Err(RpcError::invalid_params("cancellation unavailable"))
+    }
     async fn list_guilds(&self) -> Result<Value, RpcError>;
     async fn list_channels(&self, params: GuildIdParams) -> Result<Value, RpcError>;
     async fn list_dms(&self) -> Result<Value, RpcError>;
@@ -417,6 +469,11 @@ pub async fn dispatch(api: &dyn ReaderApi, request: RpcRequest) -> Option<RpcRes
             "ping" => api.ping().await,
             "get_me" => api.get_me().await,
             "get_capabilities" => api.get_capabilities().await,
+            "get_read_state" => api.get_read_state(parse(&params)?).await,
+            "record_inbox_state" => api.record_inbox_state(parse(&params)?).await,
+            "get_account_coverage" => api.get_account_coverage().await,
+            "start_account_sync" => api.start_account_sync(parse(&params)?).await,
+            "cancel_sync" => api.cancel_sync(parse(&params)?).await,
             "list_guilds" => api.list_guilds().await,
             "list_channels" => {
                 let p: GuildIdParams = parse(&params)?;
@@ -527,9 +584,31 @@ pub async fn bind_socket(path: impl AsRef<Path>) -> std::io::Result<UnixListener
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    // Remove a stale socket from a previous run.
-    if tokio::fs::symlink_metadata(path).await.is_ok() {
-        tokio::fs::remove_file(path).await?;
+    if let Ok(metadata) = tokio::fs::symlink_metadata(path).await {
+        use std::os::unix::fs::FileTypeExt;
+        if !metadata.file_type().is_socket() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "RPC path is not a socket",
+            ));
+        }
+        match UnixStream::connect(path).await {
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    "RPC socket is already active",
+                ))
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                tokio::fs::remove_file(path).await?;
+            }
+            Err(error) => return Err(error),
+        }
     }
     let listener = UnixListener::bind(path)?;
     set_socket_mode(path)?;
@@ -667,7 +746,7 @@ mod tests {
             Ok(json!({}))
         }
         async fn list_guilds(&self) -> Result<Value, RpcError> {
-            Ok(json!({"guilds": [{"id": "1", "name": "ZENVR"}]}))
+            Ok(json!({"guilds": [{"id": "1", "name": "Example Guild"}]}))
         }
         async fn list_channels(&self, _p: GuildIdParams) -> Result<Value, RpcError> {
             Ok(json!({"channels": []}))
@@ -827,12 +906,25 @@ mod tests {
         let line = lines.next_line().await.unwrap().unwrap();
         let response: RpcResponse = serde_json::from_str(&line).unwrap();
         assert_eq!(response.id, Some(1));
-        assert_eq!(response.result.unwrap()["guilds"][0]["name"], "ZENVR");
+        assert_eq!(
+            response.result.unwrap()["guilds"][0]["name"],
+            "Example Guild"
+        );
 
         server.abort();
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn binding_again_does_not_unlink_an_active_daemon_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("active.sock");
+        let listener = bind_socket(&path).await.unwrap();
+        assert!(bind_socket(&path).await.is_err());
+        assert!(UnixStream::connect(&path).await.is_ok());
+        drop(listener);
+    }
+
     #[tokio::test]
     async fn socket_permissions_are_restricted() {
         use std::os::unix::fs::PermissionsExt;

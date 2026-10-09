@@ -236,10 +236,11 @@ async fn run(options: Options) -> anyhow::Result<()> {
     })?;
     info!(database = %options.database.display(), "cache ready");
 
-    let api = Arc::new(DaemonApi::new(client, Arc::new(store)));
     let listener = rpc::bind_socket(&options.socket)
         .await
         .with_context(|| format!("failed to bind {}", options.socket.display()))?;
+    store.interrupt_account_jobs(&discord_store::sqlite::now_iso())?;
+    let api = Arc::new(DaemonApi::new(client, Arc::new(store)));
     info!(socket = %options.socket.display(), "read-only rpc listening");
 
     let server = tokio::spawn(rpc::serve(listener, api));

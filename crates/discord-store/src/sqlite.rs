@@ -3,6 +3,15 @@
 //! The cache is written lazily: only data that a client already asked for is
 //! stored. Nothing is crawled in the background.
 
+#[path = "account.rs"]
+pub mod account;
+#[path = "observations.rs"]
+pub mod observations;
+#[path = "snapshots.rs"]
+pub mod snapshots;
+#[path = "workflow.rs"]
+pub mod workflow;
+
 use std::{path::Path, sync::Mutex};
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -186,6 +195,7 @@ impl ChannelGuild {
 /// One consistent cache observation of a channel and its retrieval evidence.
 #[derive(Debug)]
 pub struct ChannelSnapshot {
+    pub kind: Option<u8>,
     pub guild: ChannelGuild,
     pub messages: Vec<MessageRow>,
     pub coverage: Vec<CoverageRange>,
@@ -311,6 +321,66 @@ CREATE TABLE IF NOT EXISTS deleted_messages (
     observed_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS account_inventory (
+    generation TEXT PRIMARY KEY,
+    account_user_id TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    refreshed_at TEXT,
+    status TEXT NOT NULL,
+    discovery_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS account_inventory_user ON account_inventory(account_user_id,started_at);
+CREATE TABLE IF NOT EXISTS account_targets (
+    account_user_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    guild_id TEXT,
+    parent_id TEXT,
+    kind INTEGER NOT NULL,
+    generation TEXT NOT NULL,
+    first_discovered_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    last_attempt_at TEXT,
+    attempt_sequence INTEGER NOT NULL DEFAULT 0,
+    last_checked_at TEXT,
+    next_check_at TEXT,
+    backfill_before TEXT,
+    increment_after TEXT,
+    history_status TEXT NOT NULL DEFAULT 'unfetched',
+    next_direction TEXT NOT NULL DEFAULT 'backfill',
+    last_error_json TEXT,
+    PRIMARY KEY(account_user_id,channel_id)
+);
+CREATE INDEX IF NOT EXISTS account_targets_fair ON account_targets(account_user_id,last_attempt_at,channel_id);
+CREATE TABLE IF NOT EXISTS account_sync_jobs (
+    job_id TEXT PRIMARY KEY,
+    account_user_id TEXT NOT NULL,
+    generation TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
+    progress_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS inbox_workflow (
+    account_user_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    workflow_json TEXT NOT NULL,
+    PRIMARY KEY(account_user_id,channel_id,message_id)
+);
+CREATE TABLE IF NOT EXISTS account_observations (
+    account_user_id TEXT PRIMARY KEY,
+    observed_at TEXT NOT NULL,
+    observation_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS inbox_snapshots (
+    snapshot_id TEXT PRIMARY KEY,
+    account_user_id TEXT NOT NULL,
+    query_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    response_json TEXT NOT NULL
+);
+
 -- Named server-side search cursors (resumable paging).
 CREATE TABLE IF NOT EXISTS search_cursors (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -430,72 +500,7 @@ impl Store {
     pub fn insert_message_at(&self, message: &Message, fetched_at: &str) -> Result<(), StoreError> {
         let conn = self.conn.lock().expect("store lock");
         let tx = conn.unchecked_transaction()?;
-        let mut view = MessageView::from(message);
-        if view.guild_id.is_none() {
-            view.guild_id = tx
-                .query_row(
-                    "SELECT guild_id FROM messages WHERE id = ?1 AND channel_id = ?2",
-                    params![message.id, message.channel_id],
-                    |row| row.get::<_, Option<String>>(0),
-                )
-                .optional()?
-                .flatten();
-            if view.guild_id.is_none() {
-                view.guild_id = tx
-                    .query_row(
-                        "SELECT guild_id FROM channels WHERE id = ?1",
-                        params![message.channel_id],
-                        |row| row.get::<_, Option<String>>(0),
-                    )
-                    .optional()?
-                    .flatten();
-            }
-        }
-        let message_json = serde_json::to_string(&view)
-            .map_err(|e| StoreError::Search(format!("cannot serialize message view: {e}")))?;
-        tx.execute(
-            "INSERT INTO messages
-                (id, channel_id, guild_id, author_id, timestamp, edited_timestamp, content,
-                 message_json, fetched_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-             ON CONFLICT(id) DO UPDATE SET
-                channel_id = excluded.channel_id,
-                guild_id = excluded.guild_id,
-                author_id = excluded.author_id,
-                timestamp = excluded.timestamp,
-                edited_timestamp = excluded.edited_timestamp,
-                content = excluded.content,
-                message_json = excluded.message_json,
-                fetched_at = excluded.fetched_at",
-            params![
-                message.id,
-                message.channel_id,
-                view.guild_id,
-                message.author.as_ref().map(|a| a.id.clone()),
-                message.timestamp,
-                message.edited_timestamp,
-                message.content,
-                message_json,
-                fetched_at,
-            ],
-        )?;
-        tx.execute(
-            "DELETE FROM messages_fts WHERE message_id = ?1",
-            params![message.id],
-        )?;
-        tx.execute(
-            "INSERT INTO messages_fts (message_id, content) VALUES (?1, ?2)",
-            params![message.id, message.content],
-        )?;
-        if let Some(author) = &message.author {
-            tx.execute(
-                "INSERT INTO users (id, username, global_name) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(id) DO UPDATE SET
-                    username = COALESCE(excluded.username, users.username),
-                    global_name = COALESCE(excluded.global_name, users.global_name)",
-                params![author.id, author.username, author.global_name],
-            )?;
-        }
+        persist_message(&tx, message, fetched_at)?;
         tx.commit()?;
         Ok(())
     }
@@ -605,6 +610,7 @@ impl Store {
                 |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, u8>(1)?)),
             )
             .optional()?;
+        let kind = association.as_ref().map(|(_, kind)| *kind);
         let guild = match association {
             Some((Some(id), _)) => ChannelGuild::Guild(id),
             Some((None, 1 | 3)) => ChannelGuild::NoGuild,
@@ -637,6 +643,7 @@ impl Store {
         };
         tx.commit()?;
         Ok(ChannelSnapshot {
+            kind,
             guild,
             messages,
             coverage,
@@ -1090,6 +1097,79 @@ pub(crate) fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Messag
     })
 }
 
+fn persist_message(
+    conn: &Connection,
+    message: &Message,
+    fetched_at: &str,
+) -> Result<(), StoreError> {
+    let mut view = MessageView::from(message);
+    if view.guild_id.is_none() {
+        view.guild_id = conn
+            .query_row(
+                "SELECT guild_id FROM messages WHERE id = ?1 AND channel_id = ?2",
+                params![message.id, message.channel_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        if view.guild_id.is_none() {
+            view.guild_id = conn
+                .query_row(
+                    "SELECT guild_id FROM channels WHERE id = ?1",
+                    params![message.channel_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten();
+        }
+    }
+    let message_json = serde_json::to_string(&view)
+        .map_err(|e| StoreError::Search(format!("cannot serialize message view: {e}")))?;
+    conn.execute(
+        "INSERT INTO messages
+            (id, channel_id, guild_id, author_id, timestamp, edited_timestamp, content,
+             message_json, fetched_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(id) DO UPDATE SET
+            channel_id = excluded.channel_id,
+            guild_id = excluded.guild_id,
+            author_id = excluded.author_id,
+            timestamp = excluded.timestamp,
+            edited_timestamp = excluded.edited_timestamp,
+            content = excluded.content,
+            message_json = excluded.message_json,
+            fetched_at = excluded.fetched_at",
+        params![
+            message.id,
+            message.channel_id,
+            view.guild_id,
+            message.author.as_ref().map(|a| a.id.clone()),
+            message.timestamp,
+            message.edited_timestamp,
+            message.content,
+            message_json,
+            fetched_at,
+        ],
+    )?;
+    conn.execute(
+        "DELETE FROM messages_fts WHERE message_id = ?1",
+        params![message.id],
+    )?;
+    conn.execute(
+        "INSERT INTO messages_fts (message_id, content) VALUES (?1, ?2)",
+        params![message.id, message.content],
+    )?;
+    if let Some(author) = &message.author {
+        conn.execute(
+            "INSERT INTO users (id, username, global_name) VALUES (?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET
+                username = COALESCE(excluded.username, users.username),
+                global_name = COALESCE(excluded.global_name, users.global_name)",
+            params![author.id, author.username, author.global_name],
+        )?;
+    }
+    Ok(())
+}
 /// Merge overlapping or adjacent coverage ranges for one channel.
 fn merge_coverage(conn: &rusqlite::Connection, channel_id: &str) -> Result<(), StoreError> {
     let mut stmt = conn.prepare(
@@ -1270,7 +1350,7 @@ mod tests {
         assert_eq!(
             conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            2
+            3
         );
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r
@@ -1278,6 +1358,41 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn versioned_v2_drift_is_not_silently_repaired_by_v3() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("drift.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, backup_path TEXT); INSERT INTO schema_migrations VALUES(2,'2026-01-01',NULL); PRAGMA user_version=2; DROP TABLE coverage;").unwrap();
+        drop(conn);
+        assert!(Store::open(&path).is_err());
+        let conn = Connection::open(&path).unwrap();
+        assert!(conn.prepare("SELECT * FROM coverage").is_err());
+    }
+
+    #[test]
+    fn v2_upgrade_preserves_rows_and_adds_account_and_snapshot_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v2.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, backup_path TEXT); INSERT INTO schema_migrations VALUES(2,'2026-01-01',NULL); PRAGMA user_version=2; INSERT INTO coverage VALUES('200','1','9');").unwrap();
+        drop(conn);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(store.coverage("200").unwrap()[0].to_id, "9");
+        let conn = store.conn.lock().unwrap();
+        for table in [
+            "account_inventory",
+            "account_targets",
+            "account_sync_jobs",
+            "inbox_snapshots",
+        ] {
+            assert!(conn.prepare(&format!("SELECT * FROM {table}")).is_ok());
+        }
     }
 
     #[test]

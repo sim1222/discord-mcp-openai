@@ -34,7 +34,7 @@ guild membership can require GET requests even when `refresh=false`.
 ## Classification and paging
 
 Mention classification uses confirmed matches in order: `direct`, `reply`,
-`role`, `everyone`. Replies require the referenced author's identity; cached
+`role`, `everyone`, then incoming `dm` or `group_dm`. Replies require the referenced author's identity; cached
 target authors can supply that evidence. Unknown authors remain unresolved.
 An explicitly deleted reference is not an unresolved author lookup, and
 forwarded references are not classified as replies. `list_replies` considers
@@ -48,9 +48,10 @@ roles. A confirmed direct or reply hit does not need a role lookup.
 
 Both tools return matches in `mentions`, newest first. `limit` bounds returned
 matches, not rows classified. All retained channel rows are scanned from a
-per-channel cache snapshot. `next_cursor` is the last returned hit's ID when more matches exist;
-pass it unchanged to exclude that ID and newer matches on the next page. These
-are observations of a changing cache, not a frozen result snapshot.
+per-channel cache snapshot. The first call persists an immutable result snapshot.
+`next_cursor` is an opaque snapshot/offset cursor when more matches exist;
+pass it unchanged with the same scope, window and list mode. Continuation rejects
+`refresh=true` and another account. The cursor is not a Discord message ID.
 
 `checked` separates:
 
@@ -69,8 +70,8 @@ window; `channels_skipped` counts those without such messages. Neither is a
 temporal completeness certificate.
 Messages, guild association, and coverage ranges are read in one SQLite read
 transaction per channel, so evidence cannot come from a later cache update
-than the rows classified. Different channels and later result pages can still
-observe different cache states.
+than the rows classified. Different channels can observe different cache states
+during initial capture; later result pages return the same persisted observations.
 Reply-author cache lookups and role-membership GET requests occur outside that
 target-message transaction. Their observations can be newer than the target
 rows; the scan is not a single snapshot of all classification dependencies.
@@ -152,3 +153,16 @@ metadata/classification, paging, and coverage arithmetic. Previously reported
 live direct/reply/everyone positives remain valid observations. Acceptance of
 this revision, including role positives, user-authenticated thread searches,
 rate limits, edits/deletions, and restart behavior, needs separate live testing.
+
+## Revision 4 immutable inbox pages
+
+`next_cursor` is now an opaque persisted snapshot ID and offset, replacing the
+old exclusive message-ID cursor. Keep scope, window and list mode unchanged;
+refresh-on-resume fails. Entries, coverage, read evidence and explicit local
+workflow are frozen at capture; edits/new messages do not change subsequent pages.
+Snapshots survive restart and currently have no automatic pruning.
+Incoming confirmed DM/group DM messages are classified as `dm`/`group_dm` when
+there is no stronger direct/reply match. Unknown channel kind is not guessed.
+Fresh independently observed Gateway ACK positions can supply read comparison;
+notification delivery and deletion status are still unknown. Explicit local
+workflow never follows from read state. See [account reading contract](account-reading-contract.md).

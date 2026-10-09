@@ -229,13 +229,15 @@ mod tests {
     fn fts_finds_keyword() {
         let store = Store::open_in_memory().unwrap();
         store
-            .insert_message(&msg("1", "200", "展軸祭の打ち合わせは明日です"))
+            .insert_message(&msg("1", "200", "会議予定の打ち合わせは明日です"))
             .unwrap();
         store
             .insert_message(&msg("2", "200", "ランチはカレーにしましょう"))
             .unwrap();
 
-        let hits = store.search(&SearchQuery::new("展軸祭").limit(10)).unwrap();
+        let hits = store
+            .search(&SearchQuery::new("会議予定").limit(10))
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].message.id, "1");
         assert!(hits[0].relevance > 0.0);

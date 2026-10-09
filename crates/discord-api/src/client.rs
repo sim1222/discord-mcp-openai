@@ -355,3 +355,17 @@ mod tests {
         assert!(dump.contains("[REDACTED]"));
     }
 }
+
+impl crate::account_observation::AccountObserver for DiscordClient {
+    async fn observe_account(
+        &self,
+    ) -> Result<
+        crate::account_observation::AccountObservation,
+        crate::account_observation::ObservationError,
+    > {
+        if self.token_kind != TokenKind::User {
+            return Err(crate::account_observation::ObservationError::Unsupported);
+        }
+        crate::account_observation::observe(&self.token).await
+    }
+}

@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 use crate::sqlite::StoreError;
 
-const VERSION: i64 = 2;
+const VERSION: i64 = 3;
 const V2_ADDED_COLUMNS: [(&str, &str); 3] = [
     ("messages", "message_json"),
     ("messages", "fetched_at"),
@@ -40,11 +40,24 @@ pub(crate) fn migrate(conn: &mut Connection, schema: &str) -> Result<(), StoreEr
         )?;
         if !recorded {
             return Err(StoreError::Schema(
-                "schema version 2 has no migration history entry".into(),
+                "current schema has no migration history entry".into(),
             ));
         }
         log_schema(conn, &database)?;
         return Ok(());
+    }
+    if version == 2 {
+        validate_versioned(conn, &canonical, 2)?;
+        let recorded: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=2)",
+            [],
+            |row| row.get(0),
+        )?;
+        if !recorded {
+            return Err(StoreError::Schema(
+                "version 2 has no migration history entry".into(),
+            ));
+        }
     }
     let has_tables: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%')", [], |row| row.get(0))?;
     if has_tables {
@@ -165,7 +178,28 @@ fn normalize(sql: &str) -> String {
 }
 
 fn validate(conn: &Connection, canonical: &Connection) -> Result<(), StoreError> {
+    validate_versioned(conn, canonical, VERSION)
+}
+
+fn validate_versioned(
+    conn: &Connection,
+    canonical: &Connection,
+    version: i64,
+) -> Result<(), StoreError> {
+    const V3_OBJECTS: &[&str] = &[
+        "account_inventory",
+        "account_inventory_user",
+        "account_targets",
+        "account_targets_fair",
+        "account_sync_jobs",
+        "inbox_snapshots",
+        "account_observations",
+        "inbox_workflow",
+    ];
     for (kind, name, sql) in objects(canonical)? {
+        if version == 2 && V3_OBJECTS.contains(&name.as_str()) {
+            continue;
+        }
         if kind == "table" {
             if !exists(conn, &name)? {
                 return Err(StoreError::Schema(format!(
@@ -207,7 +241,7 @@ fn backup(conn: &Connection, database: &str) -> Result<PathBuf, StoreError> {
         .map_err(|error| StoreError::Schema(error.to_string()))?
         .as_nanos();
     let mut name = source.as_os_str().to_os_string();
-    name.push(format!(".backup-v2-{}-{stamp}.sqlite3", std::process::id()));
+    name.push(format!(".backup-v3-{}-{stamp}.sqlite3", std::process::id()));
     let path = PathBuf::from(name);
     let mut partial_name = path.as_os_str().to_os_string();
     partial_name.push(".partial");

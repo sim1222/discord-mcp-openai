@@ -37,7 +37,7 @@ Secure MCP Tunnel → ChatGPT
 | 任意 URL なし | URL は `API_BASE + DiscordRequest::path()` からのみ生成。識別子は snowflake (数字) 検証でパストラバーソルを遮断 |
 | credential 分離 | Discord token は `discord-reader-daemon` のみが読む。`discord-mcp` / `tunnel-client` には mount しない |
 | credential 漏洩防止 | `Token` 型は `Debug`/`Display`/`Serialize` を `[REDACTED]` に。ログ・RPC・エラー文言に credential を一切出さない (テストで担保) |
-| 書き込み tool なし | MCP tool は read-only 24 個のみ。tool 名に write 動詞が含まれないことをテストで検証 |
+| 書き込み tool なし | MCP tool は Discord read-only 29 個 (ローカル状態記録を含む)。tool 名に write 動詞が含まれないことをテストで検証 |
 | 任意 SQL / 任意 FS なし | MCP tool は RPC メソッドのみ経由。SQL も固定ステートメント |
 | ネットワーク分離 | `discord-mcp` は internal network のみ → Internet / Discord / OpenAI に到達不能。`discord-reader` は Discord API、`tunnel-client` は api.openai.com への outbound のみ |
 | rate limit 尊重 | 同時 HTTP リクエスト 4 (設定可)、`X-RateLimit-*` と `Retry-After` を尊重。固定 sleep でのごまかしなし、全チャンネル同時クロールなし |
@@ -48,8 +48,8 @@ Secure MCP Tunnel → ChatGPT
 リスクがあります。このリポジトリではリスクを増やさないため以下を徹底しています。
 
 - 書き込み API を実装しない (存在させない)
-- 全履歴の自動クロール・常時巡回・バックフィルを行わない (要求された分だけ遅延取得)
-- 自動化を増やすイベント購読 (Gateway) は実装しない
+- 常時巡回は行わない。通常は遅延取得し、明示的な `start_account_sync` の要求時だけ、上限付きのバックフィル・差分取得を進める
+- Gateway は明示的な `get_read_state` の READY 取得のみ。送信操作は Identify / Heartbeat に限定し、ACK は送らない
 - 429 を必ず尊重し、同時リクエスト数を小さく保つ
 
 利用は自己責任で、Discord の利用規約・アカウント運用ポリシーを確認してください。
@@ -57,7 +57,7 @@ Secure MCP Tunnel → ChatGPT
 ### 閲覧しても既読になりません
 
 Discord の既読状態 (未読バッジ) は `POST /channels/{channel.id}/messages/{message.id}/ack`
-等の ack エンドポイントで更新されます。本実装は `GET` のみで ack 系の API を一切持たないため、
+等の ack エンドポイントで更新されます。本実装は REST `GET` と Gateway の認証・Heartbeat のみで、ack 系の送信 API を持たないため、
 
 - このツールでメッセージを読んでも **既読は付きません**
 - PC / スマホの Discord クライアントの **未読バッジ・通知は消えません**
@@ -224,6 +224,21 @@ unit は `NoNewPrivileges` / `PrivateTmp` / `ProtectSystem=strict` / `ProtectHom
 
 ---
 
+## アカウント全体の読み取り基盤
+
+`get_read_state` は Discord Gateway READY 由来のチャンネル通知件数・既読位置・
+更新バージョンを返します。未取得は null、確認済みゼロだけが 0 です。サーバー画面の
+バッジはブラウザで集計されるため、直接取得値としては返しません。
+`start_account_sync` は台帳上の未取得対象から公平に初回取得・バックフィル・増分取得を
+進め、`get_account_coverage` が列挙不足・履歴不明・失敗・鮮度を示します。
+取得対象を証明できない間はアカウント全体の complete は false です。
+`list_mentions` のページは永続スナップショットで固定されます。
+`record_inbox_state` は通知・保留・対応・完了の明示的なローカル確認を、Discord既読と
+独立して記録します。Discordへの通知送信やACKは行いません。
+
+仕様・実現範囲・残る制約は [account reading contract](docs/account-reading-contract.md)、
+取得元は [browser API evidence](docs/browser-api-evidence.md) を参照してください。
+
 ## MCP tools
 
 すべて read-only です。出力は巨大な生 JSON ではなく正規化された最小限のフィールドです。
@@ -232,6 +247,11 @@ unit は `NoNewPrivileges` / `PrivateTmp` / `ProtectSystem=strict` / `ProtectHom
 | --- | --- | --- |
 | `get_me` | — | 自分の ID / ユーザー名 (`{"me":{...}}`) |
 | `get_capabilities` | — | 認証方式ごとの対応可否・制約の一覧 |
+| `get_read_state` | `guild_id?`, `channel_id?`, `refresh=true` | Discord由来の件数・既読位置・バージョン (Gateway READY) |
+| `get_account_coverage` | — | アカウント台帳・未取得・失敗・取得範囲・鮮度 |
+| `start_account_sync` | `max_targets=50`, `page_size=100`, `refresh_inventory=true` | 未確認優先の公平な永続同期ラウンド |
+| `cancel_sync` | `job_id` | ローカル同期取消 |
+| `record_inbox_state` | `channel_id`, `message_id`, 通知・対応・完了の確認情報 | 既読と独立したローカル記録 |
 | `list_guilds` | — | 参加中サーバーの列挙 `{"guilds":[{"id","name"}]}` |
 | `list_channels` | `guild_id` | チャンネル列挙 (活動ID・ID由来の時刻・取得時刻・情報源を含む) |
 | `list_dms` | — | DM / Group DM の列挙 (channel_id / participants / last_message_id) |
@@ -388,7 +408,7 @@ SQLiteスキーマ不整合は `CACHE_SCHEMA_MISMATCH` / RPC `-32004` /
 `max_messages` で1〜1000件を指定できます。
 
 ```json
-{"scope":"refetch","channel_ids":["1452089473562316801"],"max_messages":100}
+{"scope":"refetch","channel_ids":["200"],"max_messages":100}
 ```
 
 `start_sync` の `job_id` を `get_sync_progress` に渡し、`attempted` /
@@ -420,10 +440,10 @@ SQLiteスキーマ不整合は `CACHE_SCHEMA_MISMATCH` / RPC `-32004` /
 ### 受け入れテストの流れ
 
 ```text
-「ZENVRというサーバーを探して」      → list_guilds
+「Example Guildというサーバーを探して」      → list_guilds
 「generalチャンネルを探して」        → list_channels
 「最近の発言を50件読んで」           → recent_messages
-「展軸祭について話していたメッセージを探して」 → search_messages
+「会議予定について話していたメッセージを探して」 → search_messages
 「その発言の前後20件を読んで」       → message_context
 ```
 
@@ -533,7 +553,7 @@ ChatGPT の場合は上記「ChatGPT (Secure MCP Tunnel) セットアップ」�
 
 SQLite (`DATABASE_URL`, Docker では `/data/discord.sqlite3`) にキャッシュします。
 
-既存DBは起動時にバックアップを取得してトランザクション内でv2へ移行します。
+既存DBは起動時にバックアップを取得してトランザクション内でv3へ移行します。
 旧行のメンション・返信情報は要再取得として区別し、同期範囲は推測しません。
 接続先・バージョン・移行履歴の確認方法と制約は
 [SQLite cache upgrades](docs/database-upgrades.md) を参照してください。
@@ -554,7 +574,7 @@ CREATE VIRTUAL TABLE messages_fts USING fts5(message_id UNINDEXED, content,
 - メッセージと FTS 行はアプリケーションコードで同一トランザクションに書き込み、
   再取得時に FTS 行を置換 (編集の反映)
 - 取得は遅延的: `recent_messages` 等で要求された分だけ Discord へ取りに行って保存
-- 全チャンネルのバックフィル・常時クロールは行わない
+- 常時クロールは行わない。明示的なアカウント同期ラウンドは保存済み台帳・カーソルから再開する
 
 ### Lazy fetching
 
@@ -643,7 +663,7 @@ MCPでは `isError=true` の結果内に、`error_source` / `code` / `operation`
 
 ## 未実装 / 今後の作業
 
-- Gateway (WebSocket) イベント受信 (自動化を増やすため意図的に未実装)
+- Gateway の継続イベント購読・Resume は未実装 (`get_read_state` の明示的 READY 取得は対応)
 - `list_guilds` のページネーション (`before` / `after`) の MCP 暴露
 - 参加済み・非公開スレッド専用の列挙 (archived検索は対応、実機確認は未完了)
 - スレッド全量バックフィル、スレッドメンバー情報

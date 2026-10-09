@@ -10,11 +10,11 @@ log its canonical path, `PRAGMA user_version`, and migration history (version,
 timestamp, backup path). The daemon does not bind its RPC socket until opening,
 migrating, and validating the database succeeds.
 
-Version 2 accepts a fresh database, the original unversioned schema, and the
+Version 3 accepts a fresh database, the original unversioned schema, and the
 previous unversioned v2 schema. Version 1 is also accepted when its shape is
 compatible. Higher versions and incompatible schemas fail startup. Each open
 checks required column types, nullability, defaults, primary keys, declared
-indexes, and the FTS definition against a fresh canonical schema. Version 2
+indexes, and the FTS definition against a fresh canonical schema. Version 3
 must also have its migration history entry; drift is not silently repaired.
 
 Before changing a populated database, SQLite `VACUUM INTO` creates a consistent
@@ -25,8 +25,8 @@ Insufficient space, permissions, or backup failure stops startup. Backups are
 retained for manual recovery and are never overwritten.
 
 Migration runs in an IMMEDIATE transaction, rechecks the version under its
-write lock, adds the three nullable legacy columns, creates the other v2 tables
-and indexes, validates the complete schema, and records version 2 and its
+write lock, adds the three nullable legacy columns, creates the other current tables
+and indexes, validates the complete schema, and records version 3 and its
 backup path atomically. Missing FTS is rebuilt from retained message content;
 existing compatible FTS is preserved. Validation failure rolls back the schema
 and history. Reopening a migrated database does not migrate again or create a
@@ -249,3 +249,18 @@ user-authenticated threads, raw messages, attachments/events, sync jobs,
 positive inbox examples, actual role membership, 429 handling, observed edits
 and deletions, restart continuation, and requested-window coverage remains separate from
 the local regression suite. No production refetch is performed by these tests.
+
+## Version 3 account-reading state
+
+Version 3 adds account inventory generations, a target ledger with fair scheduling
+sequence and alternating historical/incremental directions, durable sync jobs,
+immutable inbox snapshots, read-state observations, and explicit local inbox workflow
+records. Version 2 databases receive a consistent backup before these additive
+changes. Existing messages, FTS rows, coverage intervals and legacy cursors remain
+unchanged; migration never manufactures channel discovery or confirmed history.
+The current version and its migration history entry are validated on reopen.
+Messages, FTS, observed coverage, and account target checkpoints for each account
+sync page commit in one transaction. On restart pending/running account jobs are
+marked interrupted; starting another account round uses their persisted target
+checkpoints. Snapshot and workflow records survive restart. Snapshot retention is
+currently unbounded and must be considered when sizing the local cache.

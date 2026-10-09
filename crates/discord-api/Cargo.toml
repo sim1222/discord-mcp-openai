@@ -7,6 +7,9 @@ rust-version.workspace = true
 description = "Read-only Discord HTTP client. GET-only by construction."
 
 [dependencies]
+futures = { workspace = true }
+chrono = { workspace = true }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

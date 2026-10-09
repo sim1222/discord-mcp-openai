@@ -38,7 +38,7 @@ impl DiscordReaderTools {
     /// List mentions directed at this account, across servers.
     ///
     /// Returns JSON: `{"mentions": [{"message": {...}, "matched_by":
-    /// "direct"|"reply"|"role"|"everyone", "matched_role_ids": [...],
+    /// "dm"|"group_dm"|"direct"|"reply"|"role"|"everyone", "matched_role_ids": [...],
     /// "guild_id": ..., "channel_id": ...}], "checked": {...}, "coverage":
     /// {...}, "next_cursor": ..., "has_more": bool}`. `matched_by` says why
     /// the message is directed at you; role matches list the roles that
@@ -52,7 +52,7 @@ impl DiscordReaderTools {
     /// monitoring or complete history. Open bounds and unproven guild-wide
     /// channel inventories stay incomplete. Use `refresh: true` for one newest
     /// page per selected channel, not period backfill. Empty incomplete results
-    /// do not establish that no contact occurred. Paging next_cursor is exclusive.
+    /// do not establish that no contact occurred. Paging uses an immutable persisted snapshot cursor; keep scope/window unchanged and do not refresh on resume.
     #[tool(name = "list_mentions")]
     pub async fn list_mentions(
         &self,

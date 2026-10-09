@@ -12,6 +12,7 @@
 //! * [`rate_limit::RateLimiter`] enforces a small concurrency cap and honours
 //!   Discord's `Retry-After` headers.
 
+pub mod account_observation;
 pub mod client;
 pub mod endpoints;
 pub mod error;

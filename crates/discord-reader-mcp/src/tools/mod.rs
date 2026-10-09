@@ -1,6 +1,7 @@
 //! MCP tools. Every tool is read-only: they proxy the daemon's read-only RPC
 //! surface and never send Discord credentials anywhere.
 
+pub mod account;
 pub mod channels;
 pub mod guilds;
 pub mod inbox;
@@ -45,6 +46,7 @@ impl DiscordReaderTools {
         router.merge(Self::inbox_router());
         router.merge(Self::threads_router());
         router.merge(Self::sync_router());
+        router.merge(Self::account_router());
         router
     }
 
@@ -367,6 +369,11 @@ mod tests {
         let mut expected = [
             "get_me",
             "get_capabilities",
+            "get_read_state",
+            "get_account_coverage",
+            "start_account_sync",
+            "cancel_sync",
+            "record_inbox_state",
             "list_guilds",
             "list_channels",
             "list_dms",
