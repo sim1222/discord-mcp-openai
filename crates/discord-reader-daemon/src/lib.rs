@@ -7,6 +7,7 @@ pub(crate) mod message_lookup;
 pub(crate) mod metadata_refetch;
 pub(crate) mod read_state;
 pub mod rpc;
+pub(crate) mod status_query;
 pub(crate) mod thread_listing;
 
 pub use api::DaemonApi;

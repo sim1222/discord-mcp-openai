@@ -327,6 +327,20 @@ pub struct ReadStateParams {
     pub channel_id: Option<String>,
     #[serde(default = "default_true")]
     pub refresh: bool,
+    pub limit: Option<u32>,
+    pub cursor: Option<String>,
+}
+
+/// Bounded inspection of cached sync state or the account target ledger.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatusParams {
+    pub guild_id: Option<String>,
+    pub channel_id: Option<String>,
+    #[serde(default)]
+    pub include_details: bool,
+    pub limit: Option<u32>,
+    pub cursor: Option<String>,
 }
 fn default_true() -> bool {
     true
@@ -400,6 +414,14 @@ pub trait ReaderApi: Send + Sync {
     async fn get_account_coverage(&self) -> Result<Value, RpcError> {
         Err(RpcError::invalid_params("account inventory unavailable"))
     }
+    async fn get_account_coverage_page(&self, params: StatusParams) -> Result<Value, RpcError> {
+        if params != StatusParams::default() {
+            return Err(RpcError::invalid_params(
+                "scoped coverage inspection unavailable",
+            ));
+        }
+        self.get_account_coverage().await
+    }
     async fn start_account_sync(&self, _params: AccountSyncParams) -> Result<Value, RpcError> {
         Err(RpcError::invalid_params(
             "account synchronization unavailable",
@@ -426,6 +448,14 @@ pub trait ReaderApi: Send + Sync {
     async fn list_changed_channels(&self, params: ChangedChannelsParams)
         -> Result<Value, RpcError>;
     async fn get_sync_status(&self) -> Result<Value, RpcError>;
+    async fn get_sync_status_page(&self, params: StatusParams) -> Result<Value, RpcError> {
+        if params != StatusParams::default() {
+            return Err(RpcError::invalid_params(
+                "scoped sync inspection unavailable",
+            ));
+        }
+        self.get_sync_status().await
+    }
     async fn start_sync(&self, params: SyncStartParams) -> Result<Value, RpcError>;
     async fn get_sync_progress(&self, params: SyncProgressParams) -> Result<Value, RpcError>;
     async fn get_member(&self, params: MemberParams) -> Result<Value, RpcError>;
@@ -471,7 +501,7 @@ pub async fn dispatch(api: &dyn ReaderApi, request: RpcRequest) -> Option<RpcRes
             "get_capabilities" => api.get_capabilities().await,
             "get_read_state" => api.get_read_state(parse(&params)?).await,
             "record_inbox_state" => api.record_inbox_state(parse(&params)?).await,
-            "get_account_coverage" => api.get_account_coverage().await,
+            "get_account_coverage" => api.get_account_coverage_page(parse(&params)?).await,
             "start_account_sync" => api.start_account_sync(parse(&params)?).await,
             "cancel_sync" => api.cancel_sync(parse(&params)?).await,
             "list_guilds" => api.list_guilds().await,
@@ -544,7 +574,7 @@ pub async fn dispatch(api: &dyn ReaderApi, request: RpcRequest) -> Option<RpcRes
                 check_limit(p.limit, 100)?;
                 api.list_changed_channels(p).await
             }
-            "get_sync_status" => api.get_sync_status().await,
+            "get_sync_status" => api.get_sync_status_page(parse(&params)?).await,
             "start_sync" => {
                 let p: SyncStartParams = parse(&params)?;
                 api.start_sync(p).await

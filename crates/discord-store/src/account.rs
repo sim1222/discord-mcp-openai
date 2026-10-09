@@ -1,6 +1,6 @@
 //! Persistent account inventory and resumable retrieval scheduling.
 
-use super::{merge_coverage, persist_message, Store, StoreError};
+use super::{merge_coverage, persist_message, CoverageRange, Store, StoreError};
 use discord_api::types::{Channel, Message};
 use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
@@ -61,6 +61,17 @@ pub struct AccountJob {
     pub updated_at: String,
     pub cancel_requested: bool,
     pub progress: Value,
+}
+
+/// Counts of retained targets within an explicit account, guild, and channel scope.
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountTargetCounts {
+    pub total: u64,
+    pub synced: u64,
+    pub unfetched: u64,
+    pub failed: u64,
+    pub blocked: u64,
+    pub due: u64,
 }
 
 fn decode(value: String) -> rusqlite::Result<Value> {
@@ -148,6 +159,57 @@ impl Store {
             .query_map([user], target)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(targets)
+    }
+
+    /// Aggregate retained retrieval evidence without loading target rows.
+    pub fn account_target_counts(
+        &self,
+        user: &str,
+        guild: Option<&str>,
+        channel: Option<&str>,
+        at: &str,
+    ) -> Result<AccountTargetCounts, StoreError> {
+        Ok(self.conn.lock().expect("store lock").query_row("SELECT COUNT(*),COALESCE(SUM(last_checked_at IS NOT NULL),0),COALESCE(SUM(last_checked_at IS NULL),0),COALESCE(SUM(last_error_json IS NOT NULL),0),COALESCE(SUM(history_status='blocked'),0),COALESCE(SUM(history_status!='blocked' AND (next_check_at IS NULL OR next_check_at<=?4)),0) FROM account_targets WHERE account_user_id=?1 AND (?2 IS NULL OR guild_id=?2) AND (?3 IS NULL OR channel_id=?3)",params![user,guild,channel,at],|row|Ok(AccountTargetCounts{total:row.get::<_,i64>(0)? as u64,synced:row.get::<_,i64>(1)? as u64,unfetched:row.get::<_,i64>(2)? as u64,failed:row.get::<_,i64>(3)? as u64,blocked:row.get::<_,i64>(4)? as u64,due:row.get::<_,i64>(5)? as u64}))?)
+    }
+
+    /// Read at most one bounded keyset page plus one continuation witness.
+    pub fn account_target_page(
+        &self,
+        user: &str,
+        guild: Option<&str>,
+        channel: Option<&str>,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<AccountTarget>, StoreError> {
+        let conn = self.conn.lock().expect("store lock");
+        let mut stmt=conn.prepare(&format!("SELECT {TARGET_COLUMNS} FROM account_targets WHERE account_user_id=?1 AND (?2 IS NULL OR guild_id=?2) AND (?3 IS NULL OR channel_id=?3) AND (?4 IS NULL OR channel_id>?4) ORDER BY channel_id LIMIT ?5"))?;
+        let page = stmt
+            .query_map(
+                params![user, guild, channel, after, limit.clamp(1, 100) + 1],
+                target,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(page)
+    }
+
+    /// Read a bounded coverage-range sample plus one truncation witness.
+    pub fn account_target_ranges(
+        &self,
+        channel: &str,
+        limit: u32,
+    ) -> Result<Vec<CoverageRange>, StoreError> {
+        let conn = self.conn.lock().expect("store lock");
+        let mut stmt=conn.prepare("SELECT channel_id,from_id,to_id FROM coverage WHERE channel_id=?1 ORDER BY CAST(from_id AS INTEGER) LIMIT ?2")?;
+        let ranges = stmt
+            .query_map(params![channel, limit.clamp(1, 100) + 1], |row| {
+                Ok(CoverageRange {
+                    channel_id: row.get(0)?,
+                    from_id: row.get(1)?,
+                    to_id: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ranges)
     }
 
     /// Schedule untouched targets first, then oldest attempts; blocked targets need explicit intervention.
@@ -432,6 +494,51 @@ mod tests {
             .save_account_page("me", "1", &[], &checkpoint)
             .unwrap();
         assert_eq!(store.coverage("1").unwrap(), ranges);
+    }
+
+    #[test]
+    fn aggregate_and_keyset_pages_handle_large_inventory_without_scope_leaks() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .begin_account_inventory("me", "g", "2026-01-01")
+            .unwrap();
+        let channels: Vec<_> = (1..=13000).map(|id| channel(&id.to_string())).collect();
+        store
+            .observe_account_targets("me", "g", &channels, "2026-01-01")
+            .unwrap();
+        store
+            .observe_account_targets("other", "g", &[channel("99999")], "2026-01-01")
+            .unwrap();
+        let counts = store
+            .account_target_counts("me", Some("42"), None, "2026-01-02")
+            .unwrap();
+        assert_eq!(counts.total, 13000);
+        assert_eq!(counts.unfetched, 13000);
+        assert_eq!(
+            store
+                .account_target_counts("me", Some("43"), None, "2026-01-02")
+                .unwrap()
+                .total,
+            0
+        );
+        let mut cursor = None;
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            let page = store
+                .account_target_page("me", Some("42"), None, cursor.as_deref(), 100)
+                .unwrap();
+            assert!(page.len() <= 101);
+            let has_more = page.len() > 100;
+            for target in page.iter().take(100) {
+                assert!(seen.insert(target.channel_id.clone()));
+                cursor = Some(target.channel_id.clone());
+            }
+            if !has_more {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), 13000);
+        assert!(!seen.contains("99999"));
     }
 
     #[test]

@@ -11,6 +11,9 @@ pub mod search;
 pub mod sync;
 pub mod threads;
 
+#[cfg(test)]
+mod transport_regressions;
+
 use std::sync::Arc;
 
 use rmcp::{

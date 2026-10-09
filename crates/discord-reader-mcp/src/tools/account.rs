@@ -16,6 +16,10 @@ pub struct ReadStateArgs {
     pub channel_id: Option<String>,
     /// Obtain a fresh Gateway READY observation; defaults to true. False reads local observations.
     pub refresh: Option<bool>,
+    /// Channel rows per page, 1..100, default 50.
+    pub limit: Option<u32>,
+    /// Continue the same scope with refresh=false.
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
@@ -60,14 +64,23 @@ impl DiscordReaderTools {
         &self,
         Parameters(args): Parameters<ReadStateArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.call_tool("get_read_state",json!({"guild_id":args.guild_id,"channel_id":args.channel_id,"refresh":args.refresh.unwrap_or(true)})).await
+        self.call_tool("get_read_state",json!({"guild_id":args.guild_id,"channel_id":args.channel_id,"refresh":args.refresh.unwrap_or(args.cursor.is_none()),"limit":args.limit,"cursor":args.cursor})).await
     }
 
-    /// Report the account target ledger, listing freshness, missing history and failures.
+    /// Report aggregate account ledger counts, listing freshness, missing history and failures.
+    /// Detail rows require include_details=true or channel_id, maximum 100 per page.
     /// complete=false includes unknown inventory and history permissions, even if all known targets were checked.
     #[tool(name = "get_account_coverage")]
-    pub async fn get_account_coverage(&self) -> Result<CallToolResult, ErrorData> {
-        self.call_tool("get_account_coverage", json!({})).await
+    pub async fn get_account_coverage(
+        &self,
+        Parameters(args): Parameters<super::sync::StatusArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call_tool(
+            "get_account_coverage",
+            serde_json::to_value(args)
+                .map_err(|_| ErrorData::internal_error("invalid status arguments", None))?,
+        )
+        .await
     }
 
     /// Run one bounded fair account synchronization round with persisted checkpoints.

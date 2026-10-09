@@ -22,8 +22,8 @@ use crate::metadata_refetch::{run_refetch, RefetchProgress, RefetchReport, Sqlit
 use crate::rpc::{
     AccountSyncParams, AfterParams, BeforeParams, ChangedChannelsParams, ChannelParams,
     ContextParams, GuildIdParams, InboxFilter, InboxStateParams, MemberParams, MessageEventsParams,
-    MessageParams, ReadStateParams, ReaderApi, RpcError, SearchParams, SyncProgressParams,
-    SyncStartParams, ThreadParams, ThreadsParams,
+    MessageParams, ReadStateParams, ReaderApi, RpcError, SearchParams, StatusParams,
+    SyncProgressParams, SyncStartParams, ThreadParams, ThreadsParams,
 };
 
 struct SyncJobProgress {
@@ -1296,6 +1296,22 @@ impl ReaderApi for DaemonApi {
             }
         }
         let user = self.me_user_id().await?;
+        if params.cursor.is_some() && params.refresh {
+            return Err(RpcError::invalid_params(
+                "read-state continuation requires refresh=false",
+            ));
+        }
+        let mut query = crate::status_query::StatusQuery::new(
+            StatusParams {
+                guild_id: params.guild_id.clone(),
+                channel_id: params.channel_id.clone(),
+                include_details: true,
+                limit: params.limit,
+                cursor: params.cursor.clone(),
+            },
+            "get_read_state",
+            &user,
+        )?;
         let _guard = self.observation_lock.lock().await;
         let snapshot = if params.refresh {
             let observation = self.client.observe_account().await.map_err(|error| RpcError::structured(-32005, json!({"error":{"error_source":"gateway","code":match error { discord_api::account_observation::ObservationError::Unsupported => "unsupported", discord_api::account_observation::ObservationError::Timeout => "timeout", discord_api::account_observation::ObservationError::SessionRejected => "session_rejected", _ => "observation_failed" },"operation":"get_read_state","retryable":matches!(error,discord_api::account_observation::ObservationError::Timeout|discord_api::account_observation::ObservationError::Transport),"message":error.to_string(),"discord_mention_count":null}})))?;
@@ -1305,8 +1321,11 @@ impl ReaderApi for DaemonApi {
             self.retain_account_observation(&observation)?;
             observation
         } else {
-            self.store
-                .load_account_observation(&user)
+            let store = Arc::clone(&self.store);
+            let account = user.clone();
+            tokio::task::spawn_blocking(move || store.load_account_observation(&account))
+                .await
+                .map_err(|_| RpcError::internal("read-state cache task failed"))?
                 .map_err(store_error)?
                 .unwrap_or(discord_api::account_observation::AccountObservation {
                     account_user_id: user.clone(),
@@ -1319,49 +1338,69 @@ impl ReaderApi for DaemonApi {
                     inventory_errors: vec!["gateway_inventory_unobserved".into()],
                 })
         };
-        let mut ids = if let Some(channel) = params.channel_id.clone() {
-            vec![channel]
-        } else {
-            self.store
-                .account_targets(&user)
-                .map_err(store_error)?
-                .into_iter()
-                .filter(|target| {
-                    params
-                        .guild_id
-                        .as_ref()
-                        .is_none_or(|guild| target.guild_id.as_ref() == Some(guild))
-                })
-                .map(|target| target.channel_id)
-                .collect::<Vec<_>>()
-        };
-        if params.guild_id.is_none() && params.channel_id.is_none() {
-            ids.extend(
-                snapshot
-                    .read_states
-                    .iter()
-                    .map(|state| state.channel_id.clone()),
-            );
-        }
-        if let (Some(guild), Some(channel)) =
-            (params.guild_id.as_deref(), params.channel_id.as_deref())
-        {
-            let actual = self.store.channel_guild_id(channel).map_err(store_error)?;
-            if actual.as_deref() != Some(guild) {
-                return Err(RpcError::invalid_params(
-                    "channel guild scope is unverified or mismatched",
-                ));
+        drop(_guard);
+        let store = Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || {
+            if let (Some(guild), Some(channel)) =
+                (params.guild_id.as_deref(), params.channel_id.as_deref())
+            {
+                let actual = store.channel_guild_id(channel).map_err(store_error)?;
+                if actual.as_deref() != Some(guild) {
+                    return Err(RpcError::invalid_params(
+                        "channel guild scope is unverified or mismatched",
+                    ));
+                }
             }
-        }
-        ids.sort();
-        ids.dedup();
-        let mut response = crate::read_state::render_read_states(&snapshot, &ids);
-        response["scope"]["guild_id"] = json!(params.guild_id);
-        response["discord_guild_badge_count"] = Value::Null;
-        response["guild_badge_reason"] = json!("browser_aggregation_not_reproduced");
-        response["coverage"] =
-            crate::account_sync::account_coverage(&self.store, &user).map_err(store_error)?;
-        Ok(response)
+            let mut targets = if let Some(channel) = params.channel_id.as_ref() {
+                discord_store::sqlite::ReadStateTargetPage {
+                    target_basis: "requested_channel".into(),
+                    total: 1,
+                    channel_ids: if query.after.as_ref().is_none_or(|after| channel > after) {
+                        vec![channel.clone()]
+                    } else {
+                        Vec::new()
+                    },
+                }
+            } else {
+                store
+                    .read_state_target_page(
+                        &user,
+                        params.guild_id.as_deref(),
+                        None,
+                        query.after.as_deref(),
+                        query.limit,
+                    )
+                    .map_err(store_error)?
+            };
+            query.bind_basis(&targets.target_basis)?;
+            let has_more = targets.channel_ids.len() > query.limit as usize;
+            targets.channel_ids.truncate(query.limit as usize);
+            let next_cursor = if has_more {
+                targets.channel_ids.last().map(|id| query.next_cursor(id))
+            } else {
+                None
+            };
+            let mut response =
+                crate::read_state::render_read_states(&snapshot, &targets.channel_ids);
+            response["channels_total_known"] = json!(targets.total);
+            response["target_basis"] = json!(targets.target_basis);
+            response["has_more"] = json!(has_more);
+            response["next_cursor"] = json!(next_cursor);
+            response["limit"] = json!(query.limit);
+            response["scope"]["guild_id"] = json!(params.guild_id);
+            response["discord_guild_badge_count"] = Value::Null;
+            response["guild_badge_reason"] = json!("browser_aggregation_not_reproduced");
+            response["coverage"] = crate::account_sync::account_coverage_scoped(
+                &store,
+                &user,
+                params.guild_id.as_deref(),
+                params.channel_id.as_deref(),
+            )
+            .map_err(store_error)?;
+            Ok(response)
+        })
+        .await
+        .map_err(|_| RpcError::internal("read-state inspection task failed"))?
     }
 
     async fn record_inbox_state(&self, params: InboxStateParams) -> Result<Value, RpcError> {
@@ -1386,10 +1425,40 @@ impl ReaderApi for DaemonApi {
     }
 
     async fn get_account_coverage(&self) -> Result<Value, RpcError> {
+        self.get_account_coverage_page(StatusParams::default())
+            .await
+    }
+
+    async fn get_account_coverage_page(&self, params: StatusParams) -> Result<Value, RpcError> {
         let user = self.me_user_id().await?;
-        Ok(
-            json!({"coverage":crate::account_sync::account_coverage(&self.store,&user).map_err(store_error)?}),
-        )
+        let query = crate::status_query::StatusQuery::new(params, "get_account_coverage", &user)?;
+        let store = Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || {
+            let mut report = if query.details {
+                crate::account_sync::account_coverage_page(
+                    &store,
+                    &user,
+                    query.params.guild_id.as_deref(),
+                    query.params.channel_id.as_deref(),
+                    query.after.as_deref(),
+                    query.limit,
+                )
+            } else {
+                crate::account_sync::account_coverage_scoped(
+                    &store,
+                    &user,
+                    query.params.guild_id.as_deref(),
+                    query.params.channel_id.as_deref(),
+                )
+            }
+            .map_err(store_error)?;
+            if let Some(after) = report["next_cursor"].as_str().map(str::to_owned) {
+                report["next_cursor"] = json!(query.next_cursor(&after));
+            }
+            Ok(json!({"coverage":report}))
+        })
+        .await
+        .map_err(|_| RpcError::internal("coverage inspection task failed"))?
     }
 
     async fn start_account_sync(&self, params: AccountSyncParams) -> Result<Value, RpcError> {
@@ -1458,7 +1527,7 @@ impl ReaderApi for DaemonApi {
                 "get_me": {"supported": true},
                 "get_capabilities": {"supported": true},
                 "get_read_state":{"supported":user_auth,"source":"discord_gateway_ready","missing_counts":null},
-                "get_account_coverage":{"supported":true,"complete":false},
+                "get_account_coverage":{"supported":true,"complete":false,"default":"summary","details_page_limit_max":100},
                 "start_account_sync":{"supported":true,"mode":"bounded_fair_round","automatic_background":false},
                 "cancel_sync":{"supported":true,"scope":"local_account_sync_job"},
                 "record_inbox_state":{"supported":true,"scope":"explicit_local_confirmation","discord_modified":false},
@@ -1478,7 +1547,7 @@ impl ReaderApi for DaemonApi {
                 "read_thread": {"supported": true},
                 "list_threads": {"supported": "partial", "requires":"channel_id", "filters":["active","archived","all"], "effective_limit_max":25,"notes": "GET parent channel threads/search; user authentication requires live acceptance, guild-wide and joined scopes unsupported"},
                 "list_changed_channels": {"supported": true,"source":"cache","live_checked":false,"refresh_method":"list_channels","notes":"never_synced is not recent new activity"},
-                "get_sync_status": {"supported": true},
+                "get_sync_status": {"supported": true,"default":"summary","details_page_limit_max":100},
                 "start_sync": {"supported": true,"scopes":["changed_channels","all","mentions","replies","refetch"],"period_filter_supported":false,
                     "refetch":{"attempt_limit":{"argument":"max_messages","default":100,"min":1,"max":1000},"resume_field":"next_refetch_before","resume_argument":"refetch_before","restart":"successful rows persist; retain cursor client-side and start a new job"},
                     "recent_scopes":{"page_size":50,"history_complete":false,"notes":"one newest page per cached target; not full backfill or edit/deletion monitoring"}},
@@ -1487,7 +1556,7 @@ impl ReaderApi for DaemonApi {
                 "get_message_events": {"supported": true},
                 "get_attachment": {"supported": true}
             },
-            "tool_contract_revision":4,
+            "tool_contract_revision":5,
             "limitations": [
                 "read-only: only GET requests are issued; no write operations exist",
                 "GetGuildActiveThreads is bot-only (20002) for user accounts; list_threads uses per-channel/thread-search endpoints",
@@ -1680,77 +1749,44 @@ impl ReaderApi for DaemonApi {
     }
 
     async fn get_sync_status(&self) -> Result<Value, RpcError> {
-        let mut rows = self.store.channel_sync_all(u32::MAX).map_err(store_error)?;
-        for id in self.store.cached_channel_ids(None).map_err(store_error)? {
-            if !rows.iter().any(|row| row.channel_id == id) {
-                rows.push(discord_store::sqlite::ChannelSyncRow {
-                    channel_id: id,
-                    last_synced_message_id: None,
-                    oldest_synced_message_id: None,
-                    last_message_id: None,
-                    last_activity_at: None,
-                    last_fetched_at: None,
-                    backfill: "partial".into(),
-                });
+        self.get_sync_status_page(StatusParams::default()).await
+    }
+
+    async fn get_sync_status_page(&self, params: StatusParams) -> Result<Value, RpcError> {
+        let user =
+            if params.include_details || params.channel_id.is_some() || params.cursor.is_some() {
+                Some(self.me_user_id().await?)
+            } else {
+                self.me_id.lock().expect("me_id lock").clone()
+            };
+        let query = crate::status_query::StatusQuery::new(
+            params,
+            "get_sync_status",
+            user.as_deref().unwrap_or("unobserved"),
+        )?;
+        let store = Arc::clone(&self.store);
+        let metrics = self.client.metrics().snapshot();
+        tokio::task::spawn_blocking(move || {
+            let guild=query.params.guild_id.as_deref();
+            let channel=query.params.channel_id.as_deref();
+            let counts=store.sync_status_summary(guild,channel).map_err(store_error)?;
+            let mut coverage=Vec::new();
+            let mut next_cursor=None;
+            let mut has_more=false;
+            if query.details {
+                let mut page=store.sync_status_page(guild,channel,query.after.as_deref(),query.limit).map_err(store_error)?;
+                has_more=page.len()>query.limit as usize;
+                page.truncate(query.limit as usize);
+                if has_more { next_cursor=page.last().map(|row|query.next_cursor(&row.channel_id)); }
+                for row in page {
+                    let envelope=store.coverage_envelope(&row.channel_id).map_err(store_error)?;
+                    let (from,to,gaps)=envelope.map_or((None,None,false),|(from,to,gaps)|(Some(from),Some(to),gaps));
+                    coverage.push(json!({"channel_id":row.channel_id,"covered_from":from,"covered_to":to,"has_gaps":gaps,"backfill":row.backfill,"last_synced_message_id":row.last_synced_message_id,"oldest_synced_message_id":row.oldest_synced_message_id,"last_message_id":row.last_message_id,"last_activity_at":row.last_activity_at,"last_fetched_at":row.last_fetched_at}));
+                }
             }
-        }
-        let account_user = self.me_id.lock().expect("me_id lock").clone();
-        let account_coverage = account_user
-            .as_deref()
-            .map(|user| {
-                crate::account_sync::account_coverage(&self.store, user).map_err(store_error)
-            })
-            .transpose()?;
-        let coverage: Vec<Value> = rows
-            .iter()
-            .map(|row| {
-                let envelope = self
-                    .store
-                    .coverage_envelope(&row.channel_id)
-                    .map_err(store_error)?;
-                let (covered_from, covered_to, has_gaps) = match envelope {
-                    Some((from, to, gaps)) => (Some(from), Some(to), gaps),
-                    None => (None, None, false),
-                };
-                Ok(json!({
-                    "channel_id": row.channel_id,
-                    "covered_from": covered_from,
-                    "covered_to": covered_to,
-                    "has_gaps": has_gaps,
-                    "backfill": row.backfill,
-                    "last_synced_message_id": row.last_synced_message_id,
-                    "oldest_synced_message_id": row.oldest_synced_message_id,
-                    "last_message_id": row.last_message_id,
-                    "last_activity_at": row.last_activity_at,
-                    "last_fetched_at": row.last_fetched_at,
-                }))
-            })
-            .collect::<Result<_, RpcError>>()?;
-        let deletions: u64 = rows
-            .iter()
-            .map(|r| {
-                self.store
-                    .deletions_after(&r.channel_id, None, u32::MAX)
-                    .map(|d| d.len() as u64)
-                    .map_err(store_error)
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .sum();
-        Ok(json!({
-            "db_id": format!("discord-cache-{}", std::process::id()),
-            "generated_at": discord_store::sqlite::now_iso(),
-            "cached_messages": self.store.message_count().map_err(store_error)?,
-            "schema_version": self.store.schema_version().map_err(store_error)?,
-            "messages_requiring_refetch": self.store.messages_requiring_refetch().map_err(store_error)?,
-            "channels_tracked": rows.len(),
-            "scope":"cached_targets",
-            "complete":false,
-            "account_coverage":account_coverage,
-            "coverage": coverage,
-            "deletions_observed": deletions,
-            "metrics": self.client.metrics().snapshot(),
-        }))
+            let account=user.as_deref().map(|user|crate::account_sync::account_coverage_scoped(&store,user,guild,channel).map_err(store_error)).transpose()?;
+            Ok(json!({"db_id":format!("discord-cache-{}",std::process::id()),"generated_at":discord_store::sqlite::now_iso(),"cached_messages":counts.message_count,"schema_version":store.schema_version().map_err(store_error)?,"messages_requiring_refetch":counts.metadata_pending,"channels_tracked":counts.known_channels,"synced":counts.synced,"unfetched":counts.unfetched,"scope":"cached_targets","target_scope":{"guild_id":guild,"channel_id":channel},"complete":false,"account_coverage":account,"coverage":coverage,"details_included":query.details,"limit":query.limit,"has_more":if query.details {Some(has_more)} else {None},"next_cursor":next_cursor,"deletions_observed":counts.deletion_count,"metrics":metrics}))
+        }).await.map_err(|_|RpcError::internal("status inspection task failed"))?
     }
 
     async fn start_sync(&self, params: SyncStartParams) -> Result<Value, RpcError> {
@@ -2952,7 +2988,7 @@ mod tests {
         let (api, _) = api_for(&mock.base);
         *api.me_id.lock().unwrap() = Some("7".into());
         let value = api.get_capabilities().await.unwrap();
-        assert_eq!(value["tool_contract_revision"], 4);
+        assert_eq!(value["tool_contract_revision"], 5);
         assert_eq!(
             value["methods"]["messages_after"]["continuation_argument"],
             "after_message_id"
@@ -3307,6 +3343,137 @@ mod tests {
         assert_eq!(entry["read_status"], "unknown");
         assert_eq!(entry["message_url"], "https://discord.com/channels/1500000000000000300/1500000000000000200/1500000000000000100");
         assert_eq!(entry["discord_mention_notification_count"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn status_pages_are_scoped_bounded_and_do_not_repeat_targets() {
+        let mock = spawn_mock(VecDeque::new()).await;
+        let (api, store) = api_for(&mock.base);
+        *api.me_id.lock().unwrap() = Some("7".into());
+        let channels: Vec<Channel> = (1..=105)
+            .map(|id| {
+                serde_json::from_value(json!({"id":id.to_string(),"guild_id":"42","type":0}))
+                    .unwrap()
+            })
+            .collect();
+        store
+            .begin_account_inventory("7", "fixture-generation", "2026-01-01T00:00:00Z")
+            .unwrap();
+        store
+            .observe_account_targets("7", "fixture-generation", &channels, "2026-01-01T00:00:00Z")
+            .unwrap();
+        for channel in channels {
+            store.upsert_channel(&channel).unwrap();
+        }
+        let summary = api.get_account_coverage().await.unwrap();
+        assert_eq!(summary["coverage"]["targets_total"], 105);
+        assert!(summary["coverage"]["targets"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        for mode in ["sync", "coverage"] {
+            let mut cursor = None;
+            let mut ids = std::collections::HashSet::new();
+            loop {
+                let params = StatusParams {
+                    guild_id: Some("42".into()),
+                    include_details: true,
+                    limit: Some(20),
+                    cursor: cursor.clone(),
+                    ..Default::default()
+                };
+                let result = if mode == "sync" {
+                    api.get_sync_status_page(params).await.unwrap()
+                } else {
+                    api.get_account_coverage_page(params).await.unwrap()
+                };
+                let report = if mode == "sync" {
+                    assert_eq!(result["account_coverage"]["target_scope"]["guild_id"], "42");
+                    &result
+                } else {
+                    &result["coverage"]
+                };
+                let rows = report[if mode == "sync" {
+                    "coverage"
+                } else {
+                    "targets"
+                }]
+                .as_array()
+                .unwrap();
+                assert!(rows.len() <= 20);
+                for row in rows {
+                    assert!(ids.insert(row["channel_id"].as_str().unwrap().to_owned()));
+                }
+                cursor = report["next_cursor"].as_str().map(str::to_owned);
+                if cursor.is_none() {
+                    break;
+                }
+                let wrong = StatusParams {
+                    guild_id: Some("43".into()),
+                    cursor: cursor.clone(),
+                    ..Default::default()
+                };
+                assert!(if mode == "sync" {
+                    api.get_sync_status_page(wrong).await
+                } else {
+                    api.get_account_coverage_page(wrong).await
+                }
+                .is_err());
+            }
+            assert_eq!(ids.len(), 105);
+        }
+    }
+
+    #[tokio::test]
+    async fn status_defaults_to_summary_and_cached_guild_read_state_is_unknown() {
+        let mock = spawn_mock(VecDeque::new()).await;
+        let (api, store) = api_for(&mock.base);
+        *api.me_id.lock().unwrap() = Some("7".into());
+        for id in 1..=100 {
+            store
+                .upsert_channel(
+                    &serde_json::from_value(json!({"id":id.to_string(),"guild_id":"42","type":0}))
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        let status = api.get_sync_status().await.unwrap();
+        assert_eq!(status["channels_tracked"], 100);
+        assert!(status["coverage"].as_array().unwrap().is_empty());
+        let state = api
+            .get_read_state(ReadStateParams {
+                guild_id: Some("42".into()),
+                refresh: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(state["read_state"].as_array().unwrap().len(), 50);
+        assert_eq!(state["read_state"][0]["availability"], "unobserved");
+        assert!(state["has_more"].as_bool().unwrap());
+        assert_eq!(state["complete"], false);
+        let cursor = state["next_cursor"].as_str().unwrap().to_owned();
+        store
+            .begin_account_inventory("7", "fixture-generation", "2026-01-01T00:00:00Z")
+            .unwrap();
+        let channels: Vec<Channel> = (1..=100)
+            .map(|id| {
+                serde_json::from_value(json!({"id":id.to_string(),"guild_id":"42","type":0}))
+                    .unwrap()
+            })
+            .collect();
+        store
+            .observe_account_targets("7", "fixture-generation", &channels, "2026-01-01T00:00:00Z")
+            .unwrap();
+        assert!(api
+            .get_read_state(ReadStateParams {
+                guild_id: Some("42".into()),
+                refresh: false,
+                cursor: Some(cursor),
+                ..Default::default()
+            })
+            .await
+            .is_err());
     }
 
     #[tokio::test]

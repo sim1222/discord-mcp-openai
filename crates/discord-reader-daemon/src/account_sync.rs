@@ -11,7 +11,7 @@ use discord_api::{
 };
 use discord_store::{
     sqlite::{
-        account::{AccountJob, AccountTarget, TargetCheckpoint},
+        account::{AccountInventory, AccountJob, AccountTarget, TargetCheckpoint},
         now_iso,
     },
     Store, StoreError,
@@ -433,7 +433,7 @@ async fn run_round(
             }
         }
         job.updated_at = now_iso();
-        job.progress = json!({"job_id":job.job_id,"scope":"account","account_user_id":job.account_user_id,"generation":job.generation,"as_of":job.updated_at,"status":"running","selected_targets":targets.len(),"attempted":attempted,"synced":saved,"messages_saved":messages_saved,"failures":failures,"complete":false});
+        job.progress = json!({"job_id":job.job_id,"scope":"account","account_user_id":job.account_user_id,"generation":job.generation,"as_of":job.updated_at,"status":"running","selected_targets":targets.len(),"attempted":attempted,"synced":saved,"messages_saved":messages_saved,"failures":failures.iter().take(20).map(failure_summary).collect::<Vec<_>>(),"failures_total":failures.len(),"failures_omitted":failures.len().saturating_sub(20),"complete":false});
         state.progress(&job)?;
     }
     if state.cancelled(&job.job_id)? {
@@ -448,7 +448,7 @@ async fn run_round(
         .into();
     }
     job.updated_at = now_iso();
-    job.progress = json!({"job_id":job.job_id,"scope":"account","account_user_id":job.account_user_id,"generation":job.generation,"as_of":job.updated_at,"status":job.status,"selected_targets":targets.len(),"attempted":attempted,"synced":saved,"messages_saved":messages_saved,"failures":failures,"cancel_reason":if job.status=="cancelled"{Some("user_requested")}else{None},"resume_cursor":{"account_user_id":job.account_user_id,"generation":job.generation,"source":"persisted_target_checkpoints"},"complete":false});
+    job.progress = json!({"job_id":job.job_id,"scope":"account","account_user_id":job.account_user_id,"generation":job.generation,"as_of":job.updated_at,"status":job.status,"selected_targets":targets.len(),"attempted":attempted,"synced":saved,"messages_saved":messages_saved,"failures":failures.iter().take(20).map(failure_summary).collect::<Vec<_>>(),"failures_total":failures.len(),"failures_omitted":failures.len().saturating_sub(20),"cancel_reason":if job.status=="cancelled"{Some("user_requested")}else{None},"resume_cursor":{"account_user_id":job.account_user_id,"generation":job.generation,"source":"persisted_target_checkpoints"},"complete":false});
     state.progress(&job)?;
     Ok(job.progress)
 }
@@ -609,19 +609,49 @@ async fn refresh_inventory(
     Ok(generation)
 }
 
-/// Report account scope independently of cached search result counts.
-pub(crate) fn account_coverage(store: &Store, user: &str) -> Result<Value, StoreError> {
-    let targets = store.account_targets(user)?;
+fn failure_summary(failure: &Value) -> Value {
+    let error = failure.get("error").unwrap_or(failure);
+    json!({"source":failure["source"].as_str().map(|s|s.chars().take(64).collect::<String>()),"channel_id":failure["channel_id"].as_str(),"guild_id":failure["guild_id"].as_str(),"parent_id":failure["parent_id"].as_str(),"error":{"code":error["code"].as_str().map(|s|s.chars().take(128).collect::<String>()),"error_source":error["error_source"].as_str(),"http_status":error["http_status"].as_u64(),"retryable":error["retryable"].as_bool(),"retry_after_ms":error["retry_after_ms"].as_u64(),"message":error["message"].as_str().map(|s|s.chars().take(256).collect::<String>())}})
+}
+
+fn inventory_summary(inventory: &AccountInventory) -> Value {
+    let discovery = &inventory.discovery;
+    let inventory_errors = discovery["inventory_errors"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let displayed_inventory_errors: Vec<_> = inventory_errors
+        .iter()
+        .take(20)
+        .filter_map(Value::as_str)
+        .map(|s| s.chars().take(256).collect::<String>())
+        .collect();
+    let failures = discovery["failures"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let displayed: Vec<_> = failures.iter().take(20).map(failure_summary).collect();
+    let reasons: Vec<_> = discovery["reasons"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .take(16)
+        .filter_map(Value::as_str)
+        .map(|s| s.chars().take(256).collect::<String>())
+        .collect();
+    json!({"generation":inventory.generation,"account_user_id":inventory.account_user_id,"started_at":inventory.started_at,"refreshed_at":inventory.refreshed_at,"status":inventory.status,"discovery":{"source":discovery["source"].as_str(),"partial":discovery["partial"].as_bool(),"inventory_errors":displayed_inventory_errors,"inventory_errors_total":inventory_errors.len(),"inventory_errors_omitted":inventory_errors.len().saturating_sub(20),"complete":false,"cancelled":discovery["cancelled"].as_bool(),"guilds_observed":discovery["guilds_observed"].as_u64(),"guild_inventory_exhausted":discovery["guild_inventory_exhausted"].as_bool(),"failures_total":failures.len(),"failures":displayed,"failures_omitted":failures.len().saturating_sub(20),"thread_resume_cursor_count":discovery["thread_resume_cursors"].as_object().map_or(0,|map|map.len()),"reasons":reasons}})
+}
+
+fn coverage_summary(
+    store: &Store,
+    user: &str,
+    guild: Option<&str>,
+    channel: Option<&str>,
+    as_of: &str,
+) -> Result<Value, StoreError> {
+    let counts = store.account_target_counts(user, guild, channel, as_of)?;
     let inventory = store.account_inventory(user)?;
-    let as_of = now_iso();
-    let synced = targets
-        .iter()
-        .filter(|target| target.last_checked_at.is_some())
-        .count();
-    let failures = targets
-        .iter()
-        .filter(|target| target.last_error.is_some())
-        .count();
     let inventory_at = inventory
         .as_ref()
         .and_then(|entry| entry.refreshed_at.clone());
@@ -629,20 +659,72 @@ pub(crate) fn account_coverage(store: &Store, user: &str) -> Result<Value, Store
         .as_deref()
         .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
         .is_none_or(|at| Utc::now().signed_duration_since(at) > Duration::minutes(15));
-    let mut remaining = Vec::new();
-    for target in &targets {
-        let ranges = store.coverage(&target.channel_id)?;
-        let gaps:Vec<_> = ranges.windows(2).map(|pair|json!({"after_message_id":pair[0].to_id,"before_message_id":pair[1].from_id})).collect();
-        let target_stale = target
+    let scope = if channel.is_some() {
+        "channel"
+    } else if guild.is_some() {
+        "guild"
+    } else {
+        "account"
+    };
+    Ok(
+        json!({"observation_consistency":"sequential_cache_reads","as_of_basis":"inspection_started_at","scope":scope,"target_scope":{"guild_id":guild,"channel_id":channel},"account_user_id":user,"as_of":as_of,"inventory_updated_at":inventory_at,"inventory_stale":stale,"inventory_initialized":inventory.is_some(),"inventory":inventory.as_ref().map(inventory_summary),"targets_total":counts.total,"target_count_basis":"retained_discovered_targets","undiscovered_target_count":null,"enumerated":counts.total,"synced":counts.synced,"unfetched":counts.unfetched,"failed":counts.failed,"blocked":counts.blocked,"due":counts.due,"targets":[],"details_included":false,"has_more":null,"next_cursor":null,"complete":false,"reasons":["account_inventory_not_proven_exhaustive","history_permissions_not_verified","edits_and_deletions_not_continuously_observed"]}),
+    )
+}
+
+/// Return bounded account summary counts without expanding retained targets.
+pub(crate) fn account_coverage(store: &Store, user: &str) -> Result<Value, StoreError> {
+    coverage_summary(store, user, None, None, &now_iso())
+}
+
+/// Return summary counts for the requested guild and channel intersection.
+pub(crate) fn account_coverage_scoped(
+    store: &Store,
+    user: &str,
+    guild: Option<&str>,
+    channel: Option<&str>,
+) -> Result<Value, StoreError> {
+    coverage_summary(store, user, guild, channel, &now_iso())
+}
+
+/// Return scoped retrieval details with a bounded keyset continuation.
+pub(crate) fn account_coverage_page(
+    store: &Store,
+    user: &str,
+    guild: Option<&str>,
+    channel: Option<&str>,
+    after: Option<&str>,
+    limit: u32,
+) -> Result<Value, StoreError> {
+    let limit = limit.clamp(1, 100);
+    let mut report = coverage_summary(store, user, guild, channel, &now_iso())?;
+    let generation = report["inventory"]["generation"].as_str();
+    let mut page = store.account_target_page(user, guild, channel, after, limit)?;
+    let has_more = page.len() > limit as usize;
+    page.truncate(limit as usize);
+    let next_cursor = if has_more {
+        page.last().map(|target| target.channel_id.clone())
+    } else {
+        None
+    };
+    let mut entries = Vec::new();
+    for target in &page {
+        let mut ranges = store.account_target_ranges(&target.channel_id, 20)?;
+        let ranges_truncated = ranges.len() > 20;
+        ranges.truncate(20);
+        let gaps:Vec<_>=ranges.windows(2).map(|pair|json!({"after_message_id":pair[0].to_id,"before_message_id":pair[1].from_id})).collect();
+        let stale = target
             .last_checked_at
             .as_deref()
             .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
             .is_none_or(|at| Utc::now().signed_duration_since(at) > Duration::minutes(5));
-        remaining.push(json!({"channel_id":target.channel_id,"guild_id":target.guild_id,"present_in_current_inventory":inventory.as_ref().is_some_and(|entry|entry.generation==target.generation),"first_discovered_at":target.first_discovered_at,"last_checked_at":target.last_checked_at,"unfetched_since":if target.last_checked_at.is_none(){Some(&target.first_discovered_at)}else{None},"last_attempt_at":target.last_attempt_at,"next_check_at":target.next_check_at,"stale":target_stale,"history_status":target.history_status,"next_direction":target.next_direction,"covered_ranges":ranges,"gaps":gaps,"covered_from":target.backfill_before,"covered_to":target.increment_after,"remaining_history":{"before_message_id":target.backfill_before,"status":"unknown"},"error":target.last_error}));
+        entries.push(json!({"channel_id":target.channel_id,"guild_id":target.guild_id,"present_in_current_inventory":generation==Some(target.generation.as_str()),"first_discovered_at":target.first_discovered_at,"last_checked_at":target.last_checked_at,"unfetched_since":if target.last_checked_at.is_none(){Some(&target.first_discovered_at)}else{None},"last_attempt_at":target.last_attempt_at,"next_check_at":target.next_check_at,"stale":stale,"history_status":target.history_status,"next_direction":target.next_direction,"covered_ranges":ranges,"ranges_truncated":ranges_truncated,"gaps":gaps,"covered_from":target.backfill_before,"covered_to":target.increment_after,"remaining_history":{"before_message_id":target.backfill_before,"status":"unknown"},"error":target.last_error.as_ref().map(|error|failure_summary(&json!({"error":error}))["error"].clone())}));
     }
-    Ok(
-        json!({"scope":"account","account_user_id":user,"as_of":as_of,"inventory_updated_at":inventory_at,"inventory_stale":stale,"inventory":inventory,"targets_total":targets.len(),"target_count_basis":"retained_discovered_targets","undiscovered_target_count":null,"enumerated":targets.len(),"synced":synced,"unfetched":targets.len()-synced,"failed":failures,"targets":remaining,"complete":false,"reasons":["account_inventory_not_proven_exhaustive","history_permissions_not_verified","edits_and_deletions_not_continuously_observed"]}),
-    )
+    report["targets"] = json!(entries);
+    report["details_included"] = json!(true);
+    report["has_more"] = json!(has_more);
+    report["next_cursor"] = json!(next_cursor);
+    report["limit"] = json!(limit);
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -1078,5 +1160,54 @@ mod tests {
             Some(("900".into(), "999".into()))
         );
         assert_eq!(checkpoints[0].history_status, "history_access_unknown");
+    }
+
+    #[test]
+    fn large_account_summary_and_scoped_details_are_bounded() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .begin_account_inventory("me", "g", "2026-01-01T00:00:00Z")
+            .unwrap();
+        let channels: Vec<Channel> = (1..=13000)
+            .map(|id| {
+                serde_json::from_value(json!({"id":id.to_string(),"type":0,"guild_id":"42"}))
+                    .unwrap()
+            })
+            .collect();
+        store
+            .observe_account_targets("me", "g", &channels, "2026-01-01T00:00:00Z")
+            .unwrap();
+        let failures:Vec<_>=(1..=13000).map(|id|json!({"channel_id":id.to_string(),"error":{"code":"failed","message":"x".repeat(1000)}})).collect();
+        store
+            .finish_account_inventory("g", "2026-01-01T00:00:00Z", &json!({"failures":failures}))
+            .unwrap();
+        let summary = account_coverage(&store, "me").unwrap();
+        assert_eq!(summary["targets_total"], 13000);
+        assert!(summary.to_string().len() < 65536);
+        assert!(summary["targets"].as_array().unwrap().is_empty());
+        assert_eq!(summary["inventory"]["discovery"]["failures_total"], 13000);
+        let page = account_coverage_page(&store, "me", Some("42"), None, None, 2).unwrap();
+        assert_eq!(page["targets_total"], 13000);
+        assert_eq!(page["targets"].as_array().unwrap().len(), 2);
+        assert_eq!(page["has_more"], true);
+        assert!(page.to_string().len() < 65536);
+        let next = account_coverage_page(
+            &store,
+            "me",
+            Some("42"),
+            None,
+            page["next_cursor"].as_str(),
+            2,
+        )
+        .unwrap();
+        assert_ne!(
+            page["targets"][1]["channel_id"],
+            next["targets"][0]["channel_id"]
+        );
+        let empty = account_coverage(&store, "unknown").unwrap();
+        assert_eq!(empty["inventory_initialized"], false);
+        assert_eq!(empty["scope"], "account");
+        assert_eq!(empty["targets_total"], 0);
+        assert_eq!(empty["complete"], false);
     }
 }

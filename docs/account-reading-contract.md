@@ -1,4 +1,4 @@
-# Account-wide reading contract (revision 4)
+# Account-wide reading contract (revision 5)
 
 ## Outcomes and acquisition basis
 
@@ -58,8 +58,8 @@ MCP publishes machine-readable input schemas for these tools.
 | Tool | Input fields |
 |---|---|
 | `get_capabilities` | none |
-| `get_read_state` | `guild_id?: string`, `channel_id?: string`, `refresh?: boolean = true` |
-| `get_account_coverage` | none |
+| `get_read_state` | `guild_id?: string`, `channel_id?: string`, `refresh?: boolean = true`, `limit?: integer (1..100) = 50`, `cursor?: string` |
+| `get_account_coverage`, `get_sync_status` | `guild_id?: string`, `channel_id?: string`, `include_details?: boolean = false`, `limit?: integer (1..100) = 50`, `cursor?: string` |
 | `start_account_sync` | `max_targets?: integer (1..1000) = 50`, `page_size?: integer (1..100) = 100`, `refresh_inventory?: boolean = true` |
 | `get_sync_progress` | `job_id: string` |
 | `cancel_sync` | `job_id: string` (local account jobs only) |
@@ -103,7 +103,10 @@ type ReadStateResult = {
   partial: boolean; complete: boolean; // read-state scope only, not history
   freshness: "fresh" | "stale";
   read_state: ReadState[];
-  inventory_errors: string[]; // dropped malformed channels or unavailable guilds
+  inventory_errors: string[]; // bounded diagnostic sample
+  inventory_errors_total: number; inventory_errors_omitted: number;
+  target_basis: string; channels_total_known: number;
+  next_cursor: string | null; has_more: boolean; limit: number;
   discord_guild_badge_count: null;
   guild_badge_reason: "browser_aggregation_not_reproduced";
   coverage: AccountCoverage;
@@ -114,7 +117,10 @@ type AccountCoverage = {
   inventory: object | null;
   targets_total: number; enumerated: number; synced: number;
   unfetched: number; failed: number;
-  targets: object[]; // channel, discovery/check times, ranges/gaps, deadlines, errors
+  inventory_initialized: boolean;
+  details_included: boolean; targets: object[]; // bounded page, empty in summary mode
+  next_cursor: string | null; has_more: boolean | null;
+  // Each target bounds retained ranges/diagnostics and discloses truncation.
   complete: false; reasons: string[];
 };
 type InboxResult = {
@@ -180,6 +186,33 @@ pages do not fabricate coverage to the beginning of the channel. Historical page
 do not skip pending incremental ranges by advancing a previously initialized
 incremental cursor.
 
+## Bounded status inspection
+
+`get_sync_status` and `get_account_coverage` return SQL aggregate counts by default;
+empty detail arrays mean details were not requested, not an empty account.
+`channel_id` or `include_details=true` enables detail pages, default 50, maximum 100.
+Cursors are bound to account, operation, guild/channel scope and read-state target source; mismatched cursors
+are argument errors. Status pages use live lexical-ID keyset ordering, not frozen
+inbox snapshots. Inserts before the current cursor need a new inspection; each
+page has its own observation time and never establishes account completeness.
+Summary counts, inventory metadata and detail ranges are sequential cache reads;
+`as_of_basis: "inspection_started_at"` is an approximate inspection time, not a
+claim that all fields came from one database or Discord snapshot.
+
+`get_read_state` also bounds channel rows. Continuation defaults to `refresh=false` at the MCP layer; explicit `refresh=true`
+is rejected on continuation.
+clients must compare source timestamps/versions if another refresh occurs while
+paging. It attaches aggregate account coverage only. If ledger membership is
+unavailable for a scope, cached channel IDs supply explicit `target_basis:
+"cached_channels"`; their absent read state remains unknown. Cache discovery does
+not initialize or certify the account ledger. `refresh=false` never proves a
+current count when the saved observation is missing or stale.
+
+Account job progress embeds summary coverage and a bounded failure sample with
+omitted/total counters. Detail range samples disclose `ranges_truncated`.
+Status/coverage inspections run outside async worker threads; unexpected task
+failure becomes a structured tool error rather than fabricated empty data.
+
 ## Read-only and verification limits
 
 REST remains a typed GET operation allowlist. The separate Gateway transport has
@@ -202,8 +235,8 @@ Repository fixtures use synthetic IDs and generic names. Live acceptance results
 are documented without server, organization or participant names, message URLs,
 or real Discord IDs; synthetic fixtures do not claim to reproduce live messages.
 
-The full workspace suite passed 195 tests (29 API, 102 daemon library,
-4 daemon binary, 12 MCP, 48 store). `cargo fmt --check` and
+The full workspace suite passed 206 tests (29 API, 106 daemon library,
+4 daemon binary, 13 MCP, 54 store). `cargo fmt --check` and
 `cargo clippy --workspace -- -D warnings` passed. Local socket mocks require an
 environment that permits TCP/Unix socket binding; the filesystem sandbox alone
 cannot run them. TDD captured failures before snapshot, workflow, fair sequencing,
@@ -223,3 +256,17 @@ separate from unit tests. Selected-message direct-match/read-state-invariance an
 guild raw-count observations are documented in [browser evidence](browser-api-evidence.md).
 No exhaustive live first backfill or continuous event-loss reconciliation test was
 performed, and a same-time guild UI badge comparison remains unverified.
+
+## Runtime failure investigation
+
+A controlled fresh HTTP MCP session on the reported deployment successfully called
+`get_read_state(refresh=false)` for a selected guild and `get_account_coverage`,
+then repeated coverage retrieval in the same session. Responses were approximately
+9.8 MB because nested coverage included the entire account ledger. A whole-cache
+sync-status response was approximately 14.7 MB. No container restart, OOM or panic
+was observed in the checked interval. This proves large response expansion and
+healthy direct HTTP calls at that time; it does not establish the cause of an
+earlier tunnel/client `Transport closed`. Cached read state is not a live unread
+zero. The bounded revision has local regression coverage; deployment and tunnel
+verification must be reported separately. No private names, IDs, message bodies
+or log text are included in these results.

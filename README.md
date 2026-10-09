@@ -231,6 +231,9 @@ unit は `NoNewPrivileges` / `PrivateTmp` / `ProtectSystem=strict` / `ProtectHom
 バッジはブラウザで集計されるため、直接取得値としては返しません。
 `start_account_sync` は台帳上の未取得対象から公平に初回取得・バックフィル・増分取得を
 進め、`get_account_coverage` が列挙不足・履歴不明・失敗・鮮度を示します。
+状態取得の既定は集計のみです。詳細は `include_details=true` または `channel_id` を指定し、
+返された `next_cursor` を同じ対象範囲へ渡します。最大100対象/ページで、未取得をゼロ扱いしません。
+`get_read_state` の続きは `refresh=false` で取得します。
 取得対象を証明できない間はアカウント全体の complete は false です。
 `list_mentions` のページは永続スナップショットで固定されます。
 `record_inbox_state` は通知・保留・対応・完了の明示的なローカル確認を、Discord既読と
@@ -247,8 +250,8 @@ unit は `NoNewPrivileges` / `PrivateTmp` / `ProtectSystem=strict` / `ProtectHom
 | --- | --- | --- |
 | `get_me` | — | 自分の ID / ユーザー名 (`{"me":{...}}`) |
 | `get_capabilities` | — | 認証方式ごとの対応可否・制約の一覧 |
-| `get_read_state` | `guild_id?`, `channel_id?`, `refresh=true` | Discord由来の件数・既読位置・バージョン (Gateway READY) |
-| `get_account_coverage` | — | アカウント台帳・未取得・失敗・取得範囲・鮮度 |
+| `get_read_state` | `guild_id?`, `channel_id?`, `refresh=true`, `limit=50`, `cursor?` | Discord由来の件数・既読位置・バージョン (最大100対象/ページ) |
+| `get_account_coverage` | `guild_id?`, `channel_id?`, `include_details=false`, `limit=50`, `cursor?` | 台帳の集計。詳細は対象指定・ページング |
 | `start_account_sync` | `max_targets=50`, `page_size=100`, `refresh_inventory=true` | 未確認優先の公平な永続同期ラウンド |
 | `cancel_sync` | `job_id` | ローカル同期取消 |
 | `record_inbox_state` | `channel_id`, `message_id`, 通知・対応・完了の確認情報 | 既読と独立したローカル記録 |
@@ -271,7 +274,7 @@ unit は `NoNewPrivileges` / `PrivateTmp` / `ProtectSystem=strict` / `ProtectHom
 | `read_thread` | `thread_id`, `limit=100` | スレッド読み取り |
 | `list_threads` | `channel_id`, `guild_id?`, `filter?` (active/archived/all), `limit=50`, `cursor?` | 親チャンネルのスレッド検索 (実効上限25件、joined・guild単独は未対応) |
 | `get_member` | `guild_id`, `user_id?` | サーバー内の自分の member / roles |
-| `get_sync_status` | — | チャンネル別の同期位置・確認範囲・キャッシュ状態 |
+| `get_sync_status` | `guild_id?`, `channel_id?`, `include_details=false`, `limit=50`, `cursor?` | キャッシュの集計。詳細は対象指定・ページング |
 | `start_sync` | `scope?`, `guild_id?`, `channel_ids?`, `max_messages?`, `refetch_before?` | 最新ページ取得、または `scope="refetch"` で旧行のメタデータを限定再取得 |
 | `get_sync_progress` | `job_id` | 同期ジョブの進捗 (成功 / 失敗 / 次カーソル) |
 

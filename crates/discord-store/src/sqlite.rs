@@ -221,6 +221,34 @@ pub struct ChannelSyncRow {
     pub backfill: String,
 }
 
+/// Scoped totals over cached targets; these do not establish account-wide discovery.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SyncStatusSummary {
+    pub known_channels: u64,
+    pub message_count: u64,
+    pub metadata_pending: u64,
+    pub deletion_count: u64,
+    pub synced: u64,
+    pub unfetched: u64,
+}
+
+/// Bounded retained read-state target IDs and the source membership used to select them.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReadStateTargetPage {
+    pub target_basis: String,
+    pub total: u64,
+    pub channel_ids: Vec<String>,
+}
+
+const SYNC_STATUS_TARGETS: &str = "WITH known(channel_id) AS (
+    SELECT id FROM channels UNION SELECT DISTINCT channel_id FROM messages INDEXED BY messages_channel_idx UNION SELECT channel_id FROM channel_sync
+), scoped AS (
+    SELECT k.channel_id FROM known k LEFT JOIN channels c ON c.id=k.channel_id
+    WHERE (?1 IS NULL OR c.guild_id=?1 OR (c.id IS NULL AND EXISTS (
+        SELECT 1 FROM messages m WHERE m.channel_id=k.channel_id AND m.guild_id=?1)))
+      AND (?2 IS NULL OR k.channel_id=?2)
+)";
+
 /// One cached role (for resolving role mentions and member role names).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleRow {
@@ -921,6 +949,131 @@ impl Store {
         Ok(row)
     }
 
+    /// Page retained account IDs without loading target records or message/read-state bodies.
+    pub fn read_state_target_page(
+        &self,
+        user: &str,
+        guild: Option<&str>,
+        channel: Option<&str>,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<ReadStateTargetPage, StoreError> {
+        let conn = self.conn.lock().expect("store lock");
+        let tx = conn.unchecked_transaction()?;
+        let membership = format!("{SYNC_STATUS_TARGETS}, ledger AS (
+            SELECT channel_id FROM account_targets
+            WHERE account_user_id=?3 AND (?1 IS NULL OR guild_id=?1) AND (?2 IS NULL OR channel_id=?2)
+        ), gateway AS (
+            SELECT CASE WHEN entry.type='object' THEN json_extract(entry.value,'$.channel_id') ELSE NULL END AS channel_id
+            FROM account_observations a, json_each(
+                CASE WHEN json_valid(a.observation_json) THEN a.observation_json ELSE '{{}}' END,'$.read_states') entry
+            WHERE a.account_user_id=?3 AND ?1 IS NULL AND ?2 IS NULL
+        ), targets AS (
+            SELECT channel_id FROM ledger
+            UNION SELECT channel_id FROM gateway WHERE typeof(channel_id)='text' AND length(channel_id)>0
+            UNION SELECT channel_id FROM scoped WHERE NOT EXISTS(SELECT 1 FROM ledger)
+        )");
+        let (total, ledger_count): (i64, i64) = tx.query_row(
+            &format!(
+                "{membership} SELECT (SELECT COUNT(*) FROM targets),(SELECT COUNT(*) FROM ledger)"
+            ),
+            params![guild, channel, user],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let channel_ids = {
+            let mut stmt = tx.prepare(&format!(
+                "{membership} SELECT channel_id FROM targets
+                WHERE (?4 IS NULL OR channel_id>?4) ORDER BY channel_id LIMIT ?5"
+            ))?;
+            let ids = stmt
+                .query_map(
+                    params![guild, channel, user, after, limit.min(100) + 1],
+                    |row| row.get(0),
+                )?
+                .collect::<Result<Vec<String>, _>>()?;
+            ids
+        };
+        tx.commit()?;
+        let target_basis = match (guild.is_some() || channel.is_some(), ledger_count > 0) {
+            (true, true) => "account_ledger",
+            (true, false) => "cached_channels",
+            (false, true) => "ledger_and_gateway",
+            (false, false) => "cached_channels_and_gateway",
+        }
+        .to_owned();
+        Ok(ReadStateTargetPage {
+            target_basis,
+            total: total as u64,
+            channel_ids,
+        })
+    }
+
+    /// Count retained targets and retrieval evidence within a cached channel or guild scope.
+    pub fn sync_status_summary(
+        &self,
+        guild: Option<&str>,
+        channel: Option<&str>,
+    ) -> Result<SyncStatusSummary, StoreError> {
+        let conn = self.conn.lock().expect("store lock");
+        let sql = format!("{SYNC_STATUS_TARGETS}
+            SELECT
+                (SELECT COUNT(*) FROM scoped),
+                (SELECT COUNT(*) FROM messages m JOIN scoped t ON t.channel_id=m.channel_id),
+                (SELECT COUNT(*) FROM messages m JOIN scoped t ON t.channel_id=m.channel_id
+                    WHERE CASE WHEN json_valid(m.message_json) THEN
+                        COALESCE(json_extract(m.message_json,'$.metadata_state'),'requires_refetch')!='available'
+                    ELSE 1 END),
+                (SELECT COUNT(*) FROM deleted_messages d JOIN scoped t ON t.channel_id=d.channel_id),
+                (SELECT COUNT(*) FROM scoped t JOIN channel_sync s ON s.channel_id=t.channel_id WHERE s.last_fetched_at IS NOT NULL)");
+        let (known_channels, message_count, metadata_pending, deletion_count, synced) = conn
+            .query_row(&sql, params![guild, channel], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?;
+        Ok(SyncStatusSummary {
+            known_channels: known_channels as u64,
+            message_count: message_count as u64,
+            metadata_pending: metadata_pending as u64,
+            deletion_count: deletion_count as u64,
+            synced: synced as u64,
+            unfetched: (known_channels - synced) as u64,
+        })
+    }
+
+    /// Return at most one lookahead row beyond a bounded page in ascending channel-ID order.
+    pub fn sync_status_page(
+        &self,
+        guild: Option<&str>,
+        channel: Option<&str>,
+        after_channel_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<ChannelSyncRow>, StoreError> {
+        let conn = self.conn.lock().expect("store lock");
+        let sql = format!("{SYNC_STATUS_TARGETS}, page AS (
+                SELECT channel_id FROM scoped WHERE (?3 IS NULL OR channel_id>?3)
+                ORDER BY channel_id LIMIT ?4
+            ) SELECT p.channel_id,s.last_synced_message_id,s.oldest_synced_message_id,
+                COALESCE(s.last_message_id,c.last_message_id,
+                    (SELECT id FROM messages m WHERE m.channel_id=p.channel_id ORDER BY length(id) DESC,id DESC LIMIT 1)),
+                COALESCE(s.last_activity_at,(SELECT MAX(timestamp) FROM messages m WHERE m.channel_id=p.channel_id)),
+                s.last_fetched_at,COALESCE(s.backfill,'partial')
+            FROM page p LEFT JOIN channels c ON c.id=p.channel_id
+            LEFT JOIN channel_sync s ON s.channel_id=p.channel_id ORDER BY p.channel_id");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(
+                params![guild, channel, after_channel_id, limit.min(100) + 1],
+                row_to_channel_sync,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// All per-channel sync rows (for `get_sync_status`).
     pub fn channel_sync_all(&self, limit: u32) -> Result<Vec<ChannelSyncRow>, StoreError> {
         let conn = self.conn.lock().expect("store lock");
@@ -1278,6 +1431,160 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
     use discord_api::types::MessageReference;
+
+    #[test]
+    fn read_state_target_paging_counts_thirteen_thousand_without_materializing_targets() {
+        let store = Store::open_in_memory().unwrap();
+        store.conn.lock().unwrap().execute_batch(
+            "WITH RECURSIVE ids(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM ids WHERE n<13000)
+             INSERT INTO account_targets(account_user_id,channel_id,guild_id,kind,generation,first_discovered_at,last_seen_at)
+             SELECT 'me',printf('%05d',n),'g',0,'generation','now','now' FROM ids;"
+        ).unwrap();
+        let page = store
+            .read_state_target_page("me", None, None, None, 100)
+            .unwrap();
+        assert_eq!(page.total, 13000);
+        assert_eq!(page.target_basis, "ledger_and_gateway");
+        assert_eq!(page.channel_ids.len(), 101);
+        let second = store
+            .read_state_target_page("me", None, None, Some(&page.channel_ids[99]), 100)
+            .unwrap();
+        assert_eq!(second.channel_ids[0], page.channel_ids[100]);
+        assert_eq!(second.channel_ids.len(), 101);
+    }
+
+    #[test]
+    fn read_state_targets_use_scoped_cache_when_only_another_guild_has_ledger_targets() {
+        let store = Store::open_in_memory().unwrap();
+        store.conn.lock().unwrap().execute_batch(
+            "INSERT INTO channels(id,guild_id,kind) VALUES('10','g',0),('20','other',0);
+             INSERT INTO account_targets(account_user_id,channel_id,guild_id,kind,generation,first_discovered_at,last_seen_at)
+                 VALUES('me','20','other',0,'generation','now','now');"
+        ).unwrap();
+        let page = store
+            .read_state_target_page("me", Some("g"), None, None, 100)
+            .unwrap();
+        assert_eq!(page.target_basis, "cached_channels");
+        assert_eq!(page.total, 1);
+        assert_eq!(page.channel_ids, ["10"]);
+        let ledger = store
+            .read_state_target_page("me", Some("other"), None, None, 100)
+            .unwrap();
+        assert_eq!(ledger.target_basis, "account_ledger");
+        assert_eq!(ledger.channel_ids, ["20"]);
+    }
+
+    #[test]
+    fn account_read_state_targets_include_gateway_only_ids_and_deduplicate_sources() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                r#"INSERT INTO channels(id,guild_id,kind) VALUES('10','g',0);
+             INSERT INTO account_observations(account_user_id,observed_at,observation_json)
+                 VALUES('me','now','{"read_states":[{"channel_id":"10"},{"channel_id":"30"}]}');"#,
+            )
+            .unwrap();
+        let page = store
+            .read_state_target_page("me", None, None, None, 100)
+            .unwrap();
+        assert_eq!(page.target_basis, "cached_channels_and_gateway");
+        assert_eq!(page.total, 2);
+        assert_eq!(page.channel_ids, ["10", "30"]);
+        assert_eq!(
+            store
+                .read_state_target_page("different", None, None, None, 100)
+                .unwrap()
+                .channel_ids,
+            ["10"]
+        );
+        let scoped = store
+            .read_state_target_page("me", Some("g"), None, None, 100)
+            .unwrap();
+        assert_eq!(scoped.channel_ids, ["10"]);
+    }
+
+    #[test]
+    fn sync_status_counts_all_thirteen_thousand_unfetched_targets() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "WITH RECURSIVE ids(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM ids WHERE n<13000)
+             INSERT INTO channels(id,guild_id,kind) SELECT printf('%05d',n),'g',0 FROM ids;",
+            )
+            .unwrap();
+        let summary = store.sync_status_summary(None, None).unwrap();
+        assert_eq!(summary.known_channels, 13000);
+        assert_eq!(summary.unfetched, 13000);
+        assert_eq!(summary.synced, 0);
+        assert_eq!(
+            store.sync_status_page(None, None, None, 100).unwrap().len(),
+            101
+        );
+    }
+
+    #[test]
+    fn sync_status_scopes_and_pages_include_message_only_and_sync_only_targets() {
+        let store = Store::open_in_memory().unwrap();
+        store.conn.lock().unwrap().execute_batch(
+            "INSERT INTO channels(id,guild_id,kind,last_message_id) VALUES('10','g',0,'100'),('20','other',0,NULL);
+             INSERT INTO messages(id,channel_id,guild_id,timestamp,content,message_json)
+                 VALUES('100','10','g','2026-01-01','a',NULL),('300','30','g','2026-01-02','b','{broken');
+             INSERT INTO channel_sync(channel_id,last_fetched_at) VALUES('10','2026-01-01'),('40',NULL);
+             INSERT INTO deleted_messages(id,channel_id,observed_at) VALUES('deleted','10','2026-01-03');"
+        ).unwrap();
+        let summary = store.sync_status_summary(Some("g"), None).unwrap();
+        assert_eq!(summary.known_channels, 2);
+        assert_eq!(summary.message_count, 2);
+        assert_eq!(summary.metadata_pending, 2);
+        assert_eq!(summary.deletion_count, 1);
+        assert_eq!((summary.synced, summary.unfetched), (1, 1));
+        assert_eq!(
+            store
+                .sync_status_summary(None, Some("40"))
+                .unwrap()
+                .unfetched,
+            1
+        );
+        assert_eq!(
+            store
+                .sync_status_summary(Some("g"), Some("40"))
+                .unwrap()
+                .known_channels,
+            0
+        );
+        let first = store.sync_status_page(None, None, None, 2).unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|r| r.channel_id.as_str())
+                .collect::<Vec<_>>(),
+            ["10", "20", "30"]
+        );
+        let second = store.sync_status_page(None, None, Some("20"), 2).unwrap();
+        assert_eq!(
+            second
+                .iter()
+                .map(|r| r.channel_id.as_str())
+                .collect::<Vec<_>>(),
+            ["30", "40"]
+        );
+        assert_eq!(second[0].last_message_id.as_deref(), Some("300"));
+        assert_eq!(second[0].last_activity_at.as_deref(), Some("2026-01-02"));
+        assert!(second[0].last_synced_message_id.is_none());
+        assert_eq!(
+            store
+                .sync_status_page(Some("g"), None, None, 10)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
 
     fn legacy_database(path: &Path) {
         let conn = Connection::open(path).unwrap();

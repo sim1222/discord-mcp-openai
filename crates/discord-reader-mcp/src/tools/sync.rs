@@ -10,6 +10,19 @@ use serde_json::json;
 
 use super::{limit_or, DiscordReaderTools};
 
+/// Aggregate by default; inspect a bounded page with include_details or channel_id.
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, JsonSchema)]
+pub struct StatusArgs {
+    pub guild_id: Option<String>,
+    pub channel_id: Option<String>,
+    #[serde(default)]
+    pub include_details: bool,
+    /// Detail rows per page, 1..100, default 50.
+    pub limit: Option<u32>,
+    /// Scope-bound opaque cursor returned with details.
+    pub cursor: Option<String>,
+}
+
 /// Arguments for `list_changed_channels`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct ChangedChannelsArgs {
@@ -75,7 +88,7 @@ impl DiscordReaderTools {
         .await
     }
 
-    /// Show sync state and confirmed coverage per channel.
+    /// Show aggregate sync counts by default, or scoped, paginated channel details.
     ///
     /// Returns JSON: `{"db_id": ..., "generated_at": ..., "cached_messages":
     /// N, "channels_tracked": N, "coverage": [{"channel_id", "covered_from",
@@ -88,8 +101,16 @@ impl DiscordReaderTools {
     /// searchable. `metrics` exposes internal HTTP request counts and 429
     /// waits so bulk operations can be costed.
     #[tool(name = "get_sync_status")]
-    pub async fn get_sync_status(&self) -> Result<CallToolResult, ErrorData> {
-        self.call_tool("get_sync_status", json!({})).await
+    pub async fn get_sync_status(
+        &self,
+        Parameters(args): Parameters<StatusArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call_tool(
+            "get_sync_status",
+            serde_json::to_value(args)
+                .map_err(|_| ErrorData::internal_error("invalid status arguments", None))?,
+        )
+        .await
     }
 
     /// Start a bounded metadata refresh or recent-message sync job.

@@ -71,7 +71,9 @@ fn render_read_states_at(
         "scope":{"kind":"channels","channel_ids":channel_ids},
         "partial":snapshot.partial,"complete":complete,
         "read_state":rows,
-        "inventory_errors":snapshot.inventory_errors,
+        "inventory_errors":snapshot.inventory_errors.iter().take(20).collect::<Vec<_>>(),
+        "inventory_errors_total":snapshot.inventory_errors.len(),
+        "inventory_errors_omitted":snapshot.inventory_errors.len().saturating_sub(20),
         "coverage":{"complete":false,"reason":"read_state_does_not_establish_message_history_coverage"},
     })
 }
