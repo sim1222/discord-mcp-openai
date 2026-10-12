@@ -31,6 +31,7 @@ pub(crate) struct AccountSyncOptions {
     pub(crate) max_duration_seconds: u32,
     pub(crate) identity_http_reservation: u32,
     pub(crate) execution_timeout: Option<std::time::Duration>,
+    pub(crate) execution_deadline: Option<tokio::time::Instant>,
 }
 
 impl Default for AccountSyncOptions {
@@ -46,6 +47,7 @@ impl Default for AccountSyncOptions {
             max_duration_seconds: 60,
             identity_http_reservation: 0,
             execution_timeout: None,
+            execution_deadline: None,
         }
     }
 }
@@ -220,15 +222,7 @@ struct SqliteAccountState {
 }
 impl AccountSyncState for SqliteAccountState {
     fn targets(&self, user: &str, at: &str, limit: u32) -> Result<Vec<AccountTarget>, StoreError> {
-        self.store
-            .due_account_targets(user, at, limit)?
-            .into_iter()
-            .filter_map(|target| match self.withheld(user, &target.channel_id) {
-                Ok(false) => Some(Ok(target)),
-                Ok(true) => None,
-                Err(error) => Some(Err(error)),
-            })
-            .collect()
+        self.store.due_account_targets(user, at, limit)
     }
     fn withheld(&self, user: &str, channel: &str) -> Result<bool, StoreError> {
         Ok(self.store.target_sync_withheld(user, channel)?
@@ -416,12 +410,14 @@ pub(crate) async fn run_account_sync(
     store: Arc<Store>,
     id: String,
     user: String,
-    options: AccountSyncOptions,
+    mut options: AccountSyncOptions,
 ) -> Result<Value, AccountSyncError> {
-    let deadline = options
+    let budget = options
         .execution_timeout
         .unwrap_or_else(|| std::time::Duration::from_secs(options.max_duration_seconds.into()));
-    let result = match tokio::time::timeout(
+    let deadline = tokio::time::Instant::now() + budget;
+    options.execution_deadline = Some(deadline);
+    let result = match tokio::time::timeout_at(
         deadline,
         run_account_sync_inner(client, Arc::clone(&store), id.clone(), user, options),
     )
@@ -507,16 +503,20 @@ async fn run_round(
     mut job: AccountJob,
     options: &AccountSyncOptions,
 ) -> Result<Value, AccountSyncError> {
+    let deadline = options.execution_deadline.unwrap_or_else(|| {
+        tokio::time::Instant::now()
+            + options.execution_timeout.unwrap_or_else(|| {
+                std::time::Duration::from_secs(options.max_duration_seconds.into())
+            })
+    });
     let at = now_iso();
     let targets: Vec<_> = state
         .targets(&job.account_user_id, &at, u32::MAX)?
         .into_iter()
         .filter(|target| options.scope.target(target))
-        .take(options.max_targets as usize)
         .collect();
     let mut body_budget = HttpAttemptBudget::new(options.max_body_http_requests);
-    let deadline = tokio::time::Instant::now()
-        + std::time::Duration::from_secs(options.max_duration_seconds.into());
+    let mut selected = 0;
     let mut failures = Vec::new();
     let mut withheld_targets = Vec::new();
     let mut attempted = 0;
@@ -524,18 +524,26 @@ async fn run_round(
     let mut messages_saved = 0;
     job.status = "running".into();
     for target in &targets {
+        if attempted >= options.max_targets {
+            break;
+        }
         if state.cancelled(&job.job_id)? {
             job.status = "cancelled".into();
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            job.status = "paused".into();
             break;
         }
         if state.withheld(&job.account_user_id, &target.channel_id)? {
             withheld_targets.push(target.channel_id.clone());
             continue;
         }
+        selected += 1;
         let remaining_messages = options.max_messages.saturating_sub(messages_saved as u32);
-        if remaining_messages == 0
+        if tokio::time::Instant::now() >= deadline
+            || remaining_messages == 0
             || !body_budget.reserve(1)
-            || tokio::time::Instant::now() >= deadline
         {
             job.status = "paused".into();
             break;
@@ -547,6 +555,10 @@ async fn run_round(
         job.progress["active_channel_id"] = json!(target.channel_id);
         job.updated_at = attempt_at.clone();
         state.progress(&job)?;
+        if tokio::time::Instant::now() >= deadline {
+            job.status = "paused".into();
+            break;
+        }
         let result = match tokio::time::timeout_at(deadline, source.page(target, limit)).await {
             Ok(result) => result,
             Err(_) => {
@@ -643,6 +655,10 @@ async fn run_round(
                     }
                     .into(),
                 };
+                if tokio::time::Instant::now() >= deadline {
+                    job.status = "paused".into();
+                    break;
+                }
                 state.save_page(
                     &job.account_user_id,
                     &target.channel_id,
@@ -663,7 +679,7 @@ async fn run_round(
             }
         }
         job.updated_at = now_iso();
-        job.progress = json!({"job_id":job.job_id,"scope":"account","account_user_id":job.account_user_id,"generation":job.generation,"as_of":job.updated_at,"status":"running","selected_targets":targets.len(),"attempted":attempted,"synced":saved,"messages_saved":messages_saved,"failures":failures.iter().take(20).map(failure_summary).collect::<Vec<_>>(),"failures_total":failures.len(),"failures_omitted":failures.len().saturating_sub(20),"complete":false});
+        job.progress = json!({"job_id":job.job_id,"scope":"account","account_user_id":job.account_user_id,"generation":job.generation,"as_of":job.updated_at,"status":"running","selected_targets":selected,"candidate_targets":targets.len(),"attempted":attempted,"synced":saved,"messages_saved":messages_saved,"failures":failures.iter().take(20).map(failure_summary).collect::<Vec<_>>(),"failures_total":failures.len(),"failures_omitted":failures.len().saturating_sub(20),"complete":false});
         state.progress(&job)?;
         if job.status == "paused" {
             break;
@@ -671,6 +687,9 @@ async fn run_round(
     }
     if state.cancelled(&job.job_id)? {
         job.status = "cancelled".into();
+    }
+    if job.status != "cancelled" && tokio::time::Instant::now() >= deadline {
+        job.status = "paused".into();
     }
     if job.status != "cancelled" && job.status != "paused" {
         job.status = if failures.is_empty() && withheld_targets.is_empty() {
@@ -681,11 +700,12 @@ async fn run_round(
         .into();
     }
     job.updated_at = now_iso();
-    job.progress = json!({"job_id":job.job_id,"scope":"account","account_user_id":job.account_user_id,"generation":job.generation,"as_of":job.updated_at,"status":job.status,"selected_targets":targets.len(),"attempted":attempted,"synced":saved,"messages_saved":messages_saved,"failures":failures.iter().take(20).map(failure_summary).collect::<Vec<_>>(),"failures_total":failures.len(),"failures_omitted":failures.len().saturating_sub(20),"cancel_reason":if job.status=="cancelled"{Some("cancellation_requested")}else{None},"resume_cursor":{"account_user_id":job.account_user_id,"generation":job.generation,"source":"persisted_target_checkpoints"},"complete":false});
+    job.progress = json!({"job_id":job.job_id,"scope":"account","account_user_id":job.account_user_id,"generation":job.generation,"as_of":job.updated_at,"status":job.status,"selected_targets":selected,"candidate_targets":targets.len(),"attempted":attempted,"synced":saved,"messages_saved":messages_saved,"failures":failures.iter().take(20).map(failure_summary).collect::<Vec<_>>(),"failures_total":failures.len(),"failures_omitted":failures.len().saturating_sub(20),"cancel_reason":if job.status=="cancelled"{Some("cancellation_requested")}else{None},"resume_cursor":{"account_user_id":job.account_user_id,"generation":job.generation,"source":"persisted_target_checkpoints"},"complete":false});
     job.progress["withheld_count"] = json!(withheld_targets.len());
     job.progress["withheld_targets"] = json!(withheld_targets.iter().take(20).collect::<Vec<_>>());
     job.progress["withheld_omitted"] = json!(withheld_targets.len().saturating_sub(20));
-    job.progress["page_complete"] = json!(job.status == "finished" && saved == targets.len());
+    job.progress["page_complete"] =
+        json!(job.status == "finished" && saved == selected && withheld_targets.is_empty());
     job.progress["scope_complete"] = json!(false);
     job.progress["inventory_complete"] = json!(false);
     job.progress["history_complete"] = json!(false);
@@ -931,12 +951,14 @@ async fn discover_inventory(
     user: &str,
     options: &AccountSyncOptions,
 ) -> Result<String, AccountSyncError> {
-    let deadline = tokio::time::Instant::now()
-        + options
-            .execution_timeout
-            .unwrap_or(std::time::Duration::from_secs(u64::from(
-                options.max_duration_seconds,
-            )));
+    let deadline = options.execution_deadline.unwrap_or_else(|| {
+        tokio::time::Instant::now()
+            + options
+                .execution_timeout
+                .unwrap_or(std::time::Duration::from_secs(u64::from(
+                    options.max_duration_seconds,
+                )))
+    });
     let key = discovery_scope_key(&options.scope);
     let mut checkpoint = match store.account_discovery_checkpoint(user, &key)? {
         Some(value) => serde_json::from_value::<DiscoveryCheckpoint>(value)
@@ -1497,6 +1519,232 @@ mod tests {
             Ok(vec![])
         }
     }
+    #[tokio::test]
+    async fn unknown_scope_does_not_starve_next_allowed_candidate() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store
+            .begin_account_inventory("9", "g", "2026-01-01")
+            .unwrap();
+        store
+            .persist_account_exclusions("9", &[], &["99".into()], "2026-01-01")
+            .unwrap();
+        let channels = vec![
+            Channel {
+                id: "1".into(),
+                kind: 0,
+                ..Default::default()
+            },
+            Channel {
+                id: "2".into(),
+                kind: 1,
+                ..Default::default()
+            },
+        ];
+        store
+            .observe_account_targets("9", "g", &channels, "2026-01-01")
+            .unwrap();
+        let state = SqliteAccountState {
+            store: Arc::clone(&store),
+        };
+        let source = RestrictionDuringRoundSource {
+            store: Arc::clone(&store),
+            calls: Mutex::new(vec![]),
+        };
+        let mut job = job();
+        job.account_user_id = "9".into();
+        let report = run_round(
+            &state,
+            &source,
+            job,
+            &AccountSyncOptions {
+                max_targets: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(*source.calls.lock().unwrap(), vec!["2"]);
+        assert_eq!(report["attempted"], 1);
+        assert_eq!(report["withheld_count"], 1);
+        assert!(store
+            .account_targets("9")
+            .unwrap()
+            .iter()
+            .find(|t| t.channel_id == "1")
+            .unwrap()
+            .last_attempt_at
+            .is_none());
+    }
+
+    struct DeadlineState {
+        state: State,
+        deadline: tokio::time::Instant,
+        delay_before_request: bool,
+        fetched: Arc<AtomicBool>,
+    }
+    impl DeadlineState {
+        fn wait_for_deadline(&self) {
+            while tokio::time::Instant::now() < self.deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+    impl AccountSyncState for DeadlineState {
+        fn targets(
+            &self,
+            user: &str,
+            at: &str,
+            limit: u32,
+        ) -> Result<Vec<AccountTarget>, StoreError> {
+            self.state.targets(user, at, limit)
+        }
+        fn attempt(&self, user: &str, channel: &str, at: &str) -> Result<(), StoreError> {
+            self.state.attempt(user, channel, at)
+        }
+        fn save_page(
+            &self,
+            user: &str,
+            channel: &str,
+            messages: &[Message],
+            checkpoint: TargetCheckpoint,
+        ) -> Result<(), StoreError> {
+            self.state.save_page(user, channel, messages, checkpoint)
+        }
+        fn fail(
+            &self,
+            user: &str,
+            channel: &str,
+            at: &str,
+            error: &Value,
+        ) -> Result<(), StoreError> {
+            self.state.fail(user, channel, at, error)
+        }
+        fn cancelled(&self, job: &str) -> Result<bool, StoreError> {
+            if !self.delay_before_request && self.fetched.load(Ordering::SeqCst) {
+                self.wait_for_deadline();
+            }
+            self.state.cancelled(job)
+        }
+        fn progress(&self, job: &AccountJob) -> Result<(), StoreError> {
+            if self.delay_before_request {
+                self.wait_for_deadline();
+            }
+            self.state.progress(job)
+        }
+    }
+    struct ObservedSource(Arc<AtomicBool>);
+    #[async_trait::async_trait]
+    impl AccountSource for ObservedSource {
+        async fn page(&self, _: &AccountTarget, _: u8) -> Result<Vec<Message>, Value> {
+            self.0.store(true, Ordering::SeqCst);
+            Ok(vec![])
+        }
+    }
+    #[tokio::test]
+    async fn synchronous_state_work_cannot_start_http_or_save_after_deadline() {
+        for delay_before_request in [true, false] {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+            let fetched = Arc::new(AtomicBool::new(false));
+            let state = DeadlineState {
+                state: state(false),
+                deadline,
+                delay_before_request,
+                fetched: Arc::clone(&fetched),
+            };
+            let report = run_round(
+                &state,
+                &ObservedSource(Arc::clone(&fetched)),
+                job(),
+                &AccountSyncOptions {
+                    execution_deadline: Some(deadline),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(report["status"], "paused");
+            assert_eq!(fetched.load(Ordering::SeqCst), !delay_before_request);
+            assert!(state.state.saved.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_round_budget_pauses_before_attempt_or_http_reservation() {
+        let state = state(false);
+        let source = Source { messages: vec![] };
+        let report = run_round(
+            &state,
+            &source,
+            job(),
+            &AccountSyncOptions {
+                execution_timeout: Some(std::time::Duration::ZERO),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(report["status"], "paused");
+        assert_eq!(report["attempted"], 0);
+        assert_eq!(report["body_http_attempt_upper_bound"], 0);
+        assert_eq!(report["page_complete"], false);
+        assert!(state.saved.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn candidate_listing_defers_individual_scope_checks_until_selected_round() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store
+            .begin_account_inventory("9", "g", "2026-01-01")
+            .unwrap();
+        store
+            .persist_account_exclusions("9", &[], &["99".into()], "2026-01-01")
+            .unwrap();
+        let channels = vec![
+            Channel {
+                id: "1".into(),
+                kind: 1,
+                ..Default::default()
+            },
+            Channel {
+                id: "2".into(),
+                kind: 0,
+                ..Default::default()
+            },
+        ];
+        store
+            .observe_account_targets("9", "g", &channels, "2026-01-01")
+            .unwrap();
+        let state = SqliteAccountState {
+            store: Arc::clone(&store),
+        };
+        let candidates = state.targets("9", &now_iso(), 100).unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(state.withheld("9", "2").unwrap());
+        let source = RestrictionDuringRoundSource {
+            store,
+            calls: Mutex::new(vec![]),
+        };
+        let mut job = job();
+        job.account_user_id = "9".into();
+        let report = run_round(
+            &state,
+            &source,
+            job,
+            &AccountSyncOptions {
+                scope: AccountScope {
+                    channel_ids: Some(vec!["2".into()]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(source.calls.lock().unwrap().is_empty());
+        assert_eq!(report["attempted"], 0);
+        assert_eq!(report["withheld_count"], 1);
+    }
+
     #[tokio::test]
     async fn restrictions_inserted_during_round_skip_preselected_targets_before_attempt() {
         let store = Arc::new(Store::open_in_memory().unwrap());

@@ -623,6 +623,7 @@ pub(crate) fn validate_account_sync(
         max_duration_seconds: params.max_duration_seconds.unwrap_or(60),
         identity_http_reservation: 0,
         execution_timeout: None,
+        execution_deadline: None,
     })
 }
 

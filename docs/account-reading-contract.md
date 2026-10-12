@@ -437,3 +437,21 @@ including invalid response payloads or pagination, remain recorded as failures b
 do not create permanent access prohibitions; a later discovery cycle can retry them. This is a
 bounded discovery cycle, not proof that Discord exposes every private or archived
 thread or that whole-account body backfill has completed.
+
+
+### Scoped-round candidate selection and time budget
+
+Account rounds list fair candidates with the store's inherited withholding filter,
+then apply the requested scope before individual execution checks. Unknown-scope
+candidates remain visible but are checked before any attempt or HTTP request.
+They do not consume `max_targets`, so they cannot starve a later allowed target.
+`candidate_targets` counts retained candidates in scope; `selected_targets` counts
+eligible targets considered for this bounded round, including one stopped by a
+budget before fetching. Withheld candidates are reported separately.
+
+One absolute execution deadline covers discovery and body retrieval. An expired
+budget produces `paused`, with no further HTTP reservation or cursor advancement.
+Synchronous SQLite work cannot be preempted by Tokio's timeout and may finish
+beyond the deadline; the next check stops retrieval and preserves incomplete
+coverage. Candidate listing still loads the retained fair queue, rather than
+claiming that all account-wide preprocessing has constant cost.
