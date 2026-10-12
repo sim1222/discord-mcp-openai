@@ -44,18 +44,25 @@ fn render_read_states_at(
         let reason = match state {
             None => Some("channel_read_state_not_observed"),
             Some(_) if !is_fresh => Some("read_state_observation_not_fresh"),
-            Some(state) => state.reason.as_deref(),
+            Some(state) => state.reason.as_deref().or_else(|| {
+                state
+                    .discord_mention_count
+                    .is_none()
+                    .then_some("mention_count_not_observed")
+            }),
         };
         rows.push(json!({
             "channel_id":channel,
             "last_read_message_id":state.filter(|_| usable).and_then(|state| state.last_read_message_id.as_deref()),
-            "last_read_message_id_reason":if !usable || state.is_none_or(|state|state.last_read_message_id.is_none()) {Some("last_read_position_not_observed_or_unacked")}else{None},
+            "last_read_message_id_reason":if !usable {reason}else if state.is_none_or(|state|state.last_read_message_id.is_none()) {Some("last_read_position_not_observed_or_unacked")}else{None},
             "discord_mention_count":state.filter(|_| usable).and_then(|state| state.discord_mention_count),
             "computed_unread_candidate_count":null,
             "source":"discord_gateway_ready",
             "fetched_at":state.map(|state| state.observed_at.as_str()),
             "version":state.and_then(|state| state.version.as_deref()),
             "availability":availability,"reason":reason,
+            "current_reason":reason,
+            "last_observed":state.map(|state|json!({"discord_mention_count":state.discord_mention_count,"last_read_message_id":state.last_read_message_id,"observed_at":state.observed_at,"version":state.version,"availability":state.availability})),
         }));
     }
     let complete = !snapshot.partial
@@ -64,6 +71,15 @@ fn render_read_states_at(
         && rows.iter().all(|row| {
             row["availability"] == "available" && !row["discord_mention_count"].is_null()
         });
+    let observed = rows
+        .iter()
+        .filter(|row| row["discord_mention_count"].is_u64())
+        .count();
+    let unknown = rows.len() - observed;
+    let sum = rows
+        .iter()
+        .filter_map(|row| row["discord_mention_count"].as_u64())
+        .fold(0u64, u64::saturating_add);
     json!({
         "account_user_id":snapshot.account_user_id,"source":"discord_gateway_ready",
         "as_of":as_of.to_rfc3339(),"fetched_at":if snapshot.observed_at.is_empty(){None}else{Some(snapshot.observed_at.as_str())},"version":snapshot.version,
@@ -71,6 +87,7 @@ fn render_read_states_at(
         "scope":{"kind":"channels","channel_ids":channel_ids},
         "partial":snapshot.partial,"complete":complete,
         "read_state":rows,
+        "counts":{"observed_rows":observed,"unknown_rows":unknown,"observed_mention_sum":sum,"discord_scope_mention_total":if unknown==0 && observed>0 {Some(sum)}else{None},"source":"discord_gateway_ready","basis":"requested_channel_rows_at_as_of","is_guild_ui_badge":false},
         "inventory_errors":snapshot.inventory_errors.iter().take(20).collect::<Vec<_>>(),
         "inventory_errors_total":snapshot.inventory_errors.len(),
         "inventory_errors_omitted":snapshot.inventory_errors.len().saturating_sub(20),
@@ -121,6 +138,49 @@ pub(crate) fn classify_message_read(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_observed_counts_cannot_become_a_scope_total() {
+        let mut observation = snapshot("2026-01-01T00:00:00Z");
+        let example = observation.read_states[0].clone();
+        observation.read_states = (0..31)
+            .map(|index| {
+                let mut state = example.clone();
+                state.channel_id = (200 + index).to_string();
+                state.discord_mention_count = Some(if index < 4 { 2 } else { 0 });
+                state
+            })
+            .collect();
+        let ids = (200..308).map(|id| id.to_string()).collect::<Vec<_>>();
+        let result = render_read_states_at(&observation, &ids, now());
+        assert_eq!(result["counts"]["observed_rows"], 31);
+        assert_eq!(result["counts"]["unknown_rows"], 77);
+        assert_eq!(result["counts"]["observed_mention_sum"], 8);
+        assert!(result["counts"]["discord_scope_mention_total"].is_null());
+        assert_eq!(result["complete"], false);
+    }
+
+    #[test]
+    fn stale_values_keep_observation_history_and_explain_current_unknown() {
+        let result = render_read_states_at(
+            &snapshot("2025-12-31T23:59:59Z"),
+            &["200".into(), "201".into()],
+            now(),
+        );
+        assert_eq!(
+            result["read_state"][0]["last_observed"]["discord_mention_count"],
+            0
+        );
+        assert_eq!(
+            result["read_state"][0]["last_observed"]["last_read_message_id"],
+            "100"
+        );
+        assert_eq!(
+            result["read_state"][0]["last_read_message_id_reason"],
+            "read_state_observation_not_fresh"
+        );
+        assert!(result["read_state"][1]["last_observed"].is_null());
+    }
 
     fn snapshot(at: &str) -> AccountObservation {
         serde_json::from_value(json!({

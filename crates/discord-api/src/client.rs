@@ -187,6 +187,11 @@ impl DiscordClient {
         }
     }
 
+    /// Maximum HTTP attempts for one logical request, including rate-limit retries.
+    pub const fn max_attempts_per_request() -> u32 {
+        MAX_ATTEMPTS
+    }
+
     /// Execute an allowlisted request. `GET` only, always.
     #[instrument(skip(self, req), fields(request = %req.bucket_key()))]
     pub async fn execute(&self, req: DiscordRequest) -> Result<Value, DiscordError> {
@@ -295,6 +300,20 @@ fn header_secs(headers: &reqwest::header::HeaderMap, name: &str) -> Option<Durat
 /// Shared handle to the client.
 pub type SharedDiscordClient = Arc<DiscordClient>;
 
+impl crate::account_observation::AccountObserver for DiscordClient {
+    async fn observe_account(
+        &self,
+    ) -> Result<
+        crate::account_observation::AccountObservation,
+        crate::account_observation::ObservationError,
+    > {
+        if self.token_kind != TokenKind::User {
+            return Err(crate::account_observation::ObservationError::Unsupported);
+        }
+        crate::account_observation::observe(&self.token).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,19 +372,5 @@ mod tests {
         let dump = format!("{client:#?}");
         assert!(!dump.contains(SECRET));
         assert!(dump.contains("[REDACTED]"));
-    }
-}
-
-impl crate::account_observation::AccountObserver for DiscordClient {
-    async fn observe_account(
-        &self,
-    ) -> Result<
-        crate::account_observation::AccountObservation,
-        crate::account_observation::ObservationError,
-    > {
-        if self.token_kind != TokenKind::User {
-            return Err(crate::account_observation::ObservationError::Unsupported);
-        }
-        crate::account_observation::observe(&self.token).await
     }
 }

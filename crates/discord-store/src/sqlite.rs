@@ -5,8 +5,12 @@
 
 #[path = "account.rs"]
 pub mod account;
+#[path = "member.rs"]
+pub mod member;
 #[path = "observations.rs"]
 pub mod observations;
+#[path = "outbox.rs"]
+pub mod outbox;
 #[path = "snapshots.rs"]
 pub mod snapshots;
 #[path = "workflow.rs"]
@@ -219,6 +223,12 @@ pub struct ChannelSyncRow {
     /// `complete` when we have fetched to the channel's start (no gaps below
     /// `oldest_synced_message_id`), `partial` otherwise.
     pub backfill: String,
+    /// Last successful channel-list metadata observation.
+    pub metadata_fetched_at: Option<String>,
+    /// Last attempted history request, independent of its outcome.
+    pub body_fetch_attempted_at: Option<String>,
+    /// Last successfully persisted history page, including an empty page.
+    pub body_last_success_at: Option<String>,
 }
 
 /// Scoped totals over cached targets; these do not establish account-wide discovery.
@@ -230,6 +240,8 @@ pub struct SyncStatusSummary {
     pub deletion_count: u64,
     pub synced: u64,
     pub unfetched: u64,
+    pub metadata_fetched: u64,
+    pub history_complete: u64,
 }
 
 /// Bounded retained read-state target IDs and the source membership used to select them.
@@ -339,6 +351,9 @@ CREATE TABLE IF NOT EXISTS channel_sync (
     last_message_id TEXT,
     last_activity_at TEXT,
     last_fetched_at TEXT,
+    metadata_fetched_at TEXT,
+    body_fetch_attempted_at TEXT,
+    body_last_success_at TEXT,
     backfill TEXT NOT NULL DEFAULT 'partial'
 );
 
@@ -394,7 +409,52 @@ CREATE TABLE IF NOT EXISTS inbox_workflow (
     channel_id TEXT NOT NULL,
     message_id TEXT NOT NULL,
     workflow_json TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY(account_user_id,channel_id,message_id)
+);
+CREATE TABLE IF NOT EXISTS account_discovery_checkpoints (
+    account_user_id TEXT NOT NULL,
+    scope_key TEXT NOT NULL,
+    state_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(account_user_id,scope_key)
+);
+CREATE TABLE IF NOT EXISTS account_exclusions (
+    account_user_id TEXT NOT NULL,
+    id_kind TEXT NOT NULL,
+    id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(account_user_id,id_kind,id)
+);
+CREATE TABLE IF NOT EXISTS account_gaps (
+    gap_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_user_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    layer TEXT NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    resolved_at TEXT,
+    last_success_at TEXT,
+    last_success_cursor TEXT,
+    error_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS account_gaps_scope ON account_gaps(account_user_id,channel_id,gap_id);
+CREATE TABLE IF NOT EXISTS notification_outbox (
+    account_user_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    material_version TEXT NOT NULL,
+    notification_kind TEXT NOT NULL,
+    entry_json TEXT NOT NULL,
+    PRIMARY KEY(account_user_id,channel_id,message_id,material_version,notification_kind)
+);
+CREATE TABLE IF NOT EXISTS member_observations (
+    account_user_id TEXT NOT NULL,
+    guild_id TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    roles_json TEXT NOT NULL,
+    PRIMARY KEY(account_user_id,guild_id)
 );
 CREATE TABLE IF NOT EXISTS account_observations (
     account_user_id TEXT PRIMARY KEY,
@@ -801,58 +861,67 @@ impl Store {
         let (observed_from, observed_to) = observed;
         let conn = self.conn.lock().expect("store lock");
         let tx = conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO coverage (channel_id, from_id, to_id) VALUES (?1, ?2, ?3)
-             ON CONFLICT(channel_id, from_id) DO UPDATE SET
-                to_id = MAX(CAST(coverage.to_id AS INTEGER), CAST(excluded.to_id AS INTEGER))",
-            params![channel_id, from_id, to_id],
+        persist_page_coverage(
+            &tx,
+            channel_id,
+            (from_id, to_id),
+            (observed_from, observed_to),
+            fetched_at,
+            backfill_complete,
         )?;
-        // Merge overlapping / adjacent ranges for this channel.
-        merge_coverage(&tx, channel_id)?;
-        // Advance the cursor with plain snowflake comparison (ids sort
-        // numerically; text comparison is not reliable for snowflakes).
-        let current: Option<(Option<String>, Option<String>)> = tx
-            .query_row(
-                "SELECT last_synced_message_id, oldest_synced_message_id
-                 FROM channel_sync WHERE channel_id = ?1",
-                params![channel_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        let (last_synced, oldest_synced) = match current {
-            Some((last, old)) => (
-                max_id(last.as_deref(), observed_to),
-                min_id(old.as_deref(), observed_from),
-            ),
-            None => (
-                Some(observed_to.to_string()),
-                Some(observed_from.to_string()),
-            ),
-        };
-        let backfill = if backfill_complete {
-            "complete".to_string()
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Atomically persist a fetched history page and its observed checkpoint.
+    pub fn save_body_page(
+        &self,
+        channel: &str,
+        messages: &[Message],
+        interval: Option<(&str, &str)>,
+        fetched_at: &str,
+        backfill_complete: bool,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().expect("store lock");
+        let tx = conn.unchecked_transaction()?;
+        for message in messages {
+            if message.channel_id != channel {
+                return Err(StoreError::Data("body page channel mismatch".into()));
+            }
+            persist_message(&tx, message, fetched_at)?;
+        }
+        if let (Some(low), Some(high)) = (
+            messages.iter().min_by_key(|m| snowflake_num(&m.id)),
+            messages.iter().max_by_key(|m| snowflake_num(&m.id)),
+        ) {
+            let interval = interval.unwrap_or((&low.id, &high.id));
+            let lower = interval
+                .0
+                .parse::<u64>()
+                .map_err(|_| StoreError::Data("invalid body page lower boundary".into()))?;
+            let upper = interval
+                .1
+                .parse::<u64>()
+                .map_err(|_| StoreError::Data("invalid body page upper boundary".into()))?;
+            if u128::from(lower) > snowflake_num(&low.id)
+                || u128::from(upper) < snowflake_num(&high.id)
+                || lower > upper
+            {
+                return Err(StoreError::Data(
+                    "body page interval excludes observed messages".into(),
+                ));
+            }
+            persist_page_coverage(
+                &tx,
+                channel,
+                interval,
+                (&low.id, &high.id),
+                fetched_at,
+                backfill_complete,
+            )?;
         } else {
-            let existing: Option<String> = tx
-                .query_row(
-                    "SELECT backfill FROM channel_sync WHERE channel_id = ?1",
-                    params![channel_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            existing.unwrap_or_else(|| "partial".to_string())
-        };
-        tx.execute(
-            "INSERT INTO channel_sync
-                (channel_id, last_synced_message_id, oldest_synced_message_id, last_fetched_at,
-                 backfill)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(channel_id) DO UPDATE SET
-                last_synced_message_id = excluded.last_synced_message_id,
-                oldest_synced_message_id = excluded.oldest_synced_message_id,
-                last_fetched_at = COALESCE(excluded.last_fetched_at, channel_sync.last_fetched_at),
-                backfill = excluded.backfill",
-            params![channel_id, last_synced, oldest_synced, fetched_at, backfill],
-        )?;
+            tx.execute("INSERT INTO channel_sync(channel_id,body_last_success_at,last_fetched_at) VALUES(?1,?2,?2) ON CONFLICT(channel_id) DO UPDATE SET body_last_success_at=excluded.body_last_success_at,last_fetched_at=excluded.last_fetched_at", params![channel, fetched_at])?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -904,14 +973,27 @@ impl Store {
         let conn = self.conn.lock().expect("store lock");
         conn.execute(
             "INSERT INTO channel_sync
-                (channel_id, last_message_id, last_activity_at, last_fetched_at, backfill)
-             VALUES (?1, ?2, ?3, ?4, 'partial')
+                (channel_id, last_message_id, last_activity_at, last_fetched_at, metadata_fetched_at, backfill)
+             VALUES (?1, ?2, ?3, ?4, ?4, 'partial')
              ON CONFLICT(channel_id) DO UPDATE SET
                 last_message_id = COALESCE(excluded.last_message_id, channel_sync.last_message_id),
                 last_activity_at = COALESCE(excluded.last_activity_at, channel_sync.last_activity_at),
+                metadata_fetched_at = excluded.metadata_fetched_at,
                 last_fetched_at = COALESCE(excluded.last_fetched_at, channel_sync.last_fetched_at)",
             params![channel_id, last_message_id, last_activity_at, last_fetched_at],
         )?;
+        Ok(())
+    }
+
+    /// Record a history request attempt without modifying its successful checkpoint.
+    pub fn record_body_fetch_attempt(&self, channel: &str, at: &str) -> Result<(), StoreError> {
+        self.conn.lock().expect("store lock").execute("INSERT INTO channel_sync(channel_id,body_fetch_attempted_at) VALUES(?1,?2) ON CONFLICT(channel_id) DO UPDATE SET body_fetch_attempted_at=excluded.body_fetch_attempted_at", params![channel, at])?;
+        Ok(())
+    }
+
+    /// Record a successful history page without inventing a message cursor for an empty page.
+    pub fn record_body_fetch_success(&self, channel: &str, at: &str) -> Result<(), StoreError> {
+        self.conn.lock().expect("store lock").execute("INSERT INTO channel_sync(channel_id,body_last_success_at,last_fetched_at) VALUES(?1,?2,?2) ON CONFLICT(channel_id) DO UPDATE SET body_last_success_at=excluded.body_last_success_at,last_fetched_at=excluded.last_fetched_at", params![channel, at])?;
         Ok(())
     }
 
@@ -940,7 +1022,8 @@ impl Store {
         let row = conn
             .query_row(
                 "SELECT channel_id, last_synced_message_id, oldest_synced_message_id,
-                        last_message_id, last_activity_at, last_fetched_at, backfill
+                        last_message_id, last_activity_at, last_fetched_at, backfill,
+                        metadata_fetched_at, body_fetch_attempted_at, body_last_success_at
                  FROM channel_sync WHERE channel_id = ?1",
                 params![channel_id],
                 row_to_channel_sync,
@@ -957,6 +1040,27 @@ impl Store {
         channel: Option<&str>,
         after: Option<&str>,
         limit: u32,
+    ) -> Result<ReadStateTargetPage, StoreError> {
+        self.read_state_target_selection(user, guild, channel, after, i64::from(limit.min(100) + 1))
+    }
+
+    /// Freeze all retained target IDs for internal immutable snapshot construction.
+    pub fn read_state_target_snapshot(
+        &self,
+        user: &str,
+        guild: Option<&str>,
+        channel: Option<&str>,
+    ) -> Result<ReadStateTargetPage, StoreError> {
+        self.read_state_target_selection(user, guild, channel, None, -1)
+    }
+
+    fn read_state_target_selection(
+        &self,
+        user: &str,
+        guild: Option<&str>,
+        channel: Option<&str>,
+        after: Option<&str>,
+        limit: i64,
     ) -> Result<ReadStateTargetPage, StoreError> {
         let conn = self.conn.lock().expect("store lock");
         let tx = conn.unchecked_transaction()?;
@@ -986,10 +1090,9 @@ impl Store {
                 WHERE (?4 IS NULL OR channel_id>?4) ORDER BY channel_id LIMIT ?5"
             ))?;
             let ids = stmt
-                .query_map(
-                    params![guild, channel, user, after, limit.min(100) + 1],
-                    |row| row.get(0),
-                )?
+                .query_map(params![guild, channel, user, after, limit], |row| {
+                    row.get(0)
+                })?
                 .collect::<Result<Vec<String>, _>>()?;
             ids
         };
@@ -1024,17 +1127,28 @@ impl Store {
                         COALESCE(json_extract(m.message_json,'$.metadata_state'),'requires_refetch')!='available'
                     ELSE 1 END),
                 (SELECT COUNT(*) FROM deleted_messages d JOIN scoped t ON t.channel_id=d.channel_id),
-                (SELECT COUNT(*) FROM scoped t JOIN channel_sync s ON s.channel_id=t.channel_id WHERE s.last_fetched_at IS NOT NULL)");
-        let (known_channels, message_count, metadata_pending, deletion_count, synced) = conn
-            .query_row(&sql, params![guild, channel], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
-                ))
-            })?;
+                (SELECT COUNT(*) FROM scoped t JOIN channel_sync s ON s.channel_id=t.channel_id WHERE s.body_last_success_at IS NOT NULL),
+                (SELECT COUNT(*) FROM scoped t JOIN channel_sync s ON s.channel_id=t.channel_id WHERE s.metadata_fetched_at IS NOT NULL),
+                (SELECT COUNT(*) FROM scoped t JOIN channel_sync s ON s.channel_id=t.channel_id WHERE s.body_last_success_at IS NOT NULL AND s.backfill='complete')");
+        let (
+            known_channels,
+            message_count,
+            metadata_pending,
+            deletion_count,
+            synced,
+            metadata_fetched,
+            history_complete,
+        ) = conn.query_row(&sql, params![guild, channel], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })?;
         Ok(SyncStatusSummary {
             known_channels: known_channels as u64,
             message_count: message_count as u64,
@@ -1042,6 +1156,8 @@ impl Store {
             deletion_count: deletion_count as u64,
             synced: synced as u64,
             unfetched: (known_channels - synced) as u64,
+            metadata_fetched: metadata_fetched as u64,
+            history_complete: history_complete as u64,
         })
     }
 
@@ -1061,7 +1177,7 @@ impl Store {
                 COALESCE(s.last_message_id,c.last_message_id,
                     (SELECT id FROM messages m WHERE m.channel_id=p.channel_id ORDER BY length(id) DESC,id DESC LIMIT 1)),
                 COALESCE(s.last_activity_at,(SELECT MAX(timestamp) FROM messages m WHERE m.channel_id=p.channel_id)),
-                s.last_fetched_at,COALESCE(s.backfill,'partial')
+                s.last_fetched_at,COALESCE(s.backfill,'partial'),s.metadata_fetched_at,s.body_fetch_attempted_at,s.body_last_success_at
             FROM page p LEFT JOIN channels c ON c.id=p.channel_id
             LEFT JOIN channel_sync s ON s.channel_id=p.channel_id ORDER BY p.channel_id");
         let mut stmt = conn.prepare(&sql)?;
@@ -1079,7 +1195,8 @@ impl Store {
         let conn = self.conn.lock().expect("store lock");
         let mut stmt = conn.prepare(
             "SELECT channel_id, last_synced_message_id, oldest_synced_message_id,
-                    last_message_id, last_activity_at, last_fetched_at, backfill
+                    last_message_id, last_activity_at, last_fetched_at, backfill,
+                        metadata_fetched_at, body_fetch_attempted_at, body_last_success_at
              FROM channel_sync
              ORDER BY COALESCE(last_fetched_at, '') DESC
              LIMIT ?1",
@@ -1382,6 +1499,72 @@ fn min_id(a: Option<&str>, b: &str) -> Option<String> {
     }
 }
 
+fn persist_page_coverage(
+    tx: &rusqlite::Transaction<'_>,
+    channel_id: &str,
+    interval: (&str, &str),
+    observed: (&str, &str),
+    fetched_at: &str,
+    backfill_complete: bool,
+) -> Result<(), StoreError> {
+    let (from_id, to_id) = interval;
+    let (observed_from, observed_to) = observed;
+    tx.execute(
+        "INSERT INTO coverage (channel_id, from_id, to_id) VALUES (?1, ?2, ?3)
+             ON CONFLICT(channel_id, from_id) DO UPDATE SET
+                to_id = MAX(CAST(coverage.to_id AS INTEGER), CAST(excluded.to_id AS INTEGER))",
+        params![channel_id, from_id, to_id],
+    )?;
+    // Merge overlapping / adjacent ranges for this channel.
+    merge_coverage(tx, channel_id)?;
+    // Advance the cursor with plain snowflake comparison (ids sort
+    // numerically; text comparison is not reliable for snowflakes).
+    let current: Option<(Option<String>, Option<String>)> = tx
+        .query_row(
+            "SELECT last_synced_message_id, oldest_synced_message_id
+                 FROM channel_sync WHERE channel_id = ?1",
+            params![channel_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (last_synced, oldest_synced) = match current {
+        Some((last, old)) => (
+            max_id(last.as_deref(), observed_to),
+            min_id(old.as_deref(), observed_from),
+        ),
+        None => (
+            Some(observed_to.to_string()),
+            Some(observed_from.to_string()),
+        ),
+    };
+    let backfill = if backfill_complete {
+        "complete".to_string()
+    } else {
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT backfill FROM channel_sync WHERE channel_id = ?1",
+                params![channel_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        existing.unwrap_or_else(|| "partial".to_string())
+    };
+    tx.execute(
+        "INSERT INTO channel_sync
+                (channel_id, last_synced_message_id, oldest_synced_message_id, last_fetched_at,
+                 backfill, body_last_success_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?4)
+             ON CONFLICT(channel_id) DO UPDATE SET
+                last_synced_message_id = excluded.last_synced_message_id,
+                oldest_synced_message_id = excluded.oldest_synced_message_id,
+                last_fetched_at = COALESCE(excluded.last_fetched_at, channel_sync.last_fetched_at),
+                backfill = excluded.backfill,
+                body_last_success_at = excluded.body_last_success_at",
+        params![channel_id, last_synced, oldest_synced, fetched_at, backfill],
+    )?;
+    Ok(())
+}
+
 fn row_to_channel_sync(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChannelSyncRow> {
     Ok(ChannelSyncRow {
         channel_id: row.get(0)?,
@@ -1391,6 +1574,9 @@ fn row_to_channel_sync(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChannelSyncR
         last_activity_at: row.get(4)?,
         last_fetched_at: row.get(5)?,
         backfill: row.get(6)?,
+        metadata_fetched_at: row.get(7)?,
+        body_fetch_attempted_at: row.get(8)?,
+        body_last_success_at: row.get(9)?,
     })
 }
 
@@ -1507,6 +1693,66 @@ mod tests {
     }
 
     #[test]
+    fn body_page_storage_failure_rolls_back_messages_and_checkpoint() {
+        let store = Store::open_in_memory().unwrap();
+        let messages = [message("10", "1", "7", "a"), message("20", "2", "7", "b")];
+        assert!(store
+            .save_body_page("1", &messages, None, "2026-01-01", false)
+            .is_err());
+        assert_eq!(store.message_count().unwrap(), 0);
+        assert!(store.channel_sync("1").unwrap().is_none());
+        store
+            .save_body_page("1", &messages[..1], Some(("1", "10")), "2026-01-02", false)
+            .unwrap();
+        assert_eq!(store.message_count().unwrap(), 1);
+        assert_eq!(
+            store
+                .channel_sync("1")
+                .unwrap()
+                .unwrap()
+                .body_last_success_at
+                .as_deref(),
+            Some("2026-01-02")
+        );
+    }
+
+    #[test]
+    fn target_snapshot_retains_all_ids_beyond_page_limit() {
+        let store = Store::open_in_memory().unwrap();
+        store.conn.lock().unwrap().execute_batch("WITH RECURSIVE ids(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM ids WHERE n<130) INSERT INTO channels(id,kind) SELECT printf('%03d',n),0 FROM ids;").unwrap();
+        let snapshot = store.read_state_target_snapshot("me", None, None).unwrap();
+        assert_eq!(snapshot.total, 130);
+        assert_eq!(snapshot.channel_ids.len(), 130);
+    }
+
+    #[test]
+    fn metadata_success_is_not_body_success_and_empty_body_keeps_unknown_cursor() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .record_channel_sync("10", None, None, "2026-01-01")
+            .unwrap();
+        let summary = store.sync_status_summary(None, Some("10")).unwrap();
+        assert_eq!((summary.synced, summary.unfetched), (0, 1));
+        assert_eq!(summary.metadata_fetched, 1);
+        store.record_body_fetch_attempt("10", "2026-01-02").unwrap();
+        assert_eq!(store.sync_status_summary(None, None).unwrap().synced, 0);
+        store.record_body_fetch_success("10", "2026-01-02").unwrap();
+        let row = store.channel_sync("10").unwrap().unwrap();
+        assert_eq!(row.metadata_fetched_at.as_deref(), Some("2026-01-01"));
+        assert_eq!(row.body_last_success_at.as_deref(), Some("2026-01-02"));
+        assert!(row.last_synced_message_id.is_none());
+        let summary = store.sync_status_summary(None, None).unwrap();
+        assert_eq!(
+            (summary.synced, summary.unfetched, summary.history_complete),
+            (1, 0, 0)
+        );
+        store.record_body_fetch_attempt("10", "2026-01-03").unwrap();
+        let row = store.channel_sync("10").unwrap().unwrap();
+        assert_eq!(row.body_last_success_at.as_deref(), Some("2026-01-02"));
+        assert_eq!(row.body_fetch_attempted_at.as_deref(), Some("2026-01-03"));
+    }
+
+    #[test]
     fn sync_status_counts_all_thirteen_thousand_unfetched_targets() {
         let store = Store::open_in_memory().unwrap();
         store
@@ -1535,7 +1781,7 @@ mod tests {
             "INSERT INTO channels(id,guild_id,kind,last_message_id) VALUES('10','g',0,'100'),('20','other',0,NULL);
              INSERT INTO messages(id,channel_id,guild_id,timestamp,content,message_json)
                  VALUES('100','10','g','2026-01-01','a',NULL),('300','30','g','2026-01-02','b','{broken');
-             INSERT INTO channel_sync(channel_id,last_fetched_at) VALUES('10','2026-01-01'),('40',NULL);
+             INSERT INTO channel_sync(channel_id,body_last_success_at) VALUES('10','2026-01-01'),('40',NULL);
              INSERT INTO deleted_messages(id,channel_id,observed_at) VALUES('deleted','10','2026-01-03');"
         ).unwrap();
         let summary = store.sync_status_summary(Some("g"), None).unwrap();
@@ -1657,7 +1903,7 @@ mod tests {
         assert_eq!(
             conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            3
+            5
         );
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r
@@ -1689,7 +1935,7 @@ mod tests {
         conn.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, backup_path TEXT); INSERT INTO schema_migrations VALUES(2,'2026-01-01',NULL); PRAGMA user_version=2; INSERT INTO coverage VALUES('200','1','9');").unwrap();
         drop(conn);
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(store.schema_version().unwrap(), 5);
         assert_eq!(store.coverage("200").unwrap()[0].to_id, "9");
         let conn = store.conn.lock().unwrap();
         for table in [

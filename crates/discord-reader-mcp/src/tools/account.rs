@@ -9,7 +9,10 @@ use serde::Deserialize;
 use serde_json::json;
 
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReadStateArgs {
+    /// Fixed snapshot by default; explicit live mode permits changing observations.
+    pub pagination_mode: Option<String>,
     /// Restrict to a guild; with channel_id this is an intersection.
     pub guild_id: Option<String>,
     /// Restrict to one channel or thread ID.
@@ -22,8 +25,24 @@ pub struct ReadStateArgs {
     pub cursor: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AccountSyncArgs {
+    pub guild_ids: Option<Vec<String>>,
+    pub channel_ids: Option<Vec<String>>,
+    pub exclude_guild_ids: Option<Vec<String>>,
+    pub exclude_channel_ids: Option<Vec<String>>,
+    pub include_dms: Option<bool>,
+    pub include_threads: Option<bool>,
+    /// Cache-only preview; makes no network request and creates no job.
+    pub dry_run: Option<bool>,
+    /// HTTP attempt upper bounds; retries reserve the client maximum conservatively.
+    pub max_discovery_http_requests: Option<u32>,
+    pub max_body_http_requests: Option<u32>,
+    pub max_messages: Option<u32>,
+    pub max_duration_seconds: Option<u32>,
+    /// Only 1 is supported.
+    pub concurrency: Option<u32>,
     /// At most this many targets per fair round, 1..1000, default 50.
     pub max_targets: Option<u32>,
     /// Messages per target page, 1..100, default 100.
@@ -64,7 +83,7 @@ impl DiscordReaderTools {
         &self,
         Parameters(args): Parameters<ReadStateArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.call_tool("get_read_state",json!({"guild_id":args.guild_id,"channel_id":args.channel_id,"refresh":args.refresh.unwrap_or(args.cursor.is_none()),"limit":args.limit,"cursor":args.cursor})).await
+        self.call_tool("get_read_state",json!({"pagination_mode":args.pagination_mode,"guild_id":args.guild_id,"channel_id":args.channel_id,"refresh":args.refresh.unwrap_or(args.cursor.is_none()),"limit":args.limit,"cursor":args.cursor})).await
     }
 
     /// Report aggregate account ledger counts, listing freshness, missing history and failures.
@@ -93,9 +112,12 @@ impl DiscordReaderTools {
         &self,
         Parameters(args): Parameters<AccountSyncArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let max_targets = limit_or(args.max_targets, 50, 1000)?;
-        let page_size = limit_or(args.page_size, 100, 100)?;
-        self.call_tool("start_account_sync",json!({"max_targets":max_targets,"page_size":page_size,"refresh_inventory":args.refresh_inventory.unwrap_or(true)})).await
+        limit_or(args.max_targets, 50, 1000)?;
+        limit_or(args.page_size, 100, 100)?;
+        let mut value = serde_json::to_value(&args)
+            .map_err(|_| ErrorData::internal_error("invalid sync arguments", None))?;
+        value["refresh_inventory"] = json!(args.refresh_inventory.unwrap_or(true));
+        self.call_tool("start_account_sync", value).await
     }
 
     /// Record explicit local notification, snooze, required action and completion confirmations.

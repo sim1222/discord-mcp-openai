@@ -233,13 +233,17 @@ unit は `NoNewPrivileges` / `PrivateTmp` / `ProtectSystem=strict` / `ProtectHom
 進め、`get_account_coverage` が列挙不足・履歴不明・失敗・鮮度を示します。
 状態取得の既定は集計のみです。詳細は `include_details=true` または `channel_id` を指定し、
 返された `next_cursor` を同じ対象範囲へ渡します。最大100対象/ページで、未取得をゼロ扱いしません。
-`get_read_state` の続きは `refresh=false` で取得します。
+`get_read_state` は既定で固定snapshotを使い、続きは `refresh=false` で取得します。
+`pagination_mode="live"` を指定すると従来のLIVEページングを使えます。
+同期は対象・除外・通信／本文／時間予算を指定でき、`dry_run=true` は無通信のpreviewです。
+`patch_inbox_state` はrevision付き部分更新、`notification_outbox` は永続dedup・claim・配送結果の記録を提供します。
+どちらもDiscordへの送信を行いません。
 取得対象を証明できない間はアカウント全体の complete は false です。
 `list_mentions` のページは永続スナップショットで固定されます。
 `record_inbox_state` は通知・保留・対応・完了の明示的なローカル確認を、Discord既読と
 独立して記録します。Discordへの通知送信やACKは行いません。
 
-仕様・実現範囲・残る制約は [account reading contract](docs/account-reading-contract.md)、
+仕様・実現範囲・残る制約は [account reading contract](docs/account-reading-contract.md)、[受入結果](docs/integration-acceptance.md)、
 取得元は [browser API evidence](docs/browser-api-evidence.md) を参照してください。
 
 ## MCP tools

@@ -8,7 +8,13 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 use crate::sqlite::StoreError;
 
-const VERSION: i64 = 3;
+const VERSION: i64 = 5;
+const V4_ADDED_COLUMNS: [(&str, &str); 4] = [
+    ("channel_sync", "metadata_fetched_at"),
+    ("channel_sync", "body_fetch_attempted_at"),
+    ("channel_sync", "body_last_success_at"),
+    ("inbox_workflow", "revision"),
+];
 const V2_ADDED_COLUMNS: [(&str, &str); 3] = [
     ("messages", "message_json"),
     ("messages", "fetched_at"),
@@ -46,17 +52,17 @@ pub(crate) fn migrate(conn: &mut Connection, schema: &str) -> Result<(), StoreEr
         log_schema(conn, &database)?;
         return Ok(());
     }
-    if version == 2 {
-        validate_versioned(conn, &canonical, 2)?;
+    if matches!(version, 2..=4) {
+        validate_versioned(conn, &canonical, version)?;
         let recorded: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=2)",
-            [],
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=?1)",
+            [version],
             |row| row.get(0),
         )?;
         if !recorded {
-            return Err(StoreError::Schema(
-                "version 2 has no migration history entry".into(),
-            ));
+            return Err(StoreError::Schema(format!(
+                "version {version} has no migration history entry"
+            )));
         }
     }
     let has_tables: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%')", [], |row| row.get(0))?;
@@ -77,9 +83,16 @@ pub(crate) fn migrate(conn: &mut Connection, schema: &str) -> Result<(), StoreEr
     }
     let had_fts = exists(&tx, "messages_fts")?;
     if has_tables {
-        for (table, column) in V2_ADDED_COLUMNS {
-            if !columns(&tx, table)?.iter().any(|c| c.name == column) {
-                tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"))?;
+        for (table, column) in V2_ADDED_COLUMNS.into_iter().chain(V4_ADDED_COLUMNS) {
+            if exists(&tx, table)? && !columns(&tx, table)?.iter().any(|c| c.name == column) {
+                let declaration = if (table, column) == ("inbox_workflow", "revision") {
+                    "INTEGER NOT NULL DEFAULT 1"
+                } else {
+                    "TEXT"
+                };
+                tx.execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+                ))?;
             }
         }
     }
@@ -154,7 +167,8 @@ fn validate_legacy(conn: &Connection, canonical: &Connection) -> Result<(), Stor
         }
         let actual = columns(conn, &table)?;
         for expected in columns(canonical, &table)? {
-            let optional = V2_ADDED_COLUMNS.contains(&(table.as_str(), expected.name.as_str()));
+            let optional = V2_ADDED_COLUMNS.contains(&(table.as_str(), expected.name.as_str()))
+                || V4_ADDED_COLUMNS.contains(&(table.as_str(), expected.name.as_str()));
             match actual.iter().find(|column| column.name == expected.name) {
                 Some(column) if column == &expected => {}
                 None if optional => {}
@@ -197,7 +211,18 @@ fn validate_versioned(
         "inbox_workflow",
     ];
     for (kind, name, sql) in objects(canonical)? {
-        if version == 2 && V3_OBJECTS.contains(&name.as_str()) {
+        if (version < 5 && name == "account_discovery_checkpoints")
+            || (version == 2 && V3_OBJECTS.contains(&name.as_str()))
+            || (version < 4
+                && matches!(
+                    name.as_str(),
+                    "notification_outbox"
+                        | "account_gaps"
+                        | "account_gaps_scope"
+                        | "member_observations"
+                        | "account_exclusions"
+                ))
+        {
             continue;
         }
         if kind == "table" {
@@ -208,6 +233,11 @@ fn validate_versioned(
             }
             let actual = columns(conn, &name)?;
             for expected in columns(canonical, &name)? {
+                if version < 4
+                    && V4_ADDED_COLUMNS.contains(&(name.as_str(), expected.name.as_str()))
+                {
+                    continue;
+                }
                 if !actual.contains(&expected) {
                     return Err(StoreError::Schema(format!(
                         "missing or incompatible column {name}.{}",
@@ -300,6 +330,28 @@ mod tests {
     use super::*;
 
     const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, content TEXT NOT NULL, message_json TEXT, fetched_at TEXT); CREATE TABLE IF NOT EXISTS channels(id TEXT PRIMARY KEY, last_message_id TEXT); CREATE INDEX IF NOT EXISTS messages_channel_idx ON messages(channel_id, CAST(id AS INTEGER)); CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(message_id UNINDEXED, content, tokenize='trigram');";
+
+    #[test]
+    fn version_three_mixed_timestamp_does_not_become_body_success() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let schema = format!("{SCHEMA} CREATE TABLE IF NOT EXISTS channel_sync(channel_id TEXT PRIMARY KEY,last_fetched_at TEXT,last_synced_message_id TEXT,metadata_fetched_at TEXT,body_fetch_attempted_at TEXT,body_last_success_at TEXT);");
+        let old = schema
+            .replace("    metadata_fetched_at TEXT,\n", "")
+            .replace("    body_fetch_attempted_at TEXT,\n", "")
+            .replace("    body_last_success_at TEXT,\n", "")
+            .replace(
+                ",metadata_fetched_at TEXT,body_fetch_attempted_at TEXT,body_last_success_at TEXT",
+                "",
+            );
+        conn.execute_batch(&old).unwrap();
+        conn.execute_batch(HISTORY).unwrap();
+        conn.execute_batch("INSERT INTO schema_migrations(version,applied_at) VALUES(3,'2026-01-01'); PRAGMA user_version=3; INSERT INTO channel_sync(channel_id,last_fetched_at,last_synced_message_id) VALUES('1','2026-01-01','10');").unwrap();
+        migrate(&mut conn, &schema).unwrap();
+        migrate(&mut conn, &schema).unwrap();
+        let row: (String, String, bool) = conn.query_row("SELECT last_fetched_at,last_synced_message_id,metadata_fetched_at IS NULL AND body_fetch_attempted_at IS NULL AND body_last_success_at IS NULL FROM channel_sync", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(row, ("2026-01-01".into(), "10".into(), true));
+        assert_eq!(schema_version(&conn).unwrap(), 5);
+    }
 
     #[test]
     fn legacy_rows_keep_unknown_metadata_and_migration_is_repeatable() {

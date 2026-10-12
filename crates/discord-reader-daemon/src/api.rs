@@ -71,6 +71,21 @@ fn api_error(error: discord_api::DiscordError) -> RpcError {
     rpc_error_from_api(ApiError::from_discord_error(&error, None), None)
 }
 
+fn member_cache_error(
+    error: discord_store::StoreError,
+    stage: &str,
+    historical: Value,
+) -> RpcError {
+    let mut error = store_error(error);
+    if let Some(data) = error.data.as_mut() {
+        data["error"]["operation"] = json!("get_member");
+        data["error"]["cache_stage"] = json!(stage);
+        data["error"]["role_membership_status"] = json!("unknown");
+        data["error"]["last_observed"] = historical;
+    }
+    error
+}
+
 fn store_error(error: discord_store::StoreError) -> RpcError {
     tracing::error!(%error, code = error.code(), "cache operation failed");
     RpcError::structured(
@@ -197,6 +212,37 @@ fn inbox_snapshot_page(
 }
 
 impl DaemonApi {
+    async fn ensure_target_execution(&self, channel: &str) -> Result<(), RpcError> {
+        if !self
+            .store
+            .has_execution_restrictions()
+            .map_err(store_error)?
+        {
+            return Ok(());
+        }
+        let user = self.me_user_id().await?;
+        if self
+            .store
+            .target_sync_withheld(&user, channel)
+            .map_err(store_error)?
+        {
+            return Err(RpcError::structured(
+                -32006,
+                json!({"error":{"code":"ACQUISITION_WITHHELD","error_source":"orchestration","layer":"unknown","operation":"read_messages","channel_id":channel,"http_status":null,"discord_code":null,"retryable":false,"requires_user_action":true,"reason":"retained_restriction_requires_explicit_resolution","message":"target acquisition is withheld; inspect account gaps and exclusions"}}),
+            ));
+        }
+        if !self
+            .store
+            .target_execution_scope_known(&user, channel)
+            .map_err(store_error)?
+        {
+            return Err(RpcError::structured(
+                -32006,
+                json!({"error":{"code":"ACQUISITION_SCOPE_UNKNOWN","error_source":"orchestration","layer":"unknown","operation":"read_messages","channel_id":channel,"http_status":null,"discord_code":null,"retryable":false,"requires_user_action":true,"reason":"target_guild_or_parent_scope_not_proven","message":"target scope is unknown under retained restrictions; obtain metadata evidence before body access"}}),
+            ));
+        }
+        Ok(())
+    }
     pub fn new(client: SharedDiscordClient, store: Arc<Store>) -> Self {
         Self {
             client,
@@ -256,6 +302,11 @@ impl DaemonApi {
         after: Option<&str>,
         around: Option<&str>,
     ) -> Result<Vec<Message>, RpcError> {
+        self.ensure_target_execution(channel_id).await?;
+        let now = discord_store::sqlite::now_iso();
+        self.store
+            .record_body_fetch_attempt(channel_id, &now)
+            .map_err(store_error)?;
         let value = self
             .client
             .execute(DiscordRequest::GetMessages {
@@ -275,51 +326,37 @@ impl DaemonApi {
             .map(parse_message)
             .collect::<Result<_, _>>()
             .map_err(lookup_error)?;
-        self.store.insert_messages(&messages).map_err(store_error)?;
-
-        // Record confirmed coverage + the resume cursor for this page.
-        if !messages.is_empty() {
-            let min_id = messages
-                .iter()
-                .map(|m| m.id.clone())
-                .min_by_key(|id| snowflake_num(id));
-            let max_id = messages
-                .iter()
-                .map(|m| m.id.clone())
-                .max_by_key(|id| snowflake_num(id));
-            if let (Some(min_id), Some(max_id)) = (min_id, max_id) {
-                let now = discord_store::sqlite::now_iso();
-                let from_id = after
-                    .and_then(|id| id.parse::<u128>().ok())
-                    .map(|id| id.saturating_add(1).to_string())
-                    .unwrap_or_else(|| min_id.clone());
-                let to_id = before
-                    .and_then(|id| id.parse::<u128>().ok())
-                    .map(|id| id.saturating_sub(1).to_string())
-                    .unwrap_or_else(|| max_id.clone());
-                // A `before` page that comes back short reached the channel's
-                // beginning: the backfill is complete.
-                let backfill_complete =
-                    before.is_some() && (messages.len() as u32) < limit.min(100);
-                self.store
-                    .record_page_coverage(
-                        channel_id,
-                        (&from_id, &to_id),
-                        (&min_id, &max_id),
-                        &now,
-                        backfill_complete,
-                    )
-                    .map_err(store_error)?;
-                self.store
-                    .record_channel_sync(channel_id, None, None, &now)
-                    .map_err(store_error)?;
-                if backfill_complete {
-                    self.store
-                        .mark_backfill_complete(channel_id, &now)
-                        .map_err(store_error)?;
-                }
-            }
-        }
+        let min_id = messages
+            .iter()
+            .map(|m| m.id.clone())
+            .min_by_key(|id| snowflake_num(id));
+        let max_id = messages
+            .iter()
+            .map(|m| m.id.clone())
+            .max_by_key(|id| snowflake_num(id));
+        let interval = min_id.as_ref().zip(max_id.as_ref()).map(|(low, high)| {
+            let from = after
+                .and_then(|id| id.parse::<u128>().ok())
+                .map(|id| id.saturating_add(1).to_string())
+                .unwrap_or_else(|| low.clone());
+            let to = before
+                .and_then(|id| id.parse::<u128>().ok())
+                .map(|id| id.saturating_sub(1).to_string())
+                .unwrap_or_else(|| high.clone());
+            (from, to)
+        });
+        let history_end = before.is_some() && messages.len() < limit.min(100) as usize;
+        self.store
+            .save_body_page(
+                channel_id,
+                &messages,
+                interval
+                    .as_ref()
+                    .map(|(low, high)| (low.as_str(), high.as_str())),
+                &discord_store::sqlite::now_iso(),
+                history_end,
+            )
+            .map_err(store_error)?;
         Ok(messages)
     }
 
@@ -422,6 +459,10 @@ impl DaemonApi {
         if message.referenced_message.is_some()
             || message.referenced_message_status.as_deref() == Some("deleted")
         {
+            return;
+        }
+        if self.ensure_target_execution(&ref_channel).await.is_err() {
+            message.referenced_message_status = Some("acquisition_withheld".into());
             return;
         }
         match DiscordMessageLookup::new(Arc::clone(&self.client))
@@ -764,7 +805,9 @@ impl DaemonApi {
         let entries: Vec<Value> = hits
             .iter()
             .map(|h| {
-                let workflow=self.store.inbox_workflow(&me_id,&h.channel_id,&h.view.id).map_err(store_error)?;
+                let revision=self.store.inbox_workflow_revision(&me_id,&h.channel_id,&h.view.id).map_err(store_error)?;
+                let workflow=revision.as_ref().map(|state|&state.workflow);
+                let delivery=self.store.notification_delivery_summary(&me_id,&h.channel_id,&h.view.id).map_err(store_error)?;
                 let read=read_observation.as_ref().map(|snapshot|crate::read_state::classify_message_read(snapshot,&h.channel_id,&h.view.id,read_as_of)).unwrap_or(json!({"status":"unknown","reason":"read_state_not_observed"}));
                 Ok(json!({
                     "message": h.view,
@@ -776,11 +819,14 @@ impl DaemonApi {
                     "read_status": read["status"],
                     "read_status_reason": read["reason"],
                     "read_evidence": read,
-                    "notification_status":if workflow.as_ref().and_then(|state|state.notified_at.as_ref()).is_some(){"notified"}else{"not_recorded"},
+                    "notification_status":if workflow.as_ref().and_then(|state|state.notified_at.as_ref()).is_some(){"notified"}else{delivery.notification_status},
+                    "notification_delivery_evidence":delivery,
                     "action_required":workflow.as_ref().and_then(|state|state.action_required),
                     "action_evidence":workflow.as_ref().and_then(|state|state.action_evidence.as_deref()),
                     "completion_status":if workflow.as_ref().and_then(|state|state.completed_at.as_ref()).is_some(){"confirmed_complete"}else{"not_confirmed"},
                     "workflow":workflow,
+                    "workflow_version":revision.as_ref().map_or(0,|state|state.version),
+                    "attention_candidates":crate::attention::candidates(&h.view),
                     "workflow_source":"explicit_local_confirmation",
                     "discord_mention_notification_count": null,
                     "reply_notification_status": "unknown",
@@ -912,10 +958,42 @@ fn snowflake_num(id: &str) -> u128 {
 
 #[async_trait::async_trait]
 impl ReaderApi for DaemonApi {
+    async fn get_inbox_state(
+        &self,
+        params: crate::local_state::InboxItemParams,
+    ) -> Result<Value, RpcError> {
+        crate::local_state::get_inbox_state(&self.store, &self.me_user_id().await?, params)
+    }
+    async fn patch_inbox_state(
+        &self,
+        params: crate::local_state::InboxPatchParams,
+    ) -> Result<Value, RpcError> {
+        crate::local_state::patch_inbox_state(&self.store, &self.me_user_id().await?, params)
+    }
+    async fn get_account_gaps(
+        &self,
+        params: crate::local_state::GapListParams,
+    ) -> Result<Value, RpcError> {
+        crate::local_state::get_account_gaps(&self.store, &self.me_user_id().await?, params)
+    }
+    async fn record_account_gap(
+        &self,
+        params: crate::local_state::GapRecordParams,
+    ) -> Result<Value, RpcError> {
+        crate::local_state::record_account_gap(&self.store, &self.me_user_id().await?, params)
+    }
+    async fn notification_outbox(
+        &self,
+        params: crate::local_state::NotificationParams,
+    ) -> Result<Value, RpcError> {
+        crate::local_state::notification_outbox(&self.store, &self.me_user_id().await?, params)
+    }
     async fn ping(&self) -> Result<Value, RpcError> {
         // Deliberately touches neither Discord nor the cache: this is the
         // health check for the RPC socket.
-        Ok(json!({"ok": true}))
+        Ok(
+            json!({"ok": true,"build":{"version":env!("CARGO_PKG_VERSION"),"source_revision":option_env!("DISCORD_READER_BUILD_SHA").filter(|value|*value!="unknown"),"source_revision_source":"build_argument"}}),
+        )
     }
 
     async fn list_guilds(&self) -> Result<Value, RpcError> {
@@ -1026,6 +1104,7 @@ impl ReaderApi for DaemonApi {
     }
 
     async fn get_message(&self, params: MessageParams) -> Result<Value, RpcError> {
+        self.ensure_target_execution(&params.channel_id).await?;
         let mut message = DiscordMessageLookup::new(Arc::clone(&self.client))
             .lookup(&params.channel_id, &params.message_id)
             .await
@@ -1038,6 +1117,7 @@ impl ReaderApi for DaemonApi {
     }
 
     async fn message_context(&self, params: ContextParams) -> Result<Value, RpcError> {
+        self.ensure_target_execution(&params.channel_id).await?;
         // The message itself, then the surrounding conversation.
         let mut message = DiscordMessageLookup::new(Arc::clone(&self.client))
             .lookup(&params.channel_id, &params.message_id)
@@ -1285,6 +1365,15 @@ impl ReaderApi for DaemonApi {
     }
 
     async fn get_read_state(&self, params: ReadStateParams) -> Result<Value, RpcError> {
+        let mode = params.pagination_mode.as_deref().unwrap_or("snapshot");
+        if !matches!(mode, "snapshot" | "live") || !(1..=100).contains(&params.limit.unwrap_or(50))
+        {
+            return Err(RpcError::invalid_params(
+                "pagination_mode must be snapshot or live; limit must be 1..100",
+            ));
+        }
+        let pinned = mode == "snapshot";
+        let snapshot_query = json!({"operation":"get_read_state","guild_id":params.guild_id,"channel_id":params.channel_id,"sort":"channel_id_lexicographic_ascending","pagination_mode":"snapshot"}).to_string();
         for id in [params.guild_id.as_deref(), params.channel_id.as_deref()]
             .into_iter()
             .flatten()
@@ -1300,6 +1389,22 @@ impl ReaderApi for DaemonApi {
             return Err(RpcError::invalid_params(
                 "read-state continuation requires refresh=false",
             ));
+        }
+        if pinned {
+            if let Some(cursor) = params.cursor.clone() {
+                let store = Arc::clone(&self.store);
+                return tokio::task::spawn_blocking(move || {
+                    crate::read_snapshot::resume(
+                        &store,
+                        &user,
+                        &snapshot_query,
+                        &cursor,
+                        params.limit.unwrap_or(50),
+                    )
+                })
+                .await
+                .map_err(|_| RpcError::internal("read snapshot task failed"))?;
+            }
         }
         let mut query = crate::status_query::StatusQuery::new(
             StatusParams {
@@ -1362,7 +1467,9 @@ impl ReaderApi for DaemonApi {
                     },
                 }
             } else {
-                store
+                if pinned {
+                    store.read_state_target_snapshot(&user, params.guild_id.as_deref(), None).map_err(store_error)?
+                } else {store
                     .read_state_target_page(
                         &user,
                         params.guild_id.as_deref(),
@@ -1370,11 +1477,11 @@ impl ReaderApi for DaemonApi {
                         query.after.as_deref(),
                         query.limit,
                     )
-                    .map_err(store_error)?
+                    .map_err(store_error)?}
             };
             query.bind_basis(&targets.target_basis)?;
             let has_more = targets.channel_ids.len() > query.limit as usize;
-            targets.channel_ids.truncate(query.limit as usize);
+            if !pinned { targets.channel_ids.truncate(query.limit as usize); }
             let next_cursor = if has_more {
                 targets.channel_ids.last().map(|id| query.next_cursor(id))
             } else {
@@ -1387,6 +1494,18 @@ impl ReaderApi for DaemonApi {
             response["has_more"] = json!(has_more);
             response["next_cursor"] = json!(next_cursor);
             response["limit"] = json!(query.limit);
+            response["pagination_mode"] = json!(if pinned {"snapshot"}else{"live"});
+            if !pinned {
+                response["counts"]["discord_scope_mention_total"] = Value::Null;
+                response["counts"]["basis"] = json!("returned_live_page_at_as_of");
+                response["counts"]["page_observed_mention_sum"] = response["counts"]["observed_mention_sum"].clone();
+            }
+            response["observation_values_complete"] = response["complete"].clone();
+            response["complete"] = json!(false);
+            response["page_complete"] = json!(true);
+            response["scope_complete"] = json!(false);
+            response["history_complete"] = json!(false);
+            response["continuous_coverage"] = json!(false);
             response["scope"]["guild_id"] = json!(params.guild_id);
             response["discord_guild_badge_count"] = Value::Null;
             response["guild_badge_reason"] = json!("browser_aggregation_not_reproduced");
@@ -1397,7 +1516,10 @@ impl ReaderApi for DaemonApi {
                 params.channel_id.as_deref(),
             )
             .map_err(store_error)?;
-            Ok(response)
+            if pinned {
+                response["scope"] = json!({"guild_id":params.guild_id,"channel_id":params.channel_id,"sort":"channel_id_lexicographic_ascending"});
+                crate::read_snapshot::capture(&store,&user,&snapshot_query,response,query.limit)
+            } else { Ok(response) }
         })
         .await
         .map_err(|_| RpcError::internal("read-state inspection task failed"))?
@@ -1462,17 +1584,52 @@ impl ReaderApi for DaemonApi {
     }
 
     async fn start_account_sync(&self, params: AccountSyncParams) -> Result<Value, RpcError> {
-        let max_targets = params.max_targets.unwrap_or(50);
-        let page_size = params.page_size.unwrap_or(100);
-        if !(1..=1000).contains(&max_targets) || !(1..=100).contains(&page_size) {
-            return Err(RpcError::invalid_params(
-                "max_targets must be 1..1000 and page_size 1..100",
-            ));
+        let mut options = crate::rpc::validate_account_sync(&params)?;
+        if params.dry_run == Some(true) {
+            let cached_user = self.me_id.lock().expect("me_id lock").clone();
+            return match cached_user {
+                Some(user) => {
+                    crate::account_sync::preview_account_sync(&self.store, &user, &options)
+                        .map_err(store_error)
+                }
+                None => Ok(
+                    json!({"dry_run":true,"job_id":null,"network_requests":0,"state_changes":0,"metadata_reading":"cache_only","account_user_id":null,"selected_targets":null,"permission_status":"unknown","reason":"authenticated_identity_not_cached","scope":options.scope,"complete":false}),
+                ),
+            };
         }
         let permit = Arc::clone(&self.account_sync_lock)
             .try_lock_owned()
             .map_err(|_| RpcError::invalid_params("an account sync job is already running"))?;
-        let user = self.me_user_id().await?;
+        if self.me_id.lock().expect("me_id lock").is_none() {
+            let reservation = discord_api::DiscordClient::max_attempts_per_request();
+            if options.max_discovery_http_requests < reservation {
+                return Err(RpcError::invalid_params(
+                    "discovery budget cannot cover uncached identity lookup",
+                ));
+            }
+            options.identity_http_reservation = reservation;
+        }
+        let identity_started = std::time::Instant::now();
+        let user = tokio::time::timeout(std::time::Duration::from_secs(u64::from(options.max_duration_seconds)),self.me_user_id()).await
+            .map_err(|_|RpcError::structured(-32005,json!({"error":{"code":"timeout","error_source":"transport","operation":"start_account_sync","retryable":true,"http_status":null,"discord_code":null,"message":"identity lookup exceeded synchronization time budget"}})))??;
+        let remaining = std::time::Duration::from_secs(u64::from(options.max_duration_seconds))
+            .saturating_sub(identity_started.elapsed());
+        options.execution_timeout = Some(remaining);
+        if remaining.is_zero() {
+            return Err(RpcError::invalid_params(
+                "synchronization time budget exhausted before job creation",
+            ));
+        }
+        crate::account_sync::merge_persistent_exclusions(&self.store, &user, &mut options)
+            .map_err(store_error)?;
+        self.store
+            .persist_account_exclusions(
+                &user,
+                &options.scope.exclude_guild_ids,
+                &options.scope.exclude_channel_ids,
+                &discord_store::sqlite::now_iso(),
+            )
+            .map_err(store_error)?;
         let id = format!(
             "account-{}-{}",
             std::process::id(),
@@ -1488,18 +1645,8 @@ impl ReaderApi for DaemonApi {
         let task_id = id.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let _ = crate::account_sync::run_account_sync(
-                client,
-                store,
-                task_id,
-                user,
-                crate::account_sync::AccountSyncOptions {
-                    max_targets,
-                    page_size,
-                    refresh_inventory: params.refresh_inventory,
-                },
-            )
-            .await;
+            let _ =
+                crate::account_sync::run_account_sync(client, store, task_id, user, options).await;
         });
         Ok(json!({"job_id":id,"scope":"account","complete":false}))
     }
@@ -1519,9 +1666,12 @@ impl ReaderApi for DaemonApi {
         let user_auth = self.client.token_kind() == discord_api::TokenKind::User;
         Ok(json!({
             "auth": if user_auth {"user"} else {"bot"},
+            "build":{"version":env!("CARGO_PKG_VERSION"),"source_revision":option_env!("DISCORD_READER_BUILD_SHA").filter(|value|*value!="unknown"),"schema_version":self.store.schema_version().map_err(store_error)?},
             "authenticated_user_id":user,
             "read_state":{"supported":user_auth,"source":"discord_gateway_ready","discord_mention_count_supported":user_auth,"guild_badge_supported":false,"guild_badge_reason":"browser_aggregation_not_reproduced","reason":if user_auth{Value::Null}else{json!("user_authentication_required")}},
             "events":{"supported":"partial","mode":"on_demand_ready_snapshot","continuous_subscription":false,"reason":"continuous_event_subscription_not_implemented"},
+            "client_afk":{"supported":false,"enabled":false,"reason":"insufficient_session_state","presence_updates_sent":false,"mobile_push_recovery_verified":false,"mobile_call_recovery_verified":false},
+            "message_change_detection":{"continuous_coverage":false,"observed_before_deletion_guaranteed":false,"edits":"explicit_refetch_only","deletions":"explicit_evidence_only","reason":"changes_between_observations_and_pre_observation_deletion_not_guaranteed"},
             "methods": {
                 "ping": {"supported": true},
                 "get_me": {"supported": true},
@@ -1531,6 +1681,11 @@ impl ReaderApi for DaemonApi {
                 "start_account_sync":{"supported":true,"mode":"bounded_fair_round","automatic_background":false},
                 "cancel_sync":{"supported":true,"scope":"local_account_sync_job"},
                 "record_inbox_state":{"supported":true,"scope":"explicit_local_confirmation","discord_modified":false},
+                "get_inbox_state":{"supported":true,"source":"local_workflow"},
+                "patch_inbox_state":{"supported":true,"expected_version_required":true,"discord_modified":false},
+                "get_account_gaps":{"supported":true,"source":"local_evidence"},
+                "record_account_gap":{"supported":true,"source":"caller_reported","does_not_change_caller_approval":true},
+                "notification_outbox":{"supported":true,"delivery":"local_bookkeeping_only","external_send":false},
                 "list_guilds": {"supported": true},
                 "list_channels": {"supported": true},
                 "list_dms": {"supported": true},
@@ -1556,7 +1711,7 @@ impl ReaderApi for DaemonApi {
                 "get_message_events": {"supported": true},
                 "get_attachment": {"supported": true}
             },
-            "tool_contract_revision":5,
+            "tool_contract_revision":6,
             "limitations": [
                 "read-only: only GET requests are issued; no write operations exist",
                 "GetGuildActiveThreads is bot-only (20002) for user accounts; list_threads uses per-channel/thread-search endpoints",
@@ -1568,6 +1723,7 @@ impl ReaderApi for DaemonApi {
     }
 
     async fn get_message_raw(&self, params: MessageParams) -> Result<Value, RpcError> {
+        self.ensure_target_execution(&params.channel_id).await?;
         let found = DiscordMessageLookup::new(Arc::clone(&self.client))
             .lookup(&params.channel_id, &params.message_id)
             .await
@@ -1596,6 +1752,7 @@ impl ReaderApi for DaemonApi {
                 "channel_id is required for search_server_side",
             ));
         };
+        self.ensure_target_execution(&channel_id).await?;
         let offset = params
             .next_cursor
             .as_deref()
@@ -1781,15 +1938,16 @@ impl ReaderApi for DaemonApi {
                 for row in page {
                     let envelope=store.coverage_envelope(&row.channel_id).map_err(store_error)?;
                     let (from,to,gaps)=envelope.map_or((None,None,false),|(from,to,gaps)|(Some(from),Some(to),gaps));
-                    coverage.push(json!({"channel_id":row.channel_id,"covered_from":from,"covered_to":to,"has_gaps":gaps,"backfill":row.backfill,"last_synced_message_id":row.last_synced_message_id,"oldest_synced_message_id":row.oldest_synced_message_id,"last_message_id":row.last_message_id,"last_activity_at":row.last_activity_at,"last_fetched_at":row.last_fetched_at}));
+                    coverage.push(json!({"channel_id":row.channel_id,"covered_from":from,"covered_to":to,"has_gaps":gaps,"backfill":row.backfill,"last_synced_message_id":row.last_synced_message_id,"oldest_synced_message_id":row.oldest_synced_message_id,"last_message_id":row.last_message_id,"last_activity_at":row.last_activity_at,"last_fetched_at":row.last_fetched_at,"metadata_fetched_at":row.metadata_fetched_at,"body_fetch_attempted_at":row.body_fetch_attempted_at,"body_last_success_at":row.body_last_success_at,"body_synced":row.body_last_success_at.is_some()}));
                 }
             }
             let account=user.as_deref().map(|user|crate::account_sync::account_coverage_scoped(&store,user,guild,channel).map_err(store_error)).transpose()?;
-            Ok(json!({"db_id":format!("discord-cache-{}",std::process::id()),"generated_at":discord_store::sqlite::now_iso(),"cached_messages":counts.message_count,"schema_version":store.schema_version().map_err(store_error)?,"messages_requiring_refetch":counts.metadata_pending,"channels_tracked":counts.known_channels,"synced":counts.synced,"unfetched":counts.unfetched,"scope":"cached_targets","target_scope":{"guild_id":guild,"channel_id":channel},"complete":false,"account_coverage":account,"coverage":coverage,"details_included":query.details,"limit":query.limit,"has_more":if query.details {Some(has_more)} else {None},"next_cursor":next_cursor,"deletions_observed":counts.deletion_count,"metrics":metrics}))
+            Ok(json!({"db_id":format!("discord-cache-{}",std::process::id()),"generated_at":discord_store::sqlite::now_iso(),"cached_messages":counts.message_count,"schema_version":store.schema_version().map_err(store_error)?,"messages_requiring_refetch":counts.metadata_pending,"channels_tracked":counts.known_channels,"synced":counts.synced,"body_synced":counts.synced,"metadata_fetched":counts.metadata_fetched,"history_complete_targets":counts.history_complete,"unfetched":counts.unfetched,"scope":"cached_targets","target_scope":{"guild_id":guild,"channel_id":channel},"complete":false,"account_coverage":account,"coverage":coverage,"details_included":query.details,"limit":query.limit,"has_more":if query.details {Some(has_more)} else {None},"next_cursor":next_cursor,"deletions_observed":counts.deletion_count,"metrics":metrics}))
         }).await.map_err(|_|RpcError::internal("status inspection task failed"))?
     }
 
     async fn start_sync(&self, params: SyncStartParams) -> Result<Value, RpcError> {
+        crate::rpc::validate_sync_start(&params)?;
         let scope = params.scope.as_deref().unwrap_or("changed_channels");
         if !matches!(
             scope,
@@ -1845,12 +2003,39 @@ impl ReaderApi for DaemonApi {
         }
         targets.sort();
         targets.dedup();
+        let original_targets = targets.len();
+        let mut execution_user = self.me_id.lock().expect("me_id lock").clone();
+        if self
+            .store
+            .has_execution_restrictions()
+            .map_err(store_error)?
+        {
+            let user = self.me_user_id().await?;
+            execution_user = Some(user.clone());
+            let mut allowed = Vec::new();
+            for target in targets {
+                if !self
+                    .store
+                    .target_sync_withheld(&user, &target)
+                    .map_err(store_error)?
+                    && self
+                        .store
+                        .target_execution_scope_known(&user, &target)
+                        .map_err(store_error)?
+                {
+                    allowed.push(target);
+                }
+            }
+            targets = allowed;
+        }
         let channels_total = targets.len();
         let state = json!({
             "job_id": job_id,
             "scope": scope,
             "status": "running",
             "channels_total": channels_total,
+            "channels_withheld": original_targets-channels_total,
+            "complete":false,
             "channels_done": 0,
             "channels_failed": [],
             "started_at": started_at,
@@ -1867,7 +2052,7 @@ impl ReaderApi for DaemonApi {
         let job_id_task = job_id.clone();
         tokio::spawn(async move {
             if scope == "refetch" {
-                let cache = SqliteRefetchCache::new(store);
+                let cache = SqliteRefetchCache::with_execution_policy(store, execution_user);
                 let lookup = DiscordMessageLookup::new(client);
                 let progress = SyncJobProgress {
                     jobs,
@@ -1887,6 +2072,31 @@ impl ReaderApi for DaemonApi {
             let mut done = 0u64;
             let mut failed: Vec<Value> = Vec::new();
             for channel_id in &targets {
+                let policy = match execution_user.as_deref() {
+                    Some(user) => {
+                        store
+                            .target_sync_withheld(user, channel_id)
+                            .and_then(|withheld| {
+                                Ok(withheld
+                                    || (store.has_execution_restrictions()?
+                                        && !store
+                                            .target_execution_scope_known(user, channel_id)?))
+                            })
+                    }
+                    None => store.has_execution_restrictions(),
+                };
+                match policy {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        failed.push(json!({"channel_id":channel_id,"error":{"code":"execution_withheld","retryable":false,"http_status":null,"discord_code":null}}));
+                        continue;
+                    }
+                    Err(error) => {
+                        failed.push(json!({"channel_id":channel_id,"error":{"code":error.code(),"error_source":"cache","retryable":error.retryable()}}));
+                        continue;
+                    }
+                }
+
                 let req = DiscordRequest::GetMessages {
                     channel_id: channel_id.clone(),
                     limit: 50,
@@ -1898,21 +2108,16 @@ impl ReaderApi for DaemonApi {
                     Ok(value) => {
                         let result = (|| -> Result<(), Value> {
                             let messages = serde_json::from_value::<Vec<Message>>(value).map_err(|_| json!({"error_source": "daemon", "code": "INVALID_PAYLOAD", "operation": "start_sync", "retryable": false}))?;
-                            store.insert_messages(&messages).map_err(|error| json!({"error_source": "cache", "code": error.code(), "operation": "start_sync", "retryable": error.retryable()}))?;
-                            if let (Some(min), Some(max)) = (
-                                messages
-                                    .iter()
-                                    .map(|m| m.id.clone())
-                                    .min_by_key(|i| snowflake_num(i)),
-                                messages
-                                    .iter()
-                                    .map(|m| m.id.clone())
-                                    .max_by_key(|i| snowflake_num(i)),
-                            ) {
-                                let now = discord_store::sqlite::now_iso();
-                                store.record_coverage(channel_id, &min, &max, &now, false).map_err(|error| json!({"error_source": "cache", "code": error.code(), "operation": "start_sync", "retryable": error.retryable()}))?;
-                                store.record_channel_sync(channel_id, Some(&max), None, &now).map_err(|error| json!({"error_source": "cache", "code": error.code(), "operation": "start_sync", "retryable": error.retryable()}))?;
-                            }
+                            let min = messages
+                                .iter()
+                                .map(|m| m.id.clone())
+                                .min_by_key(|id| snowflake_num(id));
+                            let max = messages
+                                .iter()
+                                .map(|m| m.id.clone())
+                                .max_by_key(|id| snowflake_num(id));
+                            store.save_body_page(channel_id,&messages,min.as_deref().zip(max.as_deref()),&discord_store::sqlite::now_iso(),false)
+                                .map_err(|error|json!({"error_source":"cache","code":error.code(),"operation":"start_sync","retryable":error.retryable()}))?;
                             Ok(())
                         })();
                         match result {
@@ -1934,6 +2139,8 @@ impl ReaderApi for DaemonApi {
             }
             let mut reg = jobs.lock().expect("jobs lock");
             if let Some(entry) = reg.get_mut(&job_id_task) {
+                entry["channels_done"] = json!(done);
+                entry["channels_failed"] = json!(failed);
                 entry["status"] = json!(if failed.is_empty() {
                     "done"
                 } else {
@@ -1988,13 +2195,25 @@ impl ReaderApi for DaemonApi {
                 }));
             }
         }
+        let historical = self
+            .store
+            .member_observation(&me_id, &params.guild_id)
+            .map_err(|error| member_cache_error(error, "observation_read", Value::Null))?;
+        let historical = json!(historical);
         let value = self
             .client
             .execute_for(&DiscordRequest::GetOwnGuildMember {
                 guild_id: params.guild_id.clone(),
             })
             .await
-            .map_err(|api| rpc_error_from_api(api, Some(json!({"guild_id": params.guild_id}))))?;
+            .map_err(|api| {
+                let mut error = rpc_error_from_api(api, Some(json!({"guild_id": params.guild_id})));
+                if let Some(data) = error.data.as_mut() {
+                    data["error"]["role_membership_status"] = json!("unknown");
+                    data["error"]["last_observed"] = historical.clone();
+                }
+                error
+            })?;
         let user_id = value
             .get("user")
             .and_then(|u| u.get("id"))
@@ -2009,26 +2228,42 @@ impl ReaderApi for DaemonApi {
             .get("joined_at")
             .and_then(|j| j.as_str())
             .map(str::to_string);
-        let role_ids: Vec<String> = value
-            .get("roles")
-            .and_then(|r| r.as_array())
-            .map(|a| {
+        let role_ids: Option<Vec<String>> =
+            value.get("roles").and_then(|r| r.as_array()).and_then(|a| {
                 a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .map(|v| {
+                        v.as_str()
+                            .filter(|id| id.parse::<u64>().is_ok_and(|id| id > 0))
+                            .map(str::to_string)
+                    })
                     .collect()
-            })
-            .unwrap_or_default();
+            });
+        let Some(role_ids) = role_ids else {
+            return Ok(
+                json!({"member":{"user_id":user_id,"guild_id":params.guild_id,"nick":nick,"joined_at":joined_at,"roles":null,"role_membership_status":"unknown","role_membership_reason":"invalid_member_roles_response","last_observed":historical}}),
+            );
+        };
         let mut roles = Vec::new();
         for role_id in &role_ids {
-            let name = self.store.role_name(role_id).map_err(store_error)?;
+            let name = self
+                .store
+                .role_name(role_id)
+                .map_err(|error| member_cache_error(error, "role_name_read", historical.clone()))?;
             roles.push(json!({"id": role_id, "name": name}));
         }
+        let observed_at = discord_store::sqlite::now_iso();
+        self.store
+            .save_member_observation(&me_id, &params.guild_id, &role_ids, &observed_at)
+            .map_err(|error| member_cache_error(error, "observation_write", historical))?;
         Ok(json!({
             "member": {
                 "user_id": user_id,
                 "guild_id": params.guild_id,
                 "nick": nick,
                 "roles": roles,
+                "role_membership_status": "observed",
+                "role_membership_reason": null,
+                "observed_at": observed_at,
                 "joined_at": joined_at,
             }
         }))
@@ -2061,6 +2296,7 @@ impl ReaderApi for DaemonApi {
     }
 
     async fn get_attachment(&self, params: MessageParams) -> Result<Value, RpcError> {
+        self.ensure_target_execution(&params.channel_id).await?;
         let message = DiscordMessageLookup::new(Arc::clone(&self.client))
             .lookup(&params.channel_id, &params.message_id)
             .await
@@ -2092,6 +2328,327 @@ fn snowflake_key(id: &str) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn unknown_channel_scope_cannot_bypass_persisted_excluded_guild() {
+        let mock = spawn_mock(VecDeque::new()).await;
+        let (api, store) = api_for(&mock.base);
+        *api.me_id.lock().unwrap() = Some("7".into());
+        store
+            .persist_account_exclusions("7", &["42".into()], &[], "2026-01-01T00:00:00Z")
+            .unwrap();
+        let error = api
+            .get_message_raw(MessageParams {
+                channel_id: "200".into(),
+                message_id: "300".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("ACQUISITION_SCOPE_UNKNOWN"));
+        assert!(mock.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn persisted_approval_gap_blocks_alternate_body_routes() {
+        let mock = spawn_mock(VecDeque::new()).await;
+        let (api, store) = api_for(&mock.base);
+        *api.me_id.lock().unwrap() = Some("7".into());
+        store
+            .record_account_gap(&discord_store::sqlite::account::AccountGapOutcome {
+                account_user_id: "7",
+                channel_id: "200",
+                layer: "orchestration_approval",
+                status: "denied",
+                reason: "caller_reported_rejection",
+                observed_at: "2026-01-01T00:00:00Z",
+                evidence: &json!({"source":"caller_reported"}),
+            })
+            .unwrap();
+        assert!(api
+            .recent_messages(ChannelParams {
+                channel_id: "200".into(),
+                limit: 10
+            })
+            .await
+            .is_err());
+        assert!(api
+            .get_message(MessageParams {
+                channel_id: "200".into(),
+                message_id: "300".into()
+            })
+            .await
+            .is_err());
+        for operation in ["raw", "attachment"] {
+            let params = MessageParams {
+                channel_id: "200".into(),
+                message_id: "300".into(),
+            };
+            let result = if operation == "raw" {
+                api.get_message_raw(params).await
+            } else {
+                api.get_attachment(params).await
+            };
+            assert!(result.is_err());
+        }
+        let search: SearchParams =
+            serde_json::from_value(json!({"query":"fixture","channel_id":"200"})).unwrap();
+        assert!(api.search_server_side(search).await.is_err());
+        let started = api
+            .start_sync(SyncStartParams {
+                channel_ids: Some(vec!["200".into()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let progress = api
+            .get_sync_progress(SyncProgressParams {
+                job_id: started["job_id"].as_str().unwrap().into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(progress["progress"]["channels_withheld"], 1);
+        assert!(mock.requests.lock().unwrap().is_empty());
+        assert!(store.channel_sync("200").unwrap().is_none());
+    }
+    #[tokio::test]
+    async fn sync_preview_and_invalid_or_insufficient_budget_do_not_touch_network_or_jobs() {
+        let mock = spawn_mock(VecDeque::new()).await;
+        let (api, _) = api_for(&mock.base);
+        let preview = api
+            .start_account_sync(AccountSyncParams {
+                dry_run: Some(true),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(preview["network_requests"], 0);
+        assert!(preview["job_id"].is_null());
+        for params in [
+            AccountSyncParams {
+                channel_ids: Some(vec![]),
+                ..Default::default()
+            },
+            AccountSyncParams {
+                max_discovery_http_requests: Some(0),
+                ..Default::default()
+            },
+        ] {
+            assert!(api.start_account_sync(params).await.is_err());
+        }
+        assert!(api.jobs.lock().unwrap().is_empty());
+        assert!(mock.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_body_success_and_member_cache_failures_remain_distinct() {
+        let mock = spawn_mock(VecDeque::from([(200, "[]".into())])).await;
+        let (api, store) = api_for(&mock.base);
+        api.recent_messages(ChannelParams {
+            channel_id: "200".into(),
+            limit: 10,
+        })
+        .await
+        .unwrap();
+        let state = store.channel_sync("200").unwrap().unwrap();
+        assert!(state.body_last_success_at.is_some());
+        assert!(state.last_synced_message_id.is_none());
+        assert_eq!(
+            store.sync_status_summary(None, Some("200")).unwrap().synced,
+            1
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("member.sqlite3");
+        let store = Arc::new(Store::open(&path).unwrap());
+        store
+            .save_member_observation("7", "42", &["555".into()], "2026-01-01T00:00:00Z")
+            .unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("INSERT INTO roles(id,guild_id,name) VALUES('555','42',X'00')")
+            .unwrap();
+        let mock = spawn_mock(VecDeque::from([(
+            200,
+            r#"{"user":{"id":"7"},"roles":["555"]}"#.into(),
+        )]))
+        .await;
+        let (base, _) = api_for(&mock.base);
+        let api = DaemonApi::new(base.client, store);
+        *api.me_id.lock().unwrap() = Some("7".into());
+        let error = api
+            .get_member(MemberParams {
+                guild_id: "42".into(),
+                user_id: None,
+            })
+            .await
+            .unwrap_err();
+        let data = error.data.unwrap();
+        assert_eq!(error.code, -32004);
+        assert_eq!(data["error"]["code"], "CACHE_SQLITE_ERROR");
+        assert_eq!(data["error"]["cache_stage"], "role_name_read");
+        assert_eq!(data["error"]["last_observed"]["role_ids"], json!(["555"]));
+        assert_eq!(data["error"]["role_membership_status"], "unknown");
+        assert_eq!(data["error"]["retryable"], false);
+    }
+    #[tokio::test]
+    async fn known_empty_body_without_cursor_remains_successful_when_caller_withholds_next_read() {
+        let mock = spawn_mock(VecDeque::from([(200, "[]".into())])).await;
+        let (api, store) = api_for(&mock.base);
+        *api.me_id.lock().unwrap() = Some("7".into());
+        store
+            .upsert_channel(
+                &serde_json::from_value(json!({"id":"200","guild_id":"42","type":0})).unwrap(),
+            )
+            .unwrap();
+        api.recent_messages(ChannelParams {
+            channel_id: "200".into(),
+            limit: 10,
+        })
+        .await
+        .unwrap();
+        let before = store.channel_sync("200").unwrap().unwrap();
+        store
+            .record_account_gap(&discord_store::sqlite::account::AccountGapOutcome {
+                account_user_id: "7",
+                channel_id: "200",
+                layer: "orchestration_approval",
+                status: "denied",
+                reason: "caller_reported_rejection",
+                observed_at: "2026-01-01T00:00:00Z",
+                evidence: &json!({"source":"caller_reported"}),
+            })
+            .unwrap();
+        let error = api
+            .recent_messages(ChannelParams {
+                channel_id: "200".into(),
+                limit: 10,
+            })
+            .await
+            .unwrap_err();
+        let data = error.data.unwrap();
+        assert!(data["error"]["http_status"].is_null());
+        assert!(data["error"]["discord_code"].is_null());
+        let after = store.channel_sync("200").unwrap().unwrap();
+        assert_eq!(after.body_last_success_at, before.body_last_success_at);
+        assert!(after.last_synced_message_id.is_none());
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn member_observation_read_and_write_failures_preserve_storage_classification() {
+        for stage in ["observation_read", "observation_write"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("member.sqlite3");
+            let store = Arc::new(Store::open(&path).unwrap());
+            store
+                .save_member_observation("7", "42", &["555".into()], "2026-01-01T00:00:00Z")
+                .unwrap();
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            if stage == "observation_read" {
+                conn.execute_batch("DROP TABLE member_observations")
+                    .unwrap();
+            } else {
+                conn.execute_batch("CREATE TRIGGER refuse_member_observation BEFORE INSERT ON member_observations BEGIN SELECT RAISE(ABORT,'fixture write failure'); END").unwrap();
+            }
+            let mock = spawn_mock(VecDeque::from([(
+                200,
+                r#"{"user":{"id":"7"},"roles":["555"]}"#.into(),
+            )]))
+            .await;
+            let (base, _) = api_for(&mock.base);
+            let api = DaemonApi::new(base.client, store);
+            *api.me_id.lock().unwrap() = Some("7".into());
+            let error = api
+                .get_member(MemberParams {
+                    guild_id: "42".into(),
+                    user_id: None,
+                })
+                .await
+                .unwrap_err();
+            let data = error.data.unwrap();
+            assert_eq!(error.code, -32004);
+            assert_eq!(
+                data["error"]["code"],
+                if stage == "observation_read" {
+                    "CACHE_SCHEMA_MISMATCH"
+                } else {
+                    "CACHE_SQLITE_ERROR"
+                }
+            );
+            assert_eq!(data["error"]["cache_stage"], stage);
+            assert_eq!(data["error"]["role_membership_status"], "unknown");
+            assert_eq!(data["error"]["retryable"], false);
+            assert!(data["error"]["http_status"].is_null());
+            if stage == "observation_read" {
+                assert!(mock.requests.lock().unwrap().is_empty());
+            } else {
+                assert_eq!(data["error"]["last_observed"]["role_ids"], json!(["555"]));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_read_state_continuation_keeps_old_membership_and_observation() {
+        let mock = spawn_mock(VecDeque::new()).await;
+        let (api, store) = api_for(&mock.base);
+        *api.me_id.lock().unwrap() = Some("7".into());
+        let at = discord_store::sqlite::now_iso();
+        let old=serde_json::from_value(json!({"account_user_id":"7","observed_at":at,"version":"1","partial":false,"inventory_complete":false,"channels":[],"read_states":[{"channel_id":"200","discord_mention_count":0,"last_read_message_id":"100","observed_at":at,"availability":"available","version":"1"},{"channel_id":"201","discord_mention_count":2,"observed_at":at,"availability":"partial","reason":"last_read_position_unobserved","version":"1"}]})).unwrap();
+        store.save_account_observation(&old).unwrap();
+        let first = api
+            .get_read_state(ReadStateParams {
+                refresh: false,
+                limit: Some(1),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let cursor = first["next_cursor"].as_str().unwrap().to_string();
+        let newer=serde_json::from_value(json!({"account_user_id":"7","observed_at":discord_store::sqlite::now_iso(),"version":"2","partial":false,"inventory_complete":false,"channels":[],"read_states":[{"channel_id":"201","discord_mention_count":9,"observed_at":at,"availability":"available","version":"2"},{"channel_id":"202","discord_mention_count":0,"observed_at":at,"availability":"available","version":"2"}]})).unwrap();
+        store.save_account_observation(&newer).unwrap();
+        let next = api
+            .get_read_state(ReadStateParams {
+                refresh: false,
+                limit: Some(1),
+                cursor: Some(cursor),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(next["read_state"][0]["discord_mention_count"], 2);
+        assert_eq!(first["as_of"], next["as_of"]);
+        assert_eq!(first["snapshot_id"], next["snapshot_id"]);
+        assert_eq!(next["channels_total_known"], 2);
+        assert_eq!(next["has_more"], false);
+        assert!(mock.requests.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn malformed_member_roles_remain_unknown_instead_of_empty() {
+        for roles in [
+            serde_json::Value::Null,
+            serde_json::json!([12]),
+            serde_json::json!(["invalid"]),
+        ] {
+            let mock = spawn_mock(VecDeque::from([(
+                200,
+                serde_json::json!({"user":{"id":"7"},"roles":roles}).to_string(),
+            )]))
+            .await;
+            let (api, _) = api_for(&mock.base);
+            *api.me_id.lock().unwrap() = Some("7".into());
+            let result = api
+                .get_member(MemberParams {
+                    guild_id: "42".into(),
+                    user_id: None,
+                })
+                .await
+                .unwrap();
+            assert!(result["member"]["roles"].is_null());
+            assert_eq!(result["member"]["role_membership_status"], "unknown");
+            assert_eq!(
+                result["member"]["role_membership_reason"],
+                "invalid_member_roles_response"
+            );
+        }
+    }
     use super::*;
     use crate::rpc::{BeforeParams, ChannelParams, ContextParams, MessageParams, SearchParams};
     use discord_api::{DiscordClient, Token, TokenKind};
@@ -2099,6 +2656,66 @@ mod tests {
     use std::sync::Mutex;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn legacy_sync_rechecks_policy_before_each_body_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (api, store) = api_for(&base);
+        let policy_store = Arc::clone(&store);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                if line.is_empty() {
+                    break;
+                }
+            }
+            policy_store
+                .persist_account_exclusions(
+                    "9",
+                    &[],
+                    &["20".into()],
+                    &discord_store::sqlite::now_iso(),
+                )
+                .unwrap();
+            write
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]")
+                .await
+                .unwrap();
+        });
+        let started = api
+            .start_sync(SyncStartParams {
+                scope: Some("all".into()),
+                channel_ids: Some(vec!["10".into(), "20".into()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let report = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let value = api
+                    .get_sync_progress(SyncProgressParams {
+                        job_id: started["job_id"].as_str().unwrap().into(),
+                    })
+                    .await
+                    .unwrap();
+                if value["progress"]["status"] != "running" {
+                    break value;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(report["progress"]["channels_done"], 1);
+        assert_eq!(
+            report["progress"]["channels_failed"][0]["error"]["code"],
+            "execution_withheld"
+        );
+        assert!(store.channel_sync("20").unwrap().is_none());
+    }
 
     #[tokio::test]
     async fn refetch_sync_job_refreshes_legacy_rows_and_reports_remaining() {
@@ -2359,7 +2976,7 @@ mod tests {
         assert_eq!(all_channels["checked"]["messages_requiring_refetch"], 1);
         assert_eq!(status["cached_messages"], 1);
         assert_eq!(status["channels_tracked"], 1);
-        assert_eq!(status["schema_version"], 3);
+        assert_eq!(status["schema_version"], 5);
         assert_eq!(status["messages_requiring_refetch"], 1);
         assert!(api
             .list_changed_channels(ChangedChannelsParams {
@@ -2912,6 +3529,7 @@ mod tests {
         for (channel, expected) in [("200", json!(0)), ("201", Value::Null)] {
             let result = api
                 .get_read_state(ReadStateParams {
+                    pagination_mode: None,
                     channel_id: Some(channel.into()),
                     refresh: false,
                     ..Default::default()
@@ -2944,6 +3562,7 @@ mod tests {
                 max_targets: Some(1),
                 page_size: Some(1),
                 refresh_inventory: false,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -2988,7 +3607,7 @@ mod tests {
         let (api, _) = api_for(&mock.base);
         *api.me_id.lock().unwrap() = Some("7".into());
         let value = api.get_capabilities().await.unwrap();
-        assert_eq!(value["tool_contract_revision"], 5);
+        assert_eq!(value["tool_contract_revision"], 6);
         assert_eq!(
             value["methods"]["messages_after"]["continuation_argument"],
             "after_message_id"
@@ -3425,6 +4044,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_read_state_page_sum_is_not_scope_total() {
+        let mock = spawn_mock(VecDeque::new()).await;
+        let (api, store) = api_for(&mock.base);
+        *api.me_id.lock().unwrap() = Some("7".into());
+        for id in ["200", "201"] {
+            store
+                .upsert_channel(
+                    &serde_json::from_value(json!({"id":id,"guild_id":"42","type":0})).unwrap(),
+                )
+                .unwrap();
+        }
+        let at = Utc::now().to_rfc3339();
+        let observation=serde_json::from_value(json!({"account_user_id":"7","observed_at":at,"version":"42","partial":false,"inventory_complete":false,"read_states":[{"channel_id":"200","discord_mention_count":3,"observed_at":at,"availability":"available","source":"discord_gateway_ready"}],"channels":[]})).unwrap();
+        api.retain_account_observation(&observation).unwrap();
+        let result = api
+            .get_read_state(ReadStateParams {
+                pagination_mode: Some("live".into()),
+                guild_id: Some("42".into()),
+                limit: Some(1),
+                refresh: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(result["counts"]["observed_mention_sum"], 3);
+        assert!(result["has_more"].as_bool().unwrap());
+        assert!(result["counts"]["discord_scope_mention_total"].is_null());
+        assert_eq!(result["counts"]["basis"], "returned_live_page_at_as_of");
+    }
+
+    #[tokio::test]
     async fn status_defaults_to_summary_and_cached_guild_read_state_is_unknown() {
         let mock = spawn_mock(VecDeque::new()).await;
         let (api, store) = api_for(&mock.base);
@@ -3442,6 +4092,7 @@ mod tests {
         assert!(status["coverage"].as_array().unwrap().is_empty());
         let state = api
             .get_read_state(ReadStateParams {
+                pagination_mode: Some("live".into()),
                 guild_id: Some("42".into()),
                 refresh: false,
                 ..Default::default()
@@ -3467,6 +4118,7 @@ mod tests {
             .unwrap();
         assert!(api
             .get_read_state(ReadStateParams {
+                pagination_mode: Some("live".into()),
                 guild_id: Some("42".into()),
                 refresh: false,
                 cursor: Some(cursor),

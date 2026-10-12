@@ -188,22 +188,123 @@ impl GatewayReadOperation<'_> {
     }
 }
 
+const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(30);
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
+
 pub(crate) async fn observe(token: &Token) -> Result<AccountObservation, ObservationError> {
-    tokio::time::timeout(Duration::from_secs(30), observe_ready(token))
-        .await
-        .map_err(|_| ObservationError::Timeout)?
+    let token = token.clone();
+    let (response, receiver) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + OBSERVATION_TIMEOUT;
+        let mut response = response;
+        let connection = tokio::select! {
+            _ = response.closed() => return,
+            result = tokio::time::timeout_at(deadline, tokio_tungstenite::connect_async("wss://gateway.discord.gg/?v=9&encoding=json")) => result,
+        };
+        match connection {
+            Ok(Ok((socket, _))) => {
+                observe_socket(socket, token, response, deadline, CLEANUP_TIMEOUT).await;
+            }
+            Ok(Err(_)) => {
+                let _ = response.send(Err(ObservationError::Transport));
+            }
+            Err(_) => {
+                let _ = response.send(Err(ObservationError::Timeout));
+            }
+        }
+    });
+    receiver.await.unwrap_or(Err(ObservationError::Transport))
 }
 
-async fn observe_ready(token: &Token) -> Result<AccountObservation, ObservationError> {
-    let (socket, _) =
-        tokio_tungstenite::connect_async("wss://gateway.discord.gg/?v=9&encoding=json")
-            .await
-            .map_err(|_| ObservationError::Transport)?;
-    receive_ready(socket, token).await
-}
-
-async fn receive_ready<S>(
+async fn observe_socket<S>(
     mut socket: tokio_tungstenite::WebSocketStream<S>,
+    token: Token,
+    mut response: tokio::sync::oneshot::Sender<Result<AccountObservation, ObservationError>>,
+    deadline: tokio::time::Instant,
+    cleanup_timeout: Duration,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let result = tokio::select! {
+        _ = response.closed() => None,
+        result = tokio::time::timeout_at(deadline, receive_ready_events(&mut socket, &token)) => {
+            Some(result.unwrap_or(Err(ObservationError::Timeout)))
+        }
+    };
+    let cleanup = tokio::time::timeout(cleanup_timeout, close_observation(&mut socket)).await;
+    let outcome = match cleanup {
+        Ok(Ok(())) => "completed",
+        Ok(Err(())) => "transport_failed",
+        Err(_) => "timed_out",
+    };
+    tracing::debug!(operation = "gateway_observation_cleanup", outcome);
+    if let Some(result) = result {
+        let _ = response.send(result);
+    }
+}
+
+async fn close_observation<S>(socket: &mut tokio_tungstenite::WebSocketStream<S>) -> Result<(), ()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+    let close = socket
+        .close(Some(CloseFrame {
+            code: CloseCode::Normal,
+            reason: "".into(),
+        }))
+        .await;
+    // Receiving a peer close queues its reply; flush it even if a new close is rejected.
+    socket.flush().await.map_err(|_| ())?;
+    close.map_err(|_| ())?;
+    while let Some(frame) = socket.next().await {
+        match frame {
+            Ok(Frame::Close(_)) => {
+                socket.flush().await.map_err(|_| ())?;
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(tokio_tungstenite::tungstenite::Error::ConnectionClosed) => return Ok(()),
+            Err(_) => return Err(()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+async fn receive_ready<S>(
+    socket: tokio_tungstenite::WebSocketStream<S>,
+    token: &Token,
+) -> Result<AccountObservation, ObservationError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    receive_ready_bounded(socket, token, OBSERVATION_TIMEOUT, CLEANUP_TIMEOUT).await
+}
+
+#[cfg(test)]
+async fn receive_ready_bounded<S>(
+    socket: tokio_tungstenite::WebSocketStream<S>,
+    token: &Token,
+    observation_timeout: Duration,
+    cleanup_timeout: Duration,
+) -> Result<AccountObservation, ObservationError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (response, receiver) = tokio::sync::oneshot::channel();
+    tokio::spawn(observe_socket(
+        socket,
+        token.clone(),
+        response,
+        tokio::time::Instant::now() + observation_timeout,
+        cleanup_timeout,
+    ));
+    receiver.await.unwrap_or(Err(ObservationError::Transport))
+}
+
+async fn receive_ready_events<S>(
+    socket: &mut tokio_tungstenite::WebSocketStream<S>,
     token: &Token,
 ) -> Result<AccountObservation, ObservationError>
 where
@@ -279,9 +380,7 @@ where
             Some(7 | 9) => return Err(ObservationError::SessionRejected),
             Some(0) if event["t"] == "READY" => {
                 let at = chrono::Utc::now().to_rfc3339();
-                let result = AccountObservation::from_ready(&event["d"], &at);
-                let _ = socket.close(None).await;
-                return result;
+                return AccountObservation::from_ready(&event["d"], &at);
             }
             _ => {}
         }
@@ -373,6 +472,178 @@ mod tests {
             ])
         );
         assert!(result["channels"].as_array().unwrap().is_empty());
+    }
+
+    async fn assert_normal_close(
+        server: &mut tokio_tungstenite::WebSocketStream<tokio::io::DuplexStream>,
+    ) {
+        let frame = tokio::time::timeout(Duration::from_secs(1), server.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(frame, Frame::Close(Some(ref close)) if close.code == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal)
+        );
+        server.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn timeout_and_caller_abort_attempt_normal_close() {
+        use tokio_tungstenite::{tungstenite::protocol::Role, WebSocketStream};
+        for abort in [false, true] {
+            let (client_io, server_io) = tokio::io::duplex(65536);
+            let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+            let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+            let token = Token::new("test-token").unwrap();
+            let task = tokio::spawn(async move {
+                receive_ready_bounded(
+                    client,
+                    &token,
+                    Duration::from_millis(50),
+                    Duration::from_millis(100),
+                )
+                .await
+            });
+            server
+                .send(Frame::Text(
+                    json!({"op":10,"d":{"heartbeat_interval":10000}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let identify = server.next().await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(identify.to_text().unwrap()).unwrap()["op"],
+                2
+            );
+            if abort {
+                task.abort();
+            }
+            assert_normal_close(&mut server).await;
+            let result = task.await;
+            if abort {
+                assert!(result.unwrap_err().is_cancelled());
+            } else {
+                assert!(matches!(result.unwrap(), Err(ObservationError::Timeout)));
+            }
+            assert!(tokio::time::timeout(Duration::from_secs(1), server.next())
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_and_protocol_rejection_close_with_code_1000() {
+        use tokio_tungstenite::{tungstenite::protocol::Role, WebSocketStream};
+        for ready in [false, true] {
+            let (client_io, server_io) = tokio::io::duplex(65536);
+            let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+            let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+            let token = Token::new("test-token").unwrap();
+            let task = tokio::spawn(async move { receive_ready(client, &token).await });
+            let event = if ready {
+                json!({"op":0,"t":"READY","d":{"user":{"id":"7"},"read_state":{"partial":false,"entries":[]},"guilds":[],"private_channels":[]}})
+            } else {
+                json!({"op":9})
+            };
+            server
+                .send(Frame::Text(event.to_string().into()))
+                .await
+                .unwrap();
+            assert_normal_close(&mut server).await;
+            let result = task.await.unwrap();
+            if ready {
+                assert!(result.is_ok());
+            } else {
+                assert!(matches!(result, Err(ObservationError::SessionRejected)));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unresponsive_peer_cannot_extend_cleanup_indefinitely() {
+        use tokio_tungstenite::{tungstenite::protocol::Role, WebSocketStream};
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        server
+            .send(Frame::Text("invalid json".into()))
+            .await
+            .unwrap();
+        let token = Token::new("test-token").unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            receive_ready_bounded(
+                client,
+                &token,
+                Duration::from_millis(100),
+                Duration::from_millis(25),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(ObservationError::InvalidPayload)));
+        // The peer deliberately does not read or acknowledge the close until cleanup ends.
+        assert!(
+            matches!(server.next().await.unwrap().unwrap(), Frame::Close(Some(ref close)) if close.code == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal)
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_close_is_flushed_and_worker_ends() {
+        use tokio_tungstenite::{
+            tungstenite::protocol::{frame::coding::CloseCode, CloseFrame, Role},
+            WebSocketStream,
+        };
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let token = Token::new("test-token").unwrap();
+        let task = tokio::spawn(async move { receive_ready(client, &token).await });
+        server
+            .close(Some(CloseFrame {
+                code: CloseCode::Normal,
+                reason: "".into(),
+            }))
+            .await
+            .unwrap();
+        assert_normal_close(&mut server).await;
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(ObservationError::SessionRejected)
+        ));
+    }
+
+    #[tokio::test]
+    async fn observation_errors_attempt_normal_close() {
+        use tokio_tungstenite::{tungstenite::protocol::Role, WebSocketStream};
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let task = tokio::spawn(async move {
+            server
+                .send(Frame::Text("invalid json".into()))
+                .await
+                .unwrap();
+            let frame = tokio::time::timeout(Duration::from_secs(1), server.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(frame, Frame::Close(Some(ref close)) if close.code == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal)
+            );
+            server.flush().await.unwrap();
+        });
+        let token = Token::new("test-token").unwrap();
+        assert!(matches!(
+            receive_ready(client, &token).await,
+            Err(ObservationError::InvalidPayload)
+        ));
+        task.await.unwrap();
     }
 
     #[tokio::test]

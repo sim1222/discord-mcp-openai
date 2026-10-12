@@ -19,10 +19,159 @@ use discord_store::{
 use serde_json::{json, Value};
 use std::sync::Arc;
 
+#[derive(Clone)]
 pub(crate) struct AccountSyncOptions {
     pub(crate) max_targets: u32,
     pub(crate) page_size: u8,
     pub(crate) refresh_inventory: bool,
+    pub(crate) scope: AccountScope,
+    pub(crate) max_discovery_http_requests: u32,
+    pub(crate) max_body_http_requests: u32,
+    pub(crate) max_messages: u32,
+    pub(crate) max_duration_seconds: u32,
+    pub(crate) identity_http_reservation: u32,
+    pub(crate) execution_timeout: Option<std::time::Duration>,
+}
+
+impl Default for AccountSyncOptions {
+    fn default() -> Self {
+        Self {
+            max_targets: 50,
+            page_size: 100,
+            refresh_inventory: true,
+            scope: AccountScope::default(),
+            max_discovery_http_requests: 3000,
+            max_body_http_requests: 3000,
+            max_messages: 100000,
+            max_duration_seconds: 60,
+            identity_http_reservation: 0,
+            execution_timeout: None,
+        }
+    }
+}
+
+#[derive(Clone, serde::Serialize)]
+pub(crate) struct AccountScope {
+    pub(crate) guild_ids: Option<Vec<String>>,
+    pub(crate) channel_ids: Option<Vec<String>>,
+    pub(crate) exclude_guild_ids: Vec<String>,
+    pub(crate) exclude_channel_ids: Vec<String>,
+    pub(crate) include_dms: bool,
+    pub(crate) include_threads: bool,
+}
+impl Default for AccountScope {
+    fn default() -> Self {
+        Self {
+            guild_ids: None,
+            channel_ids: None,
+            exclude_guild_ids: vec![],
+            exclude_channel_ids: vec![],
+            include_dms: true,
+            include_threads: true,
+        }
+    }
+}
+impl AccountScope {
+    fn allows(&self, channel: &str, guild: Option<&str>, parent: Option<&str>, kind: i32) -> bool {
+        if self
+            .exclude_channel_ids
+            .iter()
+            .any(|id| id == channel || Some(id.as_str()) == parent)
+            || guild.is_some_and(|guild| self.exclude_guild_ids.iter().any(|id| id == guild))
+        {
+            return false;
+        }
+        if !self.include_threads && matches!(kind, 10..=12) {
+            return false;
+        }
+        if guild.is_none() && (!self.include_dms || self.guild_ids.is_some()) {
+            return false;
+        }
+        if self
+            .guild_ids
+            .as_ref()
+            .is_some_and(|ids| !guild.is_some_and(|guild| ids.iter().any(|id| id == guild)))
+        {
+            return false;
+        }
+        !self.channel_ids.as_ref().is_some_and(|ids| {
+            !ids.iter()
+                .any(|id| id == channel || (self.include_threads && Some(id.as_str()) == parent))
+        })
+    }
+    fn target(&self, target: &AccountTarget) -> bool {
+        self.allows(
+            &target.channel_id,
+            target.guild_id.as_deref(),
+            target.parent_id.as_deref(),
+            target.kind,
+        )
+    }
+    fn channel(&self, channel: &Channel) -> bool {
+        self.allows(
+            &channel.id,
+            channel.guild_id.as_deref(),
+            channel.parent_id.as_deref(),
+            channel.kind,
+        )
+    }
+}
+
+struct HttpAttemptBudget {
+    limit: u32,
+    reserved: u32,
+}
+impl HttpAttemptBudget {
+    fn new(limit: u32) -> Self {
+        Self { limit, reserved: 0 }
+    }
+    fn reserve(&mut self, logical_requests: u32) -> bool {
+        let cost =
+            logical_requests.saturating_mul(discord_api::DiscordClient::max_attempts_per_request());
+        if cost > self.limit.saturating_sub(self.reserved) {
+            return false;
+        }
+        self.reserved += cost;
+        true
+    }
+}
+
+/// Apply durable user exclusions without clearing them through a new job scope.
+pub(crate) fn merge_persistent_exclusions(
+    store: &Store,
+    user: &str,
+    options: &mut AccountSyncOptions,
+) -> Result<(), StoreError> {
+    let (guilds, channels) = store.account_exclusions(user)?;
+    for guild in guilds {
+        if !options.scope.exclude_guild_ids.contains(&guild) {
+            options.scope.exclude_guild_ids.push(guild);
+        }
+    }
+    for channel in channels {
+        if !options.scope.exclude_channel_ids.contains(&channel) {
+            options.scope.exclude_channel_ids.push(channel);
+        }
+    }
+    Ok(())
+}
+
+/// Cache-only preview. Unknown discovery cost and permissions remain unknown.
+pub(crate) fn preview_account_sync(
+    store: &Store,
+    user: &str,
+    options: &AccountSyncOptions,
+) -> Result<Value, StoreError> {
+    let mut options = options.clone();
+    merge_persistent_exclusions(store, user, &mut options)?;
+    let all = store.account_targets(user)?;
+    let selected: Vec<_> = all
+        .iter()
+        .filter(|target| options.scope.target(target))
+        .collect();
+    Ok(
+        json!({"dry_run":true,"job_id":null,"network_requests":0,"state_changes":0,"metadata_reading":"cache_only","scope":options.scope,"known_targets":all.len(),"selected_targets":selected.len(),"excluded_or_out_of_scope":all.len()-selected.len(),"unknown_discovery_targets":null,"permission_status":"unknown","complete":false,"budgets":{"max_targets":options.max_targets,"max_discovery_http_requests":options.max_discovery_http_requests,"max_body_http_requests":options.max_body_http_requests,"max_messages":options.max_messages,"max_duration_seconds":options.max_duration_seconds,"concurrency":1,"reservation":"maximum_client_retry_attempts"}}),
+    )
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -50,6 +199,9 @@ trait AccountSource: Send + Sync {
 
 trait AccountSyncState: Send + Sync {
     fn targets(&self, user: &str, at: &str, limit: u32) -> Result<Vec<AccountTarget>, StoreError>;
+    fn withheld(&self, _user: &str, _channel: &str) -> Result<bool, StoreError> {
+        Ok(false)
+    }
     fn attempt(&self, user: &str, channel: &str, at: &str) -> Result<(), StoreError>;
     fn save_page(
         &self,
@@ -68,7 +220,20 @@ struct SqliteAccountState {
 }
 impl AccountSyncState for SqliteAccountState {
     fn targets(&self, user: &str, at: &str, limit: u32) -> Result<Vec<AccountTarget>, StoreError> {
-        self.store.due_account_targets(user, at, limit)
+        self.store
+            .due_account_targets(user, at, limit)?
+            .into_iter()
+            .filter_map(|target| match self.withheld(user, &target.channel_id) {
+                Ok(false) => Some(Ok(target)),
+                Ok(true) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect()
+    }
+    fn withheld(&self, user: &str, channel: &str) -> Result<bool, StoreError> {
+        Ok(self.store.target_sync_withheld(user, channel)?
+            || (self.store.has_execution_restrictions()?
+                && !self.store.target_execution_scope_known(user, channel)?))
     }
     fn attempt(&self, user: &str, channel: &str, at: &str) -> Result<(), StoreError> {
         self.store.record_account_attempt(user, channel, at)
@@ -120,6 +285,7 @@ impl GuildInventorySource for DiscordAccountSource {
     }
 }
 
+#[cfg(test)]
 struct GuildInventory {
     guilds: Vec<Guild>,
     exhausted: bool,
@@ -127,10 +293,12 @@ struct GuildInventory {
     error: Option<Value>,
 }
 
+#[cfg(test)]
 async fn collect_guild_inventory(
     source: &dyn GuildInventorySource,
     store: &Store,
     job: &str,
+    budget: &mut HttpAttemptBudget,
 ) -> Result<GuildInventory, AccountSyncError> {
     let mut result = GuildInventory {
         guilds: vec![],
@@ -141,6 +309,10 @@ async fn collect_guild_inventory(
     let mut seen = std::collections::HashSet::new();
     for _ in 0..1000 {
         if store.account_cancel_requested(job)? {
+            return Ok(result);
+        }
+        if !budget.reserve(1) {
+            result.error = Some(json!({"code":"discovery_http_budget_exhausted","retryable":true}));
             return Ok(result);
         }
         let page = source.guild_page(result.resume_after.clone()).await;
@@ -246,13 +418,40 @@ pub(crate) async fn run_account_sync(
     user: String,
     options: AccountSyncOptions,
 ) -> Result<Value, AccountSyncError> {
-    let result =
-        run_account_sync_inner(client, Arc::clone(&store), id.clone(), user, options).await;
+    let deadline = options
+        .execution_timeout
+        .unwrap_or_else(|| std::time::Duration::from_secs(options.max_duration_seconds.into()));
+    let result = match tokio::time::timeout(
+        deadline,
+        run_account_sync_inner(client, Arc::clone(&store), id.clone(), user, options),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(AccountSyncError {
+            data: json!({"error_source":"transport","code":"budget_timeout","retryable":true,"complete":false}),
+        }),
+    };
     if let Err(error) = &result {
         if let Some(mut job) = store.account_job(&id)? {
-            job.status = "failed".into();
+            if error.data["code"] == "budget_timeout" {
+                if let Some(channel) = job.progress["active_channel_id"].as_str() {
+                    store.fail_account_target(
+                        &job.account_user_id,
+                        channel,
+                        &now_iso(),
+                        &error.data,
+                    )?;
+                }
+            }
+            job.status = if error.data["code"] == "budget_timeout" {
+                "paused"
+            } else {
+                "failed"
+            }
+            .into();
             job.updated_at = now_iso();
-            job.progress["status"] = json!("failed");
+            job.progress["status"] = json!(job.status);
             job.progress["error"] = error.payload();
             job.progress["as_of"] = json!(job.updated_at);
             store.save_account_job(&job)?;
@@ -266,7 +465,7 @@ async fn run_account_sync_inner(
     store: Arc<Store>,
     id: String,
     user: String,
-    options: AccountSyncOptions,
+    mut options: AccountSyncOptions,
 ) -> Result<Value, AccountSyncError> {
     let mut job = store.account_job(&id)?.ok_or_else(|| AccountSyncError {
         data: json!({"code":"unknown_job","retryable":false}),
@@ -276,11 +475,16 @@ async fn run_account_sync_inner(
             data: json!({"code":"account_mismatch","retryable":false}),
         });
     }
+    merge_persistent_exclusions(&store, &user, &mut options)?;
+    job.progress["target_scope"] = json!(options.scope);
+    job.progress["identity_http_attempt_upper_bound"] = json!(options.identity_http_reservation);
+    job.progress["budgets"] = json!({"max_discovery_http_requests":options.max_discovery_http_requests,"max_body_http_requests":options.max_body_http_requests,"max_messages":options.max_messages,"max_duration_seconds":options.max_duration_seconds,"concurrency":1});
+    store.save_account_job(&job)?;
     if options.refresh_inventory && !store.account_cancel_requested(&id)? {
         job.status = "running".into();
         job.updated_at = now_iso();
         store.save_account_job(&job)?;
-        job.generation = refresh_inventory(&client, &store, &id, &user).await?;
+        job.generation = refresh_inventory(&client, &store, &id, &user, &options).await?;
     } else if let Some(inventory) = store.account_inventory(&user)? {
         job.generation = inventory.generation;
     }
@@ -304,13 +508,17 @@ async fn run_round(
     options: &AccountSyncOptions,
 ) -> Result<Value, AccountSyncError> {
     let at = now_iso();
-    let limit = options.page_size.clamp(1, 100);
-    let targets = state.targets(
-        &job.account_user_id,
-        &at,
-        options.max_targets.clamp(1, 1000),
-    )?;
+    let targets: Vec<_> = state
+        .targets(&job.account_user_id, &at, u32::MAX)?
+        .into_iter()
+        .filter(|target| options.scope.target(target))
+        .take(options.max_targets as usize)
+        .collect();
+    let mut body_budget = HttpAttemptBudget::new(options.max_body_http_requests);
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(options.max_duration_seconds.into());
     let mut failures = Vec::new();
+    let mut withheld_targets = Vec::new();
     let mut attempted = 0;
     let mut saved = 0;
     let mut messages_saved = 0;
@@ -320,10 +528,32 @@ async fn run_round(
             job.status = "cancelled".into();
             break;
         }
+        if state.withheld(&job.account_user_id, &target.channel_id)? {
+            withheld_targets.push(target.channel_id.clone());
+            continue;
+        }
+        let remaining_messages = options.max_messages.saturating_sub(messages_saved as u32);
+        if remaining_messages == 0
+            || !body_budget.reserve(1)
+            || tokio::time::Instant::now() >= deadline
+        {
+            job.status = "paused".into();
+            break;
+        }
+        let limit = options.page_size.min(remaining_messages.min(100) as u8);
         let attempt_at = now_iso();
         state.attempt(&job.account_user_id, &target.channel_id, &attempt_at)?;
         attempted += 1;
-        let result = source.page(target, limit).await;
+        job.progress["active_channel_id"] = json!(target.channel_id);
+        job.updated_at = attempt_at.clone();
+        state.progress(&job)?;
+        let result = match tokio::time::timeout_at(deadline, source.page(target, limit)).await {
+            Ok(result) => result,
+            Err(_) => {
+                job.status = "paused".into();
+                Err(json!({"error_source":"transport","code":"budget_timeout","retryable":true}))
+            }
+        };
         if state.cancelled(&job.job_id)? {
             job.status = "cancelled".into();
             break;
@@ -435,12 +665,15 @@ async fn run_round(
         job.updated_at = now_iso();
         job.progress = json!({"job_id":job.job_id,"scope":"account","account_user_id":job.account_user_id,"generation":job.generation,"as_of":job.updated_at,"status":"running","selected_targets":targets.len(),"attempted":attempted,"synced":saved,"messages_saved":messages_saved,"failures":failures.iter().take(20).map(failure_summary).collect::<Vec<_>>(),"failures_total":failures.len(),"failures_omitted":failures.len().saturating_sub(20),"complete":false});
         state.progress(&job)?;
+        if job.status == "paused" {
+            break;
+        }
     }
     if state.cancelled(&job.job_id)? {
         job.status = "cancelled".into();
     }
-    if job.status != "cancelled" {
-        job.status = if failures.is_empty() {
+    if job.status != "cancelled" && job.status != "paused" {
+        job.status = if failures.is_empty() && withheld_targets.is_empty() {
             "finished"
         } else {
             "partial"
@@ -448,7 +681,20 @@ async fn run_round(
         .into();
     }
     job.updated_at = now_iso();
-    job.progress = json!({"job_id":job.job_id,"scope":"account","account_user_id":job.account_user_id,"generation":job.generation,"as_of":job.updated_at,"status":job.status,"selected_targets":targets.len(),"attempted":attempted,"synced":saved,"messages_saved":messages_saved,"failures":failures.iter().take(20).map(failure_summary).collect::<Vec<_>>(),"failures_total":failures.len(),"failures_omitted":failures.len().saturating_sub(20),"cancel_reason":if job.status=="cancelled"{Some("user_requested")}else{None},"resume_cursor":{"account_user_id":job.account_user_id,"generation":job.generation,"source":"persisted_target_checkpoints"},"complete":false});
+    job.progress = json!({"job_id":job.job_id,"scope":"account","account_user_id":job.account_user_id,"generation":job.generation,"as_of":job.updated_at,"status":job.status,"selected_targets":targets.len(),"attempted":attempted,"synced":saved,"messages_saved":messages_saved,"failures":failures.iter().take(20).map(failure_summary).collect::<Vec<_>>(),"failures_total":failures.len(),"failures_omitted":failures.len().saturating_sub(20),"cancel_reason":if job.status=="cancelled"{Some("cancellation_requested")}else{None},"resume_cursor":{"account_user_id":job.account_user_id,"generation":job.generation,"source":"persisted_target_checkpoints"},"complete":false});
+    job.progress["withheld_count"] = json!(withheld_targets.len());
+    job.progress["withheld_targets"] = json!(withheld_targets.iter().take(20).collect::<Vec<_>>());
+    job.progress["withheld_omitted"] = json!(withheld_targets.len().saturating_sub(20));
+    job.progress["page_complete"] = json!(job.status == "finished" && saved == targets.len());
+    job.progress["scope_complete"] = json!(false);
+    job.progress["inventory_complete"] = json!(false);
+    job.progress["history_complete"] = json!(false);
+    job.progress["continuous_coverage"] = json!(false);
+    job.progress["target_scope"] = json!(options.scope);
+    job.progress["body_http_attempt_upper_bound"] = json!(body_budget.reserved);
+    job.progress["identity_http_attempt_upper_bound"] = json!(options.identity_http_reservation);
+    job.progress["budget_accounting"] = json!("conservative_maximum_client_retry_reservation");
+    job.progress["cancel_actor"] = json!("unknown");
     state.progress(&job)?;
     Ok(job.progress)
 }
@@ -502,78 +748,117 @@ async fn fetch_channels(
     )
 }
 
-async fn refresh_inventory(
-    client: &SharedDiscordClient,
-    store: &Store,
-    job: &str,
-    user: &str,
-) -> Result<String, AccountSyncError> {
-    let previous = store.account_inventory(user)?;
-    let mut thread_cursors = previous
-        .and_then(|inventory| {
-            inventory
-                .discovery
-                .get("thread_resume_cursors")
-                .and_then(Value::as_object)
-                .cloned()
-        })
-        .unwrap_or_default();
-    let at = now_iso();
-    let generation = format!("inventory:{job}");
-    store.begin_account_inventory(user, &generation, &at)?;
-    let mut failures = Vec::new();
-    let guild_source = DiscordAccountSource {
-        client: Arc::clone(client),
-    };
-    let guild_inventory = collect_guild_inventory(&guild_source, store, job).await?;
-    let guilds = guild_inventory.guilds;
-    if let Some(error) = guild_inventory.error {
-        failures.push(json!({"source":"guilds","error":error}));
-    }
-    let mut parents = Vec::new();
-    if !store.account_cancel_requested(job)? {
-        match fetch_channels(client, DiscordRequest::ListUserDmChannels).await {
-            Ok(channels) => {
-                store.observe_account_targets(user, &generation, &channels, &now_iso())?
-            }
-            Err(error) => failures.push(json!({"source":"dms","error":error})),
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+enum DiscoveryTask {
+    GuildPage {
+        after: Option<String>,
+    },
+    Dms,
+    GuildChannels {
+        guild_id: String,
+    },
+    Channel {
+        channel_id: String,
+    },
+    Threads {
+        parent: Box<Channel>,
+        cursor: Option<String>,
+    },
+}
+impl DiscoveryTask {
+    fn resource_key(&self) -> String {
+        match self {
+            Self::GuildPage { .. } => "guild_inventory".into(),
+            Self::Dms => "dm_inventory".into(),
+            Self::GuildChannels { guild_id } => format!("guild:{guild_id}"),
+            Self::Channel { channel_id } => format!("channel:{channel_id}"),
+            Self::Threads { parent, .. } => format!("thread_parent:{}", parent.id),
         }
     }
-    for guild in &guilds {
-        if store.account_cancel_requested(job)? {
-            break;
-        }
-        match fetch_channels(
-            client,
-            DiscordRequest::GetGuildChannels {
-                guild_id: guild.id.clone(),
-            },
-        )
-        .await
-        {
-            Ok(mut channels) => {
-                for channel in &mut channels {
-                    channel.guild_id = Some(guild.id.clone());
-                    store.upsert_channel(channel)?;
-                }
-                store.observe_account_targets(user, &generation, &channels, &now_iso())?;
-                parents.extend(
-                    channels
-                        .into_iter()
-                        .filter(|channel| matches!(channel.kind, 0 | 5 | 15 | 16)),
-                );
-            }
-            Err(error) => {
-                failures.push(json!({"source":"guild_channels","guild_id":guild.id,"error":error}))
-            }
+    fn requests(&self) -> u32 {
+        if matches!(self, Self::Threads { .. }) {
+            2
+        } else {
+            1
         }
     }
-    let listing = DiscordThreadListing::new(Arc::clone(client));
-    for parent in parents {
-        if store.account_cancel_requested(job)? {
-            break;
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DiscoveryCheckpoint {
+    pending: std::collections::VecDeque<DiscoveryTask>,
+    completed_at: Option<String>,
+    failures: Vec<Value>,
+    #[serde(default)]
+    blocked: Vec<String>,
+}
+impl DiscoveryCheckpoint {
+    fn initial(scope: &AccountScope) -> Self {
+        let mut pending = std::collections::VecDeque::new();
+        if let Some(ids) = &scope.channel_ids {
+            pending.extend(
+                ids.iter()
+                    .filter(|id| !scope.exclude_channel_ids.contains(id))
+                    .map(|id| DiscoveryTask::Channel {
+                        channel_id: id.clone(),
+                    }),
+            );
+        } else if let Some(ids) = &scope.guild_ids {
+            pending.extend(
+                ids.iter()
+                    .filter(|id| !scope.exclude_guild_ids.contains(id))
+                    .map(|id| DiscoveryTask::GuildChannels {
+                        guild_id: id.clone(),
+                    }),
+            );
+        } else {
+            pending.push_back(DiscoveryTask::GuildPage { after: None });
+            if scope.include_dms {
+                pending.push_back(DiscoveryTask::Dms);
+            }
         }
-        let cursor = thread_cursors.get(&parent.id).and_then(Value::as_str);
+        Self {
+            pending,
+            completed_at: None,
+            failures: vec![],
+            blocked: vec![],
+        }
+    }
+}
+
+#[async_trait::async_trait]
+trait InventorySource: Send + Sync {
+    async fn guilds(&self, after: Option<String>) -> Result<Vec<Guild>, Value>;
+    async fn channels(&self, request: DiscordRequest) -> Result<Vec<Channel>, Value>;
+    async fn threads(
+        &self,
+        parent: &Channel,
+        cursor: Option<&str>,
+    ) -> Result<crate::thread_listing::ThreadPage, Value>;
+}
+#[async_trait::async_trait]
+impl InventorySource for DiscordAccountSource {
+    async fn guilds(&self, after: Option<String>) -> Result<Vec<Guild>, Value> {
+        self.guild_page(after).await
+    }
+    async fn channels(&self, request: DiscordRequest) -> Result<Vec<Channel>, Value> {
+        if matches!(request, DiscordRequest::GetChannel { .. }) {
+            let raw = self
+                .client
+                .execute_for(&request)
+                .await
+                .map_err(|error| json!(error))?;
+            serde_json::from_value(raw)
+                .map(|channel| vec![channel])
+                .map_err(|_| json!({"code":"invalid_response","retryable":false}))
+        } else {
+            fetch_channels(&self.client, request).await
+        }
+    }
+    async fn threads(
+        &self,
+        parent: &Channel,
+        cursor: Option<&str>,
+    ) -> Result<crate::thread_listing::ThreadPage, Value> {
         let query = ThreadQuery::new(
             Some(&parent.id),
             parent.guild_id.as_deref(),
@@ -582,30 +867,282 @@ async fn refresh_inventory(
             25,
             cursor,
         )
-        .map_err(|error| AccountSyncError {
-            data: error.payload(),
-        })?;
-        match listing.list(&query).await {
-            Ok(page) => {
-                store.observe_account_targets(user, &generation, &page.threads, &now_iso())?;
-                for thread in &page.threads {
-                    store.upsert_channel(thread)?;
-                }
-                if page.search_window_exhausted {
-                    failures.push(json!({"source":"threads","parent_id":parent.id,"code":"search_window_exhausted","retryable":false,"remaining_scope":"threads_beyond_search_offset_limit"}));
-                }
-                if let Some(cursor) = page.next_cursor {
-                    thread_cursors.insert(parent.id.clone(), json!(cursor));
-                } else {
-                    thread_cursors.remove(&parent.id);
-                }
-            }
-            Err(error) => failures
-                .push(json!({"source":"threads","parent_id":parent.id,"error":error.payload()})),
+        .map_err(|error| error.payload())?;
+        DiscordThreadListing::new(Arc::clone(&self.client))
+            .list(&query)
+            .await
+            .map_err(|error| error.payload())
+    }
+}
+fn discovery_scope_key(scope: &AccountScope) -> String {
+    let mut value = json!(scope);
+    for field in [
+        "guild_ids",
+        "channel_ids",
+        "exclude_guild_ids",
+        "exclude_channel_ids",
+    ] {
+        if let Some(ids) = value[field].as_array_mut() {
+            ids.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+            ids.dedup();
         }
     }
-    let cancelled = store.account_cancel_requested(job)?;
-    store.finish_account_inventory(&generation,&now_iso(),&json!({"scope":"account","complete":false,"cancelled":cancelled,"guilds_observed":guilds.len(),"guild_inventory_exhausted":guild_inventory.exhausted,"guild_resume_after":guild_inventory.resume_after,"failures":failures,"thread_resume_cursors":thread_cursors,"reasons":["dm_inventory_completeness_unverified","thread_search_index_not_exhaustive","thread_discovery_one_page_per_parent","history_permissions_not_verified"]}))?;
+    format!("inventory-v1:{value}")
+}
+async fn refresh_inventory(
+    client: &SharedDiscordClient,
+    store: &Store,
+    job: &str,
+    user: &str,
+    options: &AccountSyncOptions,
+) -> Result<String, AccountSyncError> {
+    discover_inventory(
+        &DiscordAccountSource {
+            client: Arc::clone(client),
+        },
+        store,
+        job,
+        user,
+        options,
+    )
+    .await
+}
+fn discovery_requires_explicit_resume(error: &Value) -> bool {
+    matches!(error["http_status"].as_u64(), Some(401 | 403))
+        || matches!(
+            error["code"].as_str(),
+            Some(
+                "execution_withheld"
+                    | "permission_denied"
+                    | "access_denied"
+                    | "unsupported_scope"
+                    | "unsupported_filter"
+                    | "unsupported_channel_kind"
+            )
+        )
+        || (error["error_source"] == "discord"
+            && matches!(error["discord_code"].as_u64(), Some(50001 | 50013 | 20002)))
+}
+
+async fn discover_inventory(
+    source: &dyn InventorySource,
+    store: &Store,
+    job: &str,
+    user: &str,
+    options: &AccountSyncOptions,
+) -> Result<String, AccountSyncError> {
+    let deadline = tokio::time::Instant::now()
+        + options
+            .execution_timeout
+            .unwrap_or(std::time::Duration::from_secs(u64::from(
+                options.max_duration_seconds,
+            )));
+    let key = discovery_scope_key(&options.scope);
+    let mut checkpoint = match store.account_discovery_checkpoint(user, &key)? {
+        Some(value) => serde_json::from_value::<DiscoveryCheckpoint>(value)
+            .map_err(|_| StoreError::Data("invalid persisted discovery checkpoint".into()))?,
+        None => DiscoveryCheckpoint::initial(&options.scope),
+    };
+    if checkpoint
+        .completed_at
+        .as_deref()
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+        .is_some_and(|at| Utc::now().signed_duration_since(at) > Duration::minutes(15))
+    {
+        let failures = std::mem::take(&mut checkpoint.failures);
+        let blocked = std::mem::take(&mut checkpoint.blocked);
+        checkpoint = DiscoveryCheckpoint::initial(&options.scope);
+        checkpoint.failures = failures;
+        checkpoint.blocked = blocked;
+    }
+    let generation = format!("inventory:{job}");
+    store.begin_account_inventory(user, &generation, &now_iso())?;
+    let mut budget = HttpAttemptBudget::new(options.max_discovery_http_requests);
+    budget.reserved = options.identity_http_reservation;
+    let mut visited = std::collections::HashSet::new();
+    let mut budget_blocked = Vec::new();
+    while let Some(task) = checkpoint.pending.pop_front() {
+        let task_key = serde_json::to_string(&task)
+            .map_err(|_| StoreError::Data("invalid discovery task".into()))?;
+        let resource_key = task.resource_key();
+        if store
+            .account_discovery_blocked_operations(user)?
+            .contains(&resource_key)
+            || checkpoint.blocked.contains(&resource_key)
+        {
+            continue;
+        }
+        let (excluded_guilds, excluded_channels) = store.account_exclusions(user)?;
+        let withheld = match &task {
+            DiscoveryTask::GuildChannels { guild_id } => excluded_guilds.contains(guild_id),
+            DiscoveryTask::Channel { channel_id } => {
+                excluded_channels.contains(channel_id)
+                    || store.target_sync_withheld(user, channel_id)?
+            }
+            DiscoveryTask::Threads { parent, .. } => {
+                excluded_channels.contains(&parent.id)
+                    || parent
+                        .guild_id
+                        .as_ref()
+                        .is_some_and(|id| excluded_guilds.contains(id))
+                    || store.target_sync_withheld(user, &parent.id)?
+            }
+            _ => false,
+        };
+        if withheld {
+            checkpoint.failures.push(json!({"source":"discovery","code":"execution_withheld","retryable":false,"resource":resource_key}));
+            checkpoint.blocked.push(resource_key);
+            continue;
+        }
+
+        if !visited.insert(task_key.clone()) || store.account_cancel_requested(job)? {
+            checkpoint.pending.push_front(task);
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            checkpoint.pending.push_front(task);
+            budget_blocked.push(json!({"code":"execution_time_budget_exhausted","retryable":true}));
+            break;
+        }
+        if !budget.reserve(task.requests()) {
+            budget_blocked.push(json!({"code":"insufficient_discovery_budget","required_http_attempt_upper_bound":task.requests()*discord_api::DiscordClient::max_attempts_per_request(),"configured_http_attempt_cap":options.max_discovery_http_requests,"operation":match &task{DiscoveryTask::Threads{..}=>"threads",_=>"inventory"}}));
+            checkpoint.pending.push_back(task);
+            // Rotation is persisted even when the next operation cannot fit this job.
+            if budget.reserved >= budget.limit {
+                break;
+            } else {
+                continue;
+            }
+        }
+        let result: Result<Vec<Channel>, Value> = match &task {
+            DiscoveryTask::GuildPage { after } => match source.guilds(after.clone()).await {
+                Ok(guilds) => {
+                    let last = guilds.last().map(|guild| guild.id.clone());
+                    if guilds.iter().any(|guild| {
+                        guild
+                            .id
+                            .parse::<u64>()
+                            .ok()
+                            .filter(|id| {
+                                *id > 0
+                                    && after
+                                        .as_deref()
+                                        .and_then(snowflake)
+                                        .is_none_or(|after| *id > after)
+                            })
+                            .is_none()
+                    }) || (guilds.len() == 200
+                        && last.as_deref().is_none_or(|last| {
+                            snowflake(last).unwrap_or(0)
+                                <= after.as_deref().and_then(snowflake).unwrap_or(0)
+                        }))
+                    {
+                        Err(json!({"code":"invalid_guild_pagination","retryable":false}))
+                    } else {
+                        for guild in &guilds {
+                            if !options.scope.exclude_guild_ids.contains(&guild.id) {
+                                checkpoint.pending.push_back(DiscoveryTask::GuildChannels {
+                                    guild_id: guild.id.clone(),
+                                });
+                            }
+                        }
+                        if guilds.len() == 200 {
+                            checkpoint
+                                .pending
+                                .push_back(DiscoveryTask::GuildPage { after: last });
+                        }
+                        Ok(vec![])
+                    }
+                }
+                Err(error) => Err(error),
+            },
+            DiscoveryTask::Dms => source.channels(DiscordRequest::ListUserDmChannels).await,
+            DiscoveryTask::GuildChannels { guild_id } => source
+                .channels(DiscordRequest::GetGuildChannels {
+                    guild_id: guild_id.clone(),
+                })
+                .await
+                .map(|mut channels| {
+                    for channel in &mut channels {
+                        channel.guild_id = Some(guild_id.clone());
+                    }
+                    channels
+                }),
+            DiscoveryTask::Channel { channel_id } => {
+                source
+                    .channels(DiscordRequest::GetChannel {
+                        channel_id: channel_id.clone(),
+                    })
+                    .await
+            }
+            DiscoveryTask::Threads { parent, cursor } => {
+                if store.target_sync_withheld(user, &parent.id)? {
+                    Err(json!({"code":"execution_withheld","retryable":false}))
+                } else {
+                    match source.threads(parent, cursor.as_deref()).await {
+                        Ok(page) => {
+                            if let Some(cursor) = page.next_cursor {
+                                checkpoint.pending.push_back(DiscoveryTask::Threads {
+                                    parent: parent.clone(),
+                                    cursor: Some(cursor),
+                                });
+                            }
+                            if page.search_window_exhausted {
+                                checkpoint.failures.push(json!({"source":"threads","parent_id":parent.id,"code":"search_window_exhausted","retryable":false}));
+                            }
+                            Ok(page.threads)
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+            }
+        };
+        match result {
+            Ok(mut channels) => {
+                channels.retain(|channel| options.scope.channel(channel));
+                for channel in &channels {
+                    store.upsert_channel(channel)?;
+                    if options.scope.include_threads
+                        && !matches!(task, DiscoveryTask::Threads { .. })
+                        && matches!(channel.kind, 0 | 5 | 15 | 16)
+                    {
+                        checkpoint.pending.push_back(DiscoveryTask::Threads {
+                            parent: Box::new(channel.clone()),
+                            cursor: None,
+                        });
+                    }
+                }
+                store.observe_account_targets(user, &generation, &channels, &now_iso())?;
+            }
+            Err(error) => {
+                let (guild_id, channel_id, parent_id) = match &task {
+                    DiscoveryTask::GuildChannels { guild_id } => {
+                        (Some(guild_id.as_str()), None, None)
+                    }
+                    DiscoveryTask::Channel { channel_id } => {
+                        (None, Some(channel_id.as_str()), None)
+                    }
+                    DiscoveryTask::Threads { parent, .. } => {
+                        (parent.guild_id.as_deref(), None, Some(parent.id.as_str()))
+                    }
+                    _ => (None, None, None),
+                };
+                checkpoint.failures.push(json!({"source":"discovery","guild_id":guild_id,"channel_id":channel_id,"parent_id":parent_id,"resource":resource_key,"task":task,"error":error}));
+                if discovery_requires_explicit_resume(&error) {
+                    checkpoint.blocked.push(resource_key);
+                } else if error["retryable"].as_bool() == Some(true) {
+                    checkpoint.pending.push_back(task);
+                }
+            }
+        }
+        checkpoint.failures.truncate(100);
+        store.save_account_discovery_checkpoint(user, &key, &json!(checkpoint), &now_iso())?;
+    }
+    if checkpoint.pending.is_empty() && checkpoint.completed_at.is_none() {
+        checkpoint.completed_at = Some(now_iso());
+    }
+    store.save_account_discovery_checkpoint(user, &key, &json!(checkpoint), &now_iso())?;
+    store.finish_account_inventory(&generation,&now_iso(),&json!({"scope":"account","complete":false,"cancelled":store.account_cancel_requested(job)?,"target_scope":options.scope,"discovery_http_attempt_upper_bound":budget.reserved,"budget_accounting":"conservative_maximum_client_retry_reservation","discovery_cycle_completed_at":checkpoint.completed_at,"pending_discovery_operations":checkpoint.pending.len(),"blocked_discovery_resources":store.account_discovery_blocked_operations(user)?,"discovery_checkpoint_scope":key,"failures":checkpoint.failures,"budget_blocked":budget_blocked,"reasons":["inventory_discovery_not_proven_exhaustive","thread_search_index_not_exhaustive","history_permissions_not_verified"]}))?;
     Ok(generation)
 }
 
@@ -640,7 +1177,7 @@ fn inventory_summary(inventory: &AccountInventory) -> Value {
         .filter_map(Value::as_str)
         .map(|s| s.chars().take(256).collect::<String>())
         .collect();
-    json!({"generation":inventory.generation,"account_user_id":inventory.account_user_id,"started_at":inventory.started_at,"refreshed_at":inventory.refreshed_at,"status":inventory.status,"discovery":{"source":discovery["source"].as_str(),"partial":discovery["partial"].as_bool(),"inventory_errors":displayed_inventory_errors,"inventory_errors_total":inventory_errors.len(),"inventory_errors_omitted":inventory_errors.len().saturating_sub(20),"complete":false,"cancelled":discovery["cancelled"].as_bool(),"guilds_observed":discovery["guilds_observed"].as_u64(),"guild_inventory_exhausted":discovery["guild_inventory_exhausted"].as_bool(),"failures_total":failures.len(),"failures":displayed,"failures_omitted":failures.len().saturating_sub(20),"thread_resume_cursor_count":discovery["thread_resume_cursors"].as_object().map_or(0,|map|map.len()),"reasons":reasons}})
+    json!({"generation":inventory.generation,"account_user_id":inventory.account_user_id,"started_at":inventory.started_at,"refreshed_at":inventory.refreshed_at,"status":inventory.status,"discovery":{"source":discovery["source"].as_str(),"partial":discovery["partial"].as_bool(),"inventory_errors":displayed_inventory_errors,"inventory_errors_total":inventory_errors.len(),"inventory_errors_omitted":inventory_errors.len().saturating_sub(20),"complete":false,"cancelled":discovery["cancelled"].as_bool(),"guilds_observed":discovery["guilds_observed"].as_u64(),"guild_inventory_exhausted":discovery["guild_inventory_exhausted"].as_bool(),"failures_total":failures.len(),"failures":displayed,"failures_omitted":failures.len().saturating_sub(20),"pending_discovery_operations":discovery["pending_discovery_operations"].as_u64(),"discovery_cycle_completed_at":discovery["discovery_cycle_completed_at"],"blocked_discovery_resource_count":discovery["blocked_discovery_resources"].as_array().map(Vec::len),"budget_blocked":discovery["budget_blocked"].as_array().map(|entries|entries.iter().take(20).cloned().collect::<Vec<_>>()),"thread_resume_cursor_count":discovery["thread_resume_cursors"].as_object().map(|map|map.len()),"reasons":reasons}})
 }
 
 fn coverage_summary(
@@ -651,6 +1188,8 @@ fn coverage_summary(
     as_of: &str,
 ) -> Result<Value, StoreError> {
     let counts = store.account_target_counts(user, guild, channel, as_of)?;
+    let (gap_observations, unresolved_gaps) = store.account_gap_counts(user, guild, channel)?;
+    let excluded_count = store.account_excluded_target_count(user, guild, channel)?;
     let inventory = store.account_inventory(user)?;
     let inventory_at = inventory
         .as_ref()
@@ -667,7 +1206,7 @@ fn coverage_summary(
         "account"
     };
     Ok(
-        json!({"observation_consistency":"sequential_cache_reads","as_of_basis":"inspection_started_at","scope":scope,"target_scope":{"guild_id":guild,"channel_id":channel},"account_user_id":user,"as_of":as_of,"inventory_updated_at":inventory_at,"inventory_stale":stale,"inventory_initialized":inventory.is_some(),"inventory":inventory.as_ref().map(inventory_summary),"targets_total":counts.total,"target_count_basis":"retained_discovered_targets","undiscovered_target_count":null,"enumerated":counts.total,"synced":counts.synced,"unfetched":counts.unfetched,"failed":counts.failed,"blocked":counts.blocked,"due":counts.due,"targets":[],"details_included":false,"has_more":null,"next_cursor":null,"complete":false,"reasons":["account_inventory_not_proven_exhaustive","history_permissions_not_verified","edits_and_deletions_not_continuously_observed"]}),
+        json!({"observation_consistency":"sequential_cache_reads","as_of_basis":"inspection_started_at","scope":scope,"target_scope":{"guild_id":guild,"channel_id":channel},"account_user_id":user,"as_of":as_of,"inventory_updated_at":inventory_at,"inventory_stale":stale,"inventory_initialized":inventory.is_some(),"inventory":inventory.as_ref().map(inventory_summary),"targets_total":counts.total,"target_count_basis":"retained_discovered_targets","undiscovered_target_count":null,"enumerated":counts.total,"synced":counts.synced,"unfetched":counts.unfetched,"failed":counts.failed,"blocked":counts.blocked,"due":counts.due,"targets":[],"details_included":false,"has_more":null,"next_cursor":null,"page_complete":true,"scope_complete":false,"inventory_complete":false,"history_complete":false,"continuous_coverage":false,"gap_observations":gap_observations,"unresolved_gaps":unresolved_gaps,"excluded_count":excluded_count,"excluded_count_basis":"retained_discovered_targets","complete":false,"reasons":["account_inventory_not_proven_exhaustive","history_permissions_not_verified","edits_and_deletions_not_continuously_observed"]}),
     )
 }
 
@@ -712,12 +1251,14 @@ pub(crate) fn account_coverage_page(
         let ranges_truncated = ranges.len() > 20;
         ranges.truncate(20);
         let gaps:Vec<_>=ranges.windows(2).map(|pair|json!({"after_message_id":pair[0].to_id,"before_message_id":pair[1].from_id})).collect();
-        let stale = target
-            .last_checked_at
-            .as_deref()
+        let body = store.channel_sync(&target.channel_id)?;
+        let body_success = body
+            .as_ref()
+            .and_then(|row| row.body_last_success_at.as_deref());
+        let stale = body_success
             .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
             .is_none_or(|at| Utc::now().signed_duration_since(at) > Duration::minutes(5));
-        entries.push(json!({"channel_id":target.channel_id,"guild_id":target.guild_id,"present_in_current_inventory":generation==Some(target.generation.as_str()),"first_discovered_at":target.first_discovered_at,"last_checked_at":target.last_checked_at,"unfetched_since":if target.last_checked_at.is_none(){Some(&target.first_discovered_at)}else{None},"last_attempt_at":target.last_attempt_at,"next_check_at":target.next_check_at,"stale":stale,"history_status":target.history_status,"next_direction":target.next_direction,"covered_ranges":ranges,"ranges_truncated":ranges_truncated,"gaps":gaps,"covered_from":target.backfill_before,"covered_to":target.increment_after,"remaining_history":{"before_message_id":target.backfill_before,"status":"unknown"},"error":target.last_error.as_ref().map(|error|failure_summary(&json!({"error":error}))["error"].clone())}));
+        entries.push(json!({"channel_id":target.channel_id,"guild_id":target.guild_id,"present_in_current_inventory":generation==Some(target.generation.as_str()),"first_discovered_at":target.first_discovered_at,"last_checked_at":target.last_checked_at,"account_checkpoint_checked_at":target.last_checked_at,"body_synced":body_success.is_some(),"last_body_success_at":body_success,"metadata_fetched_at":body.as_ref().and_then(|row|row.metadata_fetched_at.as_deref()),"unfetched_since":if body_success.is_none(){Some(&target.first_discovered_at)}else{None},"last_attempt_at":target.last_attempt_at,"next_check_at":target.next_check_at,"stale":stale,"history_status":target.history_status,"next_direction":target.next_direction,"covered_ranges":ranges,"ranges_truncated":ranges_truncated,"gaps":gaps,"covered_from":target.backfill_before,"covered_to":target.increment_after,"remaining_history":{"before_message_id":target.backfill_before,"status":"unknown"},"error":target.last_error.as_ref().map(|error|failure_summary(&json!({"error":error}))["error"].clone())}));
     }
     report["targets"] = json!(entries);
     report["details_included"] = json!(true);
@@ -817,6 +1358,365 @@ mod tests {
             progress: json!({}),
         }
     }
+    struct FairFixtureSource {
+        calls: Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl AccountSource for FairFixtureSource {
+        async fn page(&self, target: &AccountTarget, _: u8) -> Result<Vec<Message>, Value> {
+            self.calls.lock().unwrap().push(target.channel_id.clone());
+            if target.channel_id == "3" && target.last_checked_at.is_none() {
+                return Ok(vec![]);
+            }
+            let id = match target.channel_id.as_str() {
+                "1" => {
+                    target
+                        .increment_after
+                        .as_deref()
+                        .and_then(snowflake)
+                        .unwrap_or(100)
+                        + 1
+                }
+                "2" => 20,
+                _ => 30,
+            };
+            Ok(vec![Message {
+                id: id.to_string(),
+                channel_id: target.channel_id.clone(),
+                guild_id: Some("10".into()),
+                mentions: if target.channel_id == "2" {
+                    vec![discord_api::types::User {
+                        id: "9".into(),
+                        ..Default::default()
+                    }]
+                } else {
+                    vec![]
+                },
+                ..Default::default()
+            }])
+        }
+    }
+    #[tokio::test]
+    async fn fair_round_finds_quiet_old_mention_and_rechecks_initial_empty_target() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store
+            .begin_account_inventory("9", "g", "2026-01-01")
+            .unwrap();
+        let channels: Vec<_> = (1..=3)
+            .map(|id| Channel {
+                id: id.to_string(),
+                guild_id: Some("10".into()),
+                kind: 0,
+                ..Default::default()
+            })
+            .collect();
+        store
+            .observe_account_targets("9", "g", &channels, "2026-01-01")
+            .unwrap();
+        let state = SqliteAccountState {
+            store: Arc::clone(&store),
+        };
+        let source = FairFixtureSource {
+            calls: Mutex::new(vec![]),
+        };
+        let options = AccountSyncOptions {
+            max_targets: 1,
+            page_size: 1,
+            refresh_inventory: false,
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            let mut job = job();
+            job.account_user_id = "9".into();
+            run_round(&state, &source, job, &options).await.unwrap();
+        }
+        assert_eq!(*source.calls.lock().unwrap(), vec!["1", "2", "3"]);
+        let quiet = store.get_message("20").unwrap().unwrap();
+        let message = quiet.known_view().unwrap();
+        assert_eq!(message.mentions[0].id, "9");
+        let empty = store
+            .account_targets("9")
+            .unwrap()
+            .into_iter()
+            .find(|target| target.channel_id == "3")
+            .unwrap();
+        assert!(empty.last_checked_at.is_some());
+        assert!(empty.increment_after.is_none());
+        assert!(empty.backfill_before.is_none());
+        store
+            .save_account_page(
+                "9",
+                "3",
+                &[],
+                &TargetCheckpoint {
+                    page_interval: None,
+                    backfill_before: None,
+                    increment_after: None,
+                    checked_at: empty.last_checked_at.unwrap(),
+                    next_check_at: Some("2026-01-01".into()),
+                    history_status: empty.history_status,
+                    next_direction: empty.next_direction,
+                },
+            )
+            .unwrap();
+        // Make only the previously empty channel eligible after its periodic deadline.
+        let options = AccountSyncOptions {
+            scope: AccountScope {
+                channel_ids: Some(vec!["3".into()]),
+                ..Default::default()
+            },
+            ..options
+        };
+        let mut job = job();
+        job.account_user_id = "9".into();
+        run_round(&state, &source, job, &options).await.unwrap();
+        assert!(store.get_message("30").unwrap().is_some());
+    }
+
+    struct RestrictionDuringRoundSource {
+        store: Arc<Store>,
+        calls: Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl AccountSource for RestrictionDuringRoundSource {
+        async fn page(&self, target: &AccountTarget, _: u8) -> Result<Vec<Message>, Value> {
+            self.calls.lock().unwrap().push(target.channel_id.clone());
+            if target.channel_id == "1" {
+                self.store
+                    .record_account_gap(&discord_store::sqlite::account::AccountGapOutcome {
+                        account_user_id: "9",
+                        channel_id: "2",
+                        layer: "orchestration_approval",
+                        status: "cancelled",
+                        reason: "caller_reported_cancellation",
+                        observed_at: &now_iso(),
+                        evidence: &json!({"cancel_actor":"unknown"}),
+                    })
+                    .unwrap();
+            }
+            Ok(vec![])
+        }
+    }
+    #[tokio::test]
+    async fn restrictions_inserted_during_round_skip_preselected_targets_before_attempt() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store
+            .begin_account_inventory("9", "g", "2026-01-01")
+            .unwrap();
+        let channels: Vec<_> = (1..=2)
+            .map(|id| Channel {
+                id: id.to_string(),
+                kind: 1,
+                ..Default::default()
+            })
+            .collect();
+        store
+            .observe_account_targets("9", "g", &channels, "2026-01-01")
+            .unwrap();
+        let state = SqliteAccountState {
+            store: Arc::clone(&store),
+        };
+        let source = RestrictionDuringRoundSource {
+            store: Arc::clone(&store),
+            calls: Mutex::new(vec![]),
+        };
+        let mut job = job();
+        job.account_user_id = "9".into();
+        let report = run_round(
+            &state,
+            &source,
+            job,
+            &AccountSyncOptions {
+                max_targets: 2,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(*source.calls.lock().unwrap(), vec!["1"]);
+        assert_eq!(report["attempted"], 1);
+        assert_eq!(report["withheld_count"], 1);
+        let blocked = store
+            .account_targets("9")
+            .unwrap()
+            .into_iter()
+            .find(|target| target.channel_id == "2")
+            .unwrap();
+        assert!(blocked.last_attempt_at.is_none());
+        assert!(blocked.last_checked_at.is_none());
+        assert!(state
+            .targets("9", &now_iso(), 100)
+            .unwrap()
+            .iter()
+            .all(|target| target.channel_id != "2"));
+    }
+
+    #[tokio::test]
+    async fn persisted_exclusion_cannot_be_bypassed_by_new_default_or_allowlisted_round() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .persist_account_exclusions("me", &[], &["1".into()], "2026-01-01")
+            .unwrap();
+        for mut options in [
+            AccountSyncOptions::default(),
+            AccountSyncOptions {
+                scope: AccountScope {
+                    channel_ids: Some(vec!["1".into()]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ] {
+            merge_persistent_exclusions(&store, "me", &mut options).unwrap();
+            let state = state(false);
+            assert_eq!(
+                run_round(&state, &Source { messages: vec![] }, job(), &options)
+                    .await
+                    .unwrap()["attempted"],
+                0
+            );
+            assert!(state.saved.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn coverage_detail_and_summary_share_body_success_evidence() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .begin_account_inventory("me", "g", "2026-01-01")
+            .unwrap();
+        store
+            .observe_account_targets(
+                "me",
+                "g",
+                &[Channel {
+                    id: "1".into(),
+                    kind: 1,
+                    ..Default::default()
+                }],
+                "2026-01-01",
+            )
+            .unwrap();
+        store
+            .record_channel_sync("1", None, None, &now_iso())
+            .unwrap();
+        let report = account_coverage_page(&store, "me", None, None, None, 10).unwrap();
+        assert_eq!(report["synced"], 0);
+        assert_eq!(report["targets"][0]["body_synced"], false);
+        assert!(report["targets"][0]["last_body_success_at"].is_null());
+        let at = now_iso();
+        store
+            .save_account_page(
+                "me",
+                "1",
+                &[],
+                &TargetCheckpoint {
+                    page_interval: None,
+                    backfill_before: None,
+                    increment_after: None,
+                    checked_at: at.clone(),
+                    next_check_at: None,
+                    history_status: "history_access_unknown".into(),
+                    next_direction: "incremental".into(),
+                },
+            )
+            .unwrap();
+        let report = account_coverage_page(&store, "me", None, None, None, 10).unwrap();
+        assert_eq!(report["synced"], 1);
+        assert_eq!(report["targets"][0]["body_synced"], true);
+        assert_eq!(report["targets"][0]["last_body_success_at"], at);
+        assert!(report["targets"][0]["unfetched_since"].is_null());
+        assert_eq!(report["scope_complete"], false);
+        assert_eq!(report["page_complete"], true);
+    }
+
+    #[test]
+    fn cache_preview_preserves_unfetched_state_and_creates_no_job() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .begin_account_inventory("me", "g", "2026-01-01")
+            .unwrap();
+        store
+            .observe_account_targets(
+                "me",
+                "g",
+                &[Channel {
+                    id: "1".into(),
+                    kind: 1,
+                    ..Default::default()
+                }],
+                "2026-01-01",
+            )
+            .unwrap();
+        let preview = preview_account_sync(&store, "me", &AccountSyncOptions::default()).unwrap();
+        assert_eq!(preview["selected_targets"], 1);
+        assert_eq!(preview["network_requests"], 0);
+        assert_eq!(preview["state_changes"], 0);
+        assert_eq!(
+            store.account_targets("me").unwrap()[0].history_status,
+            "unfetched"
+        );
+        assert!(store.account_job("preview").unwrap().is_none());
+    }
+    #[tokio::test]
+    async fn discovery_zero_budget_leaves_guild_page_unrequested() {
+        let store = Store::open_in_memory().unwrap();
+        create_account_job(&store, "guilds", "me").unwrap();
+        let source = GuildPages {
+            pages: Mutex::new([vec![]].into()),
+            after: Mutex::new(vec![]),
+        };
+        let result =
+            collect_guild_inventory(&source, &store, "guilds", &mut HttpAttemptBudget::new(0))
+                .await
+                .unwrap();
+        assert!(!result.exhausted);
+        assert!(source.after.lock().unwrap().is_empty());
+        assert_eq!(
+            result.error.unwrap()["code"],
+            "discovery_http_budget_exhausted"
+        );
+    }
+
+    #[test]
+    fn scope_and_retry_budget_fail_closed() {
+        let scope = AccountScope {
+            guild_ids: Some(vec!["10".into()]),
+            exclude_channel_ids: vec!["2".into()],
+            ..Default::default()
+        };
+        assert!(scope.allows("1", Some("10"), None, 0));
+        assert!(!scope.allows("2", Some("10"), None, 0));
+        assert!(!scope.allows("3", Some("20"), None, 0));
+        assert!(!scope.allows("4", None, None, 1));
+        let mut budget = HttpAttemptBudget::new(5);
+        assert!(budget.reserve(1));
+        assert!(!budget.reserve(1));
+        assert_eq!(budget.reserved, 3);
+    }
+    #[tokio::test]
+    async fn excluded_target_and_zero_budget_do_not_fetch_or_checkpoint() {
+        for options in [
+            AccountSyncOptions {
+                scope: AccountScope {
+                    exclude_channel_ids: vec!["1".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            AccountSyncOptions {
+                max_body_http_requests: 0,
+                ..Default::default()
+            },
+        ] {
+            let state = state(false);
+            let report = run_round(&state, &Source { messages: vec![] }, job(), &options)
+                .await
+                .unwrap();
+            assert_eq!(report["attempted"], 0);
+            assert!(state.saved.lock().unwrap().is_empty());
+        }
+    }
     #[tokio::test]
     async fn empty_page_keeps_history_unknown() {
         let state = state(false);
@@ -829,6 +1729,7 @@ mod tests {
                 max_targets: 10,
                 page_size: 50,
                 refresh_inventory: false,
+                ..Default::default()
             },
         )
         .await
@@ -851,6 +1752,7 @@ mod tests {
                 max_targets: 10,
                 page_size: 50,
                 refresh_inventory: false,
+                ..Default::default()
             },
         )
         .await
@@ -881,6 +1783,7 @@ mod tests {
                 max_targets: 10,
                 page_size: 50,
                 refresh_inventory: false,
+                ..Default::default()
             },
         )
         .await
@@ -899,7 +1802,8 @@ mod tests {
             &AccountSyncOptions {
                 max_targets: 10,
                 page_size: 50,
-                refresh_inventory: false
+                refresh_inventory: false,
+                ..Default::default()
             }
         )
         .await
@@ -921,6 +1825,7 @@ mod tests {
                 max_targets: 10,
                 page_size: 50,
                 refresh_inventory: false,
+                ..Default::default()
             },
         )
         .await
@@ -937,6 +1842,7 @@ mod tests {
             max_targets: 1,
             page_size: 1,
             refresh_inventory: false,
+            ..Default::default()
         };
         for (id, direction, oldest) in [
             ("100", "incremental", "100"),
@@ -983,6 +1889,7 @@ mod tests {
                 max_targets: 1,
                 page_size: 50,
                 refresh_inventory: false,
+                ..Default::default()
             },
         )
         .await
@@ -1025,11 +1932,281 @@ mod tests {
                 max_targets: 1,
                 page_size: 50,
                 refresh_inventory: false,
+                ..Default::default()
             },
         )
         .await
         .unwrap();
         assert_eq!(report["status"], "cancelled");
+    }
+
+    struct DiscoveryFixture {
+        calls: Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl InventorySource for DiscoveryFixture {
+        async fn guilds(&self, after: Option<String>) -> Result<Vec<Guild>, Value> {
+            self.calls.lock().unwrap().push(format!("guilds:{after:?}"));
+            Ok(if after.is_none() {
+                (1..=200)
+                    .map(|id| Guild {
+                        id: id.to_string(),
+                        ..Default::default()
+                    })
+                    .collect()
+            } else {
+                vec![]
+            })
+        }
+        async fn channels(&self, request: DiscordRequest) -> Result<Vec<Channel>, Value> {
+            self.calls.lock().unwrap().push(format!("{request:?}"));
+            Ok(vec![])
+        }
+        async fn threads(
+            &self,
+            _: &Channel,
+            _: Option<&str>,
+        ) -> Result<crate::thread_listing::ThreadPage, Value> {
+            panic!("no parents")
+        }
+    }
+    #[tokio::test]
+    async fn small_discovery_budget_resumes_guild_pages_and_rotates_guild_channels() {
+        let store = Store::open_in_memory().unwrap();
+        let source = DiscoveryFixture {
+            calls: Mutex::new(vec![]),
+        };
+        let mut options = AccountSyncOptions {
+            max_discovery_http_requests: 3,
+            ..Default::default()
+        };
+        options.scope.include_dms = false;
+        options.scope.exclude_guild_ids = (1..200).map(|id| id.to_string()).collect();
+        for job in ["one", "two", "three"] {
+            create_account_job(&store, job, "9").unwrap();
+            discover_inventory(&source, &store, job, "9", &options)
+                .await
+                .unwrap();
+        }
+        let calls = source.calls.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0], "guilds:None");
+        assert!(calls.iter().any(|call| call == "guilds:Some(\"200\")"));
+        assert!(calls
+            .iter()
+            .any(|call| call.contains("200") && call != "guilds:Some(\"200\")"));
+    }
+    #[tokio::test]
+    async fn explicit_guild_discovery_does_not_restart_first_guild_with_small_budget() {
+        let store = Store::open_in_memory().unwrap();
+        let source = DiscoveryFixture {
+            calls: Mutex::new(vec![]),
+        };
+        let mut options = AccountSyncOptions {
+            max_discovery_http_requests: 3,
+            ..Default::default()
+        };
+        options.scope.guild_ids = Some(vec!["10".into(), "20".into()]);
+        for job in ["one", "two", "three"] {
+            create_account_job(&store, job, "9").unwrap();
+            discover_inventory(&source, &store, job, "9", &options)
+                .await
+                .unwrap();
+        }
+        let calls = source.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].contains("10"));
+        assert!(calls[1].contains("20"));
+    }
+
+    #[test]
+    fn invalid_discovery_payload_is_not_a_permanent_permission_or_capability_denial() {
+        for code in [
+            "invalid_response",
+            "invalid_guild_pagination",
+            "UNKNOWN_ERROR",
+        ] {
+            assert!(!discovery_requires_explicit_resume(
+                &json!({"code":code,"retryable":false})
+            ));
+        }
+        assert!(discovery_requires_explicit_resume(
+            &json!({"http_status":403,"retryable":false})
+        ));
+        assert!(discovery_requires_explicit_resume(
+            &json!({"code":"execution_withheld","retryable":false})
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_discovery_response_recovers_after_cycle_refresh_and_scope_change() {
+        struct RecoveringInventory {
+            fail: AtomicBool,
+            calls: Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl InventorySource for RecoveringInventory {
+            async fn guilds(&self, _: Option<String>) -> Result<Vec<Guild>, Value> {
+                panic!("scoped")
+            }
+            async fn channels(&self, request: DiscordRequest) -> Result<Vec<Channel>, Value> {
+                self.calls.lock().unwrap().push(format!("{request:?}"));
+                if self.fail.load(Ordering::SeqCst) {
+                    Err(json!({"code":"invalid_response","retryable":false}))
+                } else {
+                    Ok(vec![])
+                }
+            }
+            async fn threads(
+                &self,
+                _: &Channel,
+                _: Option<&str>,
+            ) -> Result<crate::thread_listing::ThreadPage, Value> {
+                panic!("no parent")
+            }
+        }
+        let store = Store::open_in_memory().unwrap();
+        let source = RecoveringInventory {
+            fail: AtomicBool::new(true),
+            calls: Mutex::new(vec![]),
+        };
+        let mut options = AccountSyncOptions::default();
+        options.scope.guild_ids = Some(vec!["10".into()]);
+        create_account_job(&store, "bad", "9").unwrap();
+        discover_inventory(&source, &store, "bad", "9", &options)
+            .await
+            .unwrap();
+        let key = discovery_scope_key(&options.scope);
+        let mut saved = store
+            .account_discovery_checkpoint("9", &key)
+            .unwrap()
+            .unwrap();
+        saved["completed_at"] = json!("2000-01-01T00:00:00Z");
+        store
+            .save_account_discovery_checkpoint("9", &key, &saved, &now_iso())
+            .unwrap();
+        source.fail.store(false, Ordering::SeqCst);
+        create_account_job(&store, "recover", "9").unwrap();
+        discover_inventory(&source, &store, "recover", "9", &options)
+            .await
+            .unwrap();
+        assert_eq!(source.calls.lock().unwrap().len(), 2);
+        assert!(store
+            .account_discovery_blocked_operations("9")
+            .unwrap()
+            .is_empty());
+        options.scope.guild_ids = Some(vec!["10".into(), "20".into()]);
+        create_account_job(&store, "newscope", "9").unwrap();
+        discover_inventory(&source, &store, "newscope", "9", &options)
+            .await
+            .unwrap();
+        assert_eq!(source.calls.lock().unwrap().len(), 4);
+    }
+
+    struct ThreadDiscoveryFixture {
+        calls: Mutex<Vec<String>>,
+        deny: bool,
+    }
+    #[async_trait::async_trait]
+    impl InventorySource for ThreadDiscoveryFixture {
+        async fn guilds(&self, _: Option<String>) -> Result<Vec<Guild>, Value> {
+            panic!("scoped")
+        }
+        async fn channels(&self, request: DiscordRequest) -> Result<Vec<Channel>, Value> {
+            let DiscordRequest::GetGuildChannels { guild_id } = request else {
+                panic!("guild")
+            };
+            Ok(vec![Channel {
+                id: format!("{guild_id}0"),
+                guild_id: Some(guild_id),
+                kind: 0,
+                ..Default::default()
+            }])
+        }
+        async fn threads(
+            &self,
+            parent: &Channel,
+            _: Option<&str>,
+        ) -> Result<crate::thread_listing::ThreadPage, Value> {
+            self.calls.lock().unwrap().push(parent.id.clone());
+            if self.deny {
+                return Err(json!({"code":50001,"http_status":403,"retryable":false}));
+            }
+            Ok(crate::thread_listing::ThreadPage {
+                threads: vec![Channel {
+                    id: format!("{}1", parent.id),
+                    guild_id: parent.guild_id.clone(),
+                    parent_id: Some(parent.id.clone()),
+                    kind: 11,
+                    ..Default::default()
+                }],
+                next_cursor: None,
+                has_more: false,
+                effective_limit: 25,
+                search_window_exhausted: false,
+            })
+        }
+    }
+    #[tokio::test]
+    async fn discovery_resumes_later_thread_parent_and_reports_too_small_budget() {
+        let store = Store::open_in_memory().unwrap();
+        let source = ThreadDiscoveryFixture {
+            calls: Mutex::new(vec![]),
+            deny: false,
+        };
+        let mut options = AccountSyncOptions {
+            max_discovery_http_requests: 6,
+            ..Default::default()
+        };
+        options.scope.guild_ids = Some(vec!["10".into(), "20".into()]);
+        create_account_job(&store, "one", "9").unwrap();
+        discover_inventory(&source, &store, "one", "9", &options)
+            .await
+            .unwrap();
+        options.max_discovery_http_requests = 3;
+        create_account_job(&store, "small", "9").unwrap();
+        discover_inventory(&source, &store, "small", "9", &options)
+            .await
+            .unwrap();
+        assert!(source.calls.lock().unwrap().is_empty());
+        assert_eq!(
+            store.account_inventory("9").unwrap().unwrap().discovery["budget_blocked"][0]
+                ["required_http_attempt_upper_bound"],
+            6
+        );
+        options.max_discovery_http_requests = 6;
+        for job in ["two", "three"] {
+            create_account_job(&store, job, "9").unwrap();
+            discover_inventory(&source, &store, job, "9", &options)
+                .await
+                .unwrap();
+        }
+        let mut calls = source.calls.lock().unwrap().clone();
+        calls.sort();
+        assert_eq!(calls, vec!["100", "200"]);
+    }
+    #[tokio::test]
+    async fn discovery_denial_is_retained_across_new_scope_and_parent_metadata() {
+        let store = Store::open_in_memory().unwrap();
+        let source = ThreadDiscoveryFixture {
+            calls: Mutex::new(vec![]),
+            deny: true,
+        };
+        let mut options = AccountSyncOptions {
+            max_discovery_http_requests: 30,
+            ..Default::default()
+        };
+        options.scope.guild_ids = Some(vec!["10".into()]);
+        for job in ["one", "two"] {
+            if job == "two" {
+                options.scope.guild_ids = Some(vec!["10".into(), "20".into()]);
+            }
+            create_account_job(&store, job, "9").unwrap();
+            discover_inventory(&source, &store, job, "9", &options)
+                .await
+                .unwrap();
+        }
+        assert_eq!(*source.calls.lock().unwrap(), vec!["100", "200"]);
     }
 
     struct GuildPages {
@@ -1054,9 +2231,14 @@ mod tests {
             pages: Mutex::new([first, vec![]].into()),
             after: Mutex::new(vec![]),
         };
-        let result = collect_guild_inventory(&source, &store, "guilds")
-            .await
-            .unwrap();
+        let result = collect_guild_inventory(
+            &source,
+            &store,
+            "guilds",
+            &mut HttpAttemptBudget::new(10000),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.guilds.len(), 200);
         assert!(result.exhausted);
         assert_eq!(
@@ -1078,6 +2260,7 @@ mod tests {
                 max_targets: 1,
                 page_size: 100,
                 refresh_inventory: false,
+                ..Default::default()
             },
         )
         .await
@@ -1101,9 +2284,14 @@ mod tests {
     async fn cancellation_during_discovery_does_not_claim_exhaustion() {
         let store = Store::open_in_memory().unwrap();
         create_account_job(&store, "guilds", "me").unwrap();
-        let result = collect_guild_inventory(&CancelGuildRead { store: &store }, &store, "guilds")
-            .await
-            .unwrap();
+        let result = collect_guild_inventory(
+            &CancelGuildRead { store: &store },
+            &store,
+            "guilds",
+            &mut HttpAttemptBudget::new(10000),
+        )
+        .await
+        .unwrap();
         assert!(!result.exhausted);
         assert!(store.account_cancel_requested("guilds").unwrap());
     }
@@ -1124,6 +2312,7 @@ mod tests {
                 max_targets: 1,
                 page_size: 1,
                 refresh_inventory: false,
+                ..Default::default()
             },
         )
         .await
@@ -1150,6 +2339,7 @@ mod tests {
                 max_targets: 1,
                 page_size: 50,
                 refresh_inventory: false,
+                ..Default::default()
             },
         )
         .await

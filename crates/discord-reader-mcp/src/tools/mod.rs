@@ -5,6 +5,7 @@ pub mod account;
 pub mod channels;
 pub mod guilds;
 pub mod inbox;
+pub mod local_state;
 pub mod messages;
 pub mod meta;
 pub mod search;
@@ -50,6 +51,7 @@ impl DiscordReaderTools {
         router.merge(Self::threads_router());
         router.merge(Self::sync_router());
         router.merge(Self::account_router());
+        router.merge(Self::local_state_router());
         router
     }
 
@@ -108,7 +110,11 @@ impl ServerHandler for DiscordReaderTools {
 
     fn get_info(&self) -> InitializeResult {
         let mut info = InitializeResult::new(ServerCapabilities::builder().enable_tools().build());
-        info.server_info = Implementation::new("discord-reader-mcp", env!("CARGO_PKG_VERSION"));
+        let version = option_env!("DISCORD_READER_BUILD_SHA")
+            .filter(|value| *value != "unknown")
+            .map(|revision| format!("{}+{}", env!("CARGO_PKG_VERSION"), revision))
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+        info.server_info = Implementation::new("discord-reader-mcp", version);
         info.instructions = Some(
             "Read-only view of Discord servers, channels, messages, threads and DMs. \
              Data is fetched on demand and cached locally; full-text search covers \
@@ -157,7 +163,7 @@ pub(crate) fn remote_error(operation: &str, error: RpcClientError) -> CallToolRe
             data,
         } => {
             let payload = data.filter(|value| value.get("error").is_some_and(Value::is_object)).or_else(|| serde_json::from_str::<Value>(&message).ok().filter(|value| value.get("error").is_some_and(Value::is_object))).unwrap_or_else(|| {
-                let (name, source) = if code == -32602 { ("INVALID_PARAMS", "client") } else if code == -32601 { ("METHOD_NOT_FOUND", "client") } else { ("INTERNAL_ERROR", "daemon") };
+                let (name, source) = if code == -32602 { ("INVALID_PARAMS", "client") } else if code == -32601 { ("METHOD_NOT_FOUND", "client") } else if code == -32603 { ("INTERNAL_ERROR", "daemon") } else { ("UNKNOWN_ERROR", "unknown") };
                 json!({"error":{"error_source":source,"code":name,"retryable":false,"message":message}})
             });
             (payload, Some(code))
@@ -182,11 +188,14 @@ pub(crate) fn remote_error(operation: &str, error: RpcClientError) -> CallToolRe
         payload["error"]["request_operation"] = json!(request.to_string());
     }
     payload["error"]["operation"] = json!(operation);
+    if payload["error"]["code"] == "INVALID_PARAMS" {
+        payload["error"]["argument_code"] = json!("INVALID_ARGUMENT");
+    }
     if payload["error"].get("error_source").is_none() {
-        payload["error"]["error_source"] = json!("daemon");
+        payload["error"]["error_source"] = json!("unknown");
     }
     if payload["error"].get("code").is_none() {
-        payload["error"]["code"] = json!("INTERNAL_ERROR");
+        payload["error"]["code"] = json!("UNKNOWN_ERROR");
     }
     if payload["error"].get("retryable").is_none() {
         payload["error"]["retryable"] = json!(false);
@@ -194,23 +203,34 @@ pub(crate) fn remote_error(operation: &str, error: RpcClientError) -> CallToolRe
     if payload["error"].get("message").is_none() {
         payload["error"]["message"] = json!("request failed");
     }
+    if payload["error"].get("layer").is_none() {
+        payload["error"]["layer"] = json!(match payload["error"]["error_source"].as_str() {
+            Some("client") => "validation",
+            Some("discord") => "discord_api",
+            Some("cache") => "storage",
+            Some("transport" | "protocol") => "transport",
+            Some("capability") => "capability",
+            _ => "unknown",
+        });
+    }
+    for field in ["http_status", "discord_code"] {
+        if payload["error"].get(field).is_none() {
+            payload["error"][field] = Value::Null;
+        }
+    }
     if let Some(code) = rpc_code {
         payload["rpc_code"] = json!(code);
     }
-    CallToolResult::error(vec![ContentBlock::text(
-        serde_json::to_string_pretty(&payload).expect("JSON error payload"),
-    )])
+    CallToolResult::structured_error(payload)
 }
 
 fn tool_error(operation: &str, error: ErrorData) -> CallToolResult {
     let invalid = error.code == rmcp::model::ErrorCode::INVALID_PARAMS;
     let payload = json!({"error":{
         "error_source":if invalid { "client" } else { "mcp" }, "code":if invalid { "INVALID_PARAMS" } else { "INTERNAL_ERROR" },
-        "operation":operation, "retryable":false, "message":error.message
+        "operation":operation, "retryable":false, "message":error.message,"layer":if invalid {"validation"} else {"unknown"},"http_status":null,"discord_code":null,"argument_code":if invalid {Some("INVALID_ARGUMENT")} else {None}
     }, "rpc_code":error.code.0});
-    CallToolResult::error(vec![ContentBlock::text(
-        serde_json::to_string_pretty(&payload).expect("JSON error payload"),
-    )])
+    CallToolResult::structured_error(payload)
 }
 
 /// Validate an optional limit argument.
@@ -250,6 +270,83 @@ mod tests {
     }
 
     #[test]
+    fn unknown_remote_failure_is_not_guessed_as_validation_or_discord_denial() {
+        let result = remote_error(
+            "get_member",
+            RpcClientError::Remote {
+                code: -39999,
+                message: "unclassified".into(),
+                data: None,
+            },
+        );
+        let payload = result_json(&result);
+        assert_eq!(payload["error"]["code"], "UNKNOWN_ERROR");
+        assert_eq!(payload["error"]["layer"], "unknown");
+        assert!(payload["error"]["http_status"].is_null());
+        assert!(payload["error"]["discord_code"].is_null());
+        assert_eq!(result.structured_content.as_ref(), Some(&payload));
+    }
+
+    #[test]
+    fn cache_errors_have_identical_text_and_structured_content() {
+        let result = remote_error(
+            "get_member",
+            RpcClientError::Remote {
+                code: -32004,
+                message: "cache operation failed".into(),
+                data: Some(
+                    json!({"error":{"code":"CACHE_SQLITE_ERROR", "error_source":"cache", "operation":"cache", "retryable":false, "message":"cache operation failed; inspect daemon database diagnostics"}}),
+                ),
+            },
+        );
+        let text = result_json(&result);
+        assert_eq!(result.structured_content.as_ref(), Some(&text));
+        assert_eq!(text["error"]["code"], "CACHE_SQLITE_ERROR");
+        assert_eq!(text["error"]["error_source"], "cache");
+        assert_eq!(text["error"]["operation"], "get_member");
+        assert_eq!(text["error"]["retryable"], false);
+        assert_eq!(text["rpc_code"], -32004);
+        let local = tool_error(
+            "start_sync",
+            ErrorData::invalid_params("invalid tool arguments", None),
+        );
+        assert_eq!(
+            local.structured_content.as_ref(),
+            Some(&result_json(&local))
+        );
+    }
+
+    #[test]
+    fn sync_schemas_and_deserializers_reject_unimplemented_controls() {
+        for value in [
+            json!({"dryrun":true}),
+            json!({"exclude":["200"]}),
+            json!({"max_target":1}),
+            json!({"safety":{"dry_run":true}}),
+        ] {
+            assert!(
+                serde_json::from_value::<account::AccountSyncArgs>(value.clone()).is_err(),
+                "account controls must fail: {value}"
+            );
+            assert!(
+                serde_json::from_value::<sync::StartSyncArgs>(value.clone()).is_err(),
+                "legacy controls must fail: {value}"
+            );
+        }
+        for name in ["start_account_sync", "start_sync"] {
+            let tool = DiscordReaderTools::tool_router()
+                .list_all()
+                .into_iter()
+                .find(|tool| tool.name == name)
+                .unwrap();
+            assert_eq!(
+                tool.input_schema.get("additionalProperties"),
+                Some(&json!(false))
+            );
+        }
+    }
+
+    #[test]
     fn remote_errors_prefer_data_and_retain_legacy_message_compatibility() {
         let result = remote_error(
             "get_message",
@@ -284,6 +381,7 @@ mod tests {
         let result = tool_error("recent_messages", limit_or(Some(0), 50, 100).unwrap_err());
         let value = result_json(&result);
         assert_eq!(value["error"]["code"], "INVALID_PARAMS");
+        assert_eq!(value["error"]["argument_code"], "INVALID_ARGUMENT");
         assert_eq!(value["error"]["operation"], "recent_messages");
         assert_eq!(value["error"]["retryable"], false);
         let timeout = result_json(&remote_error("start_sync", RpcClientError::Timeout));
@@ -370,6 +468,11 @@ mod tests {
             .collect();
         names.sort();
         let mut expected = [
+            "get_account_gaps",
+            "get_inbox_state",
+            "notification_outbox",
+            "patch_inbox_state",
+            "record_account_gap",
             "get_me",
             "get_capabilities",
             "get_read_state",
@@ -410,6 +513,9 @@ mod tests {
             "update", "post", "put", "patch",
         ];
         for name in &names {
+            if name == "patch_inbox_state" {
+                continue;
+            }
             for verb in banned {
                 assert!(
                     !name.contains(verb),

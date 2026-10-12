@@ -11,6 +11,9 @@ use crate::message_lookup::MessageLookup;
 
 /// Retained messages awaiting authentic metadata, ordered newest first.
 pub(crate) trait RefetchCache: Send + Sync {
+    fn withheld(&self, _channel: &str) -> Result<bool, StoreError> {
+        Ok(false)
+    }
     fn pending(
         &self,
         channel: &str,
@@ -42,15 +45,38 @@ pub(crate) struct RefetchReport {
 
 pub(crate) struct SqliteRefetchCache {
     store: Arc<Store>,
+    execution_policy: Option<Option<String>>,
 }
 
 impl SqliteRefetchCache {
+    #[cfg(test)]
     pub(crate) fn new(store: Arc<Store>) -> Self {
-        Self { store }
+        Self {
+            store,
+            execution_policy: None,
+        }
+    }
+}
+
+impl SqliteRefetchCache {
+    pub(crate) fn with_execution_policy(store: Arc<Store>, user: Option<String>) -> Self {
+        Self {
+            store,
+            execution_policy: Some(user),
+        }
     }
 }
 
 impl RefetchCache for SqliteRefetchCache {
+    fn withheld(&self, channel: &str) -> Result<bool, StoreError> {
+        match &self.execution_policy {
+            None => Ok(false),
+            Some(None) => self.store.has_execution_restrictions(),
+            Some(Some(user)) => Ok(self.store.target_sync_withheld(user, channel)?
+                || (self.store.has_execution_restrictions()?
+                    && !self.store.target_execution_scope_known(user, channel)?)),
+        }
+    }
     fn pending(
         &self,
         channel: &str,
@@ -136,6 +162,18 @@ pub(crate) async fn run_refetch(
         let mut channel_exhausted = false;
         let mut before = refetch_before.get(channel).cloned();
         while report.attempted < u64::from(max_messages) {
+            match cache.withheld(channel) {
+                Ok(false) => {}
+                Ok(true) => {
+                    report.failures.push(json!({"channel_id":channel,"error":{"code":"execution_withheld","layer":"orchestration_approval","retryable":false,"http_status":null,"discord_code":null}}));
+                    break;
+                }
+                Err(error) => {
+                    report.failures.push(cache_failure(channel, error));
+                    cache_failed = true;
+                    break;
+                }
+            }
             let pending = match cache.pending(channel, before.as_deref(), 1) {
                 Ok(pending) => pending,
                 Err(error) => {
@@ -265,6 +303,53 @@ mod tests {
         connection.execute_batch("CREATE TABLE messages (id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, guild_id TEXT, author_id TEXT, timestamp TEXT NOT NULL, edited_timestamp TEXT, content TEXT NOT NULL); INSERT INTO messages VALUES ('10','200',NULL,'7','2026-10-07T08:30:00Z',NULL,'retained'),('20','200',NULL,'7','2026-10-07T08:30:00Z',NULL,'retained');").unwrap();
         drop(connection);
         Arc::new(Store::open(path).unwrap())
+    }
+
+    #[tokio::test]
+    async fn policy_inserted_during_refetch_stops_before_next_attempt_or_boundary() {
+        struct RestrictingLookup {
+            store: Arc<Store>,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait]
+        impl MessageLookup for RestrictingLookup {
+            async fn lookup(&self, _: &str, id: &str) -> Result<LocatedMessage, LookupError> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.store
+                    .persist_account_exclusions(
+                        "9",
+                        &[],
+                        &["200".into()],
+                        &discord_store::sqlite::now_iso(),
+                    )
+                    .unwrap();
+                Ok(LocatedMessage {
+                    message: message(id),
+                    raw: json!({}),
+                    operation: "test".into(),
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = legacy_store(&dir.path().join("test.sqlite"));
+        let lookup = RestrictingLookup {
+            store: Arc::clone(&store),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let cache = SqliteRefetchCache::with_execution_policy(store, None);
+        let report = run_refetch(
+            &cache,
+            &lookup,
+            &Progress::default(),
+            &["200".into()],
+            10,
+            &HashMap::new(),
+        )
+        .await;
+        assert_eq!(lookup.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.next_refetch_before["200"], "20");
+        assert_eq!(report.failures[0]["error"]["code"], "execution_withheld");
     }
 
     #[tokio::test]

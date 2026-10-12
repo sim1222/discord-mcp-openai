@@ -36,6 +36,7 @@ pub struct ChangedChannelsArgs {
 
 /// Arguments for `start_sync`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StartSyncArgs {
     /// What to sync: `mentions`, `replies`, `changed_channels`, `all` or `refetch`.
     /// Defaults to `changed_channels`.

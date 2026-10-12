@@ -24,6 +24,8 @@ RUN mkdir -p crates/discord-api/src crates/discord-store/src \
     && cargo build --release -p discord-reader-mcp || true
 
 COPY crates ./crates
+ARG SOURCE_REVISION=unknown
+ENV DISCORD_READER_BUILD_SHA=${SOURCE_REVISION}
 RUN rm -f crates/discord-reader-mcp/src/lib.rs \
     && touch crates/discord-api/src/lib.rs crates/discord-store/src/lib.rs \
         crates/discord-reader-daemon/src/lib.rs crates/discord-reader-daemon/src/main.rs \

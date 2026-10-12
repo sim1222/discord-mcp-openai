@@ -58,6 +58,9 @@ async fn account_tools_handle_large_inventory_optional_arguments_and_errors_in_o
                     "get_read_state" => {
                         json!({"id":request["id"],"result":{"read_state":[],"complete":false}})
                     }
+                    "get_member" => {
+                        json!({"id":request["id"],"error":{"code":-32004,"message":"cache operation failed; inspect daemon database diagnostics","data":{"error":{"code":"CACHE_SQLITE_ERROR","error_source":"cache","operation":"get_member","retryable":false,"message":"cache operation failed; inspect daemon database diagnostics"}}}})
+                    }
                     "get_me" => json!({"id":request["id"],"result":{"me":{"id":"7"}}}),
                     _ => panic!("unexpected synthetic RPC method"),
                 };
@@ -108,6 +111,11 @@ async fn account_tools_handle_large_inventory_optional_arguments_and_errors_in_o
             false,
         ),
         ("get_me", None, false),
+        ("get_member", Some(json!({"guild_id":"42"})), true),
+        ("start_account_sync", Some(json!({"dryrun":true})), true),
+        ("start_account_sync", Some(json!({"exclude":["200"]})), true),
+        ("start_sync", Some(json!({"safety":{"dry_run":true}})), true),
+        ("start_sync", Some(json!({"scpoe":"all"})), true),
     ];
     for (index, (name, arguments, expected_error)) in calls.into_iter().enumerate() {
         let id = index + 2;
@@ -147,8 +155,20 @@ async fn account_tools_handle_large_inventory_optional_arguments_and_errors_in_o
                 "exercise a response larger than one MiB"
             );
         } else if expected_error {
-            assert_eq!(result["error"]["code"], "temporary_failure");
-            assert_eq!(result["error"]["retryable"], true);
+            assert_eq!(response["result"]["structuredContent"], result);
+            if name == "get_member" {
+                assert_eq!(result["error"]["code"], "CACHE_SQLITE_ERROR");
+                assert_eq!(result["error"]["error_source"], "cache");
+                assert_eq!(result["error"]["operation"], "get_member");
+                assert_eq!(result["error"]["retryable"], false);
+                assert_eq!(result["rpc_code"], -32004);
+            } else if name.starts_with("start_") {
+                assert_eq!(result["error"]["code"], "INVALID_PARAMS");
+                assert_eq!(result["error"]["retryable"], false);
+            } else {
+                assert_eq!(result["error"]["code"], "temporary_failure");
+                assert_eq!(result["error"]["retryable"], true);
+            }
         } else if name == "get_account_coverage" {
             assert_eq!(result["coverage"]["targets_total"], 13_000);
         } else if name == "get_me" {
@@ -156,7 +176,10 @@ async fn account_tools_handle_large_inventory_optional_arguments_and_errors_in_o
         }
     }
     let requests = observed.lock().unwrap();
-    assert_eq!(requests.len(), 8);
+    assert_eq!(requests.len(), 9);
+    assert!(requests
+        .iter()
+        .all(|request| !request["method"].as_str().unwrap().starts_with("start_")));
     assert_eq!(requests[0]["params"]["guild_id"], "42");
     assert_eq!(requests[0]["params"]["refresh"], false);
     assert_eq!(requests[1]["params"]["refresh"], true);

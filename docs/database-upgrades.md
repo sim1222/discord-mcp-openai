@@ -10,11 +10,11 @@ log its canonical path, `PRAGMA user_version`, and migration history (version,
 timestamp, backup path). The daemon does not bind its RPC socket until opening,
 migrating, and validating the database succeeds.
 
-Version 3 accepts a fresh database, the original unversioned schema, and the
+Version 5 accepts a fresh database, the original unversioned schema, and the
 previous unversioned v2 schema. Version 1 is also accepted when its shape is
 compatible. Higher versions and incompatible schemas fail startup. Each open
 checks required column types, nullability, defaults, primary keys, declared
-indexes, and the FTS definition against a fresh canonical schema. Version 3
+indexes, and the FTS definition against a fresh canonical schema. Version 5
 must also have its migration history entry; drift is not silently repaired.
 
 Before changing a populated database, SQLite `VACUUM INTO` creates a consistent
@@ -26,7 +26,7 @@ retained for manual recovery and are never overwritten.
 
 Migration runs in an IMMEDIATE transaction, rechecks the version under its
 write lock, adds the three nullable legacy columns, creates the other current tables
-and indexes, validates the complete schema, and records version 3 and its
+and indexes, validates the complete schema, and records version 5 and its
 backup path atomically. Missing FTS is rebuilt from retained message content;
 existing compatible FTS is preserved. Validation failure rolls back the schema
 and history. Reopening a migrated database does not migrate again or create a
@@ -264,3 +264,75 @@ sync page commit in one transaction. On restart pending/running account jobs are
 marked interrupted; starting another account round uses their persisted target
 checkpoints. Snapshot and workflow records survive restart. Snapshot retention is
 currently unbounded and must be considered when sizing the local cache.
+
+## Version 4 observation and delivery state
+
+Version 4 separates channel metadata acquisition from body attempts and successful
+body observations. Metadata timestamps are never copied into a body-success field.
+Existing rows without evidence remain unknown. A successful empty body page can
+record body success without inventing a message cursor or complete history.
+Account failure gaps preserve their original successful cursor and remain distinct
+from later successes or caller-reported execution restrictions.
+
+The upgrade also adds a workflow revision column, defaulting retained workflow rows
+to revision 1, and a durable notification outbox. A missing workflow has revision 0.
+Existing full-replacement writes retain their replacement semantics and increment
+the revision. Partial writes distinguish omitted fields, explicit null, and values;
+they commit only when expected_version matches the current revision. The workflow
+JSON remains compatible with existing readers.
+
+Outbox identity includes account, channel, message, material version, and notification
+kind. Claims and workflow eligibility checks use IMMEDIATE transactions, including
+between independent database connections. Each claim receives a fresh opaque token.
+A claim that expires before delivery starts may be reclaimed. A delivery that starts
+and then loses its worker becomes ambiguous_delivery when its expired claim is
+inspected, and cannot be claimed again. External receipt import can reconcile that
+state; repeated import of the same receipt preserves the first delivery observation.
+An explicit not_sent result allows retry only when the caller has evidence that no
+external delivery occurred. The reader does not send notifications itself.
+
+available_at preserves quiet-hours deferral across restart. Claim and delivery-start
+operations recheck the latest workflow revision, completion, snooze, and prior
+notification state. Material-change renotification is an explicit caller policy;
+the caller must supply a stable material version and avoid changing it for minor
+edits. A completed workflow remains ineligible even for material changes. There is
+no unconditional exactly-once guarantee across an external service.
+
+Schema validation, backup, rollback, and preservation of existing message, cursor,
+and snapshot state continue to apply. No upgrade deletes or resets the database.
+Local migration and reopen fixtures are separate from production runtime checks;
+this implementation session has not upgraded a production database.
+
+Outbox queue inspection uses bounded live row-ID keyset pages. Its default view
+excludes delivered history, while an explicit status filter can inspect that
+history separately. Continuation binds account and filter in the RPC adapter.
+Concurrent status changes can alter membership; restart the inspection round to
+find entries whose membership changed behind the cursor. Database rebuild or row-ID
+renumbering maintenance also requires a new round. This queue cursor is not an
+immutable delivery or workflow snapshot.
+
+Inbox delivery evidence can aggregate outbox states across all retained material
+versions and notification kinds for the exact account/channel/message. It exposes
+counts and the latest historical delivery observation without receipts or claim
+tokens. A prior delivered or imported item is labelled prior_delivery_recorded;
+current-material delivery remains unknown unless that material version is supplied
+and checked separately. No local record is proof that other notification paths have
+not delivered the item. Latest-time ordering uses SQLite datetime precision and
+discloses that basis.
+
+Each outbox write advances a local entry revision. Revalidation/rescheduling is an
+explicit queued-only operation requiring both expected_entry_version and the
+current expected_workflow_version. It updates available_at and the workflow
+reference under one IMMEDIATE transaction while preserving the material key and
+renotification policy. This lets a caller clear a snooze, reread current versions,
+and explicitly revalidate the same queued candidate. Stale writers conflict;
+claimed, sending, ambiguous, and delivered entries cannot be revalidated or reset.
+Existing retained JSON without a revision starts at revision 1 when loaded.
+
+
+## Version 5 resumable discovery
+
+Version 5 adds account- and scope-bound discovery checkpoints. Remaining guild
+pages, channel discovery and thread parents can survive bounded rounds and database
+reopening. It preserves version-4 body timestamps, workflow revisions, gaps, member
+observations and notification records. Checkpoint JSON never contains credentials.

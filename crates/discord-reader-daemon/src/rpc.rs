@@ -86,7 +86,8 @@ impl RpcError {
                 -32601 => ("METHOD_NOT_FOUND", "client"),
                 -32700 => ("PARSE_ERROR", "client"),
                 -32600 => ("INVALID_REQUEST", "client"),
-                _ => ("INTERNAL_ERROR", "daemon"),
+                -32603 => ("INTERNAL_ERROR", "daemon"),
+                _ => ("UNKNOWN_ERROR", "unknown"),
             };
             self.data = Some(serde_json::json!({"error": {
                 "error_source": source, "code": code, "operation": operation,
@@ -94,11 +95,14 @@ impl RpcError {
             }}));
         }
         if let Some(data) = self.data.as_mut() {
+            if data["error"]["code"] == "INVALID_PARAMS" {
+                data["error"]["argument_code"] = Value::String("INVALID_ARGUMENT".into());
+            }
             if data["error"].get("error_source").is_none() {
-                data["error"]["error_source"] = Value::String("daemon".into());
+                data["error"]["error_source"] = Value::String("unknown".into());
             }
             if data["error"].get("code").is_none() {
-                data["error"]["code"] = Value::String("INTERNAL_ERROR".into());
+                data["error"]["code"] = Value::String("UNKNOWN_ERROR".into());
             }
             if data["error"].get("retryable").is_none() {
                 data["error"]["retryable"] = Value::Bool(false);
@@ -304,6 +308,7 @@ pub struct ThreadsParams {
 
 /// Parameters for `start_sync`.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SyncStartParams {
     /// `mentions`, `replies`, `changed_channels`, `all` or `refetch`.
     #[serde(default)]
@@ -322,7 +327,9 @@ pub struct SyncStartParams {
 
 /// Scope for a read-state observation; IDs are Discord snowflake strings.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReadStateParams {
+    pub pagination_mode: Option<String>,
     pub guild_id: Option<String>,
     pub channel_id: Option<String>,
     #[serde(default = "default_true")]
@@ -362,7 +369,21 @@ pub struct InboxStateParams {
 
 /// Bounds for one fair account synchronization round.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AccountSyncParams {
+    pub guild_ids: Option<Vec<String>>,
+    pub channel_ids: Option<Vec<String>>,
+    pub exclude_guild_ids: Option<Vec<String>>,
+    pub exclude_channel_ids: Option<Vec<String>>,
+    pub include_dms: Option<bool>,
+    pub include_threads: Option<bool>,
+    pub dry_run: Option<bool>,
+    pub max_discovery_http_requests: Option<u32>,
+    pub max_body_http_requests: Option<u32>,
+    pub max_messages: Option<u32>,
+    pub max_duration_seconds: Option<u32>,
+    pub concurrency: Option<u32>,
+
     pub max_targets: Option<u32>,
     pub page_size: Option<u8>,
     #[serde(default = "default_true")]
@@ -427,6 +448,36 @@ pub trait ReaderApi: Send + Sync {
             "account synchronization unavailable",
         ))
     }
+    async fn get_inbox_state(
+        &self,
+        _params: crate::local_state::InboxItemParams,
+    ) -> Result<Value, RpcError> {
+        Err(RpcError::internal("local workflow operation unavailable"))
+    }
+    async fn patch_inbox_state(
+        &self,
+        _params: crate::local_state::InboxPatchParams,
+    ) -> Result<Value, RpcError> {
+        Err(RpcError::internal("local workflow operation unavailable"))
+    }
+    async fn get_account_gaps(
+        &self,
+        _params: crate::local_state::GapListParams,
+    ) -> Result<Value, RpcError> {
+        Err(RpcError::internal("local workflow operation unavailable"))
+    }
+    async fn record_account_gap(
+        &self,
+        _params: crate::local_state::GapRecordParams,
+    ) -> Result<Value, RpcError> {
+        Err(RpcError::internal("local workflow operation unavailable"))
+    }
+    async fn notification_outbox(
+        &self,
+        _params: crate::local_state::NotificationParams,
+    ) -> Result<Value, RpcError> {
+        Err(RpcError::internal("local workflow operation unavailable"))
+    }
     async fn cancel_sync(&self, _params: SyncProgressParams) -> Result<Value, RpcError> {
         Err(RpcError::invalid_params("cancellation unavailable"))
     }
@@ -490,6 +541,142 @@ fn parse<T: for<'de> Deserialize<'de>>(params: &Value) -> Result<T, RpcError> {
         .map_err(|e| RpcError::invalid_params(format!("invalid params: {e}")))
 }
 
+pub(crate) fn validate_account_sync(
+    params: &AccountSyncParams,
+) -> Result<crate::account_sync::AccountSyncOptions, RpcError> {
+    check_limit(params.max_targets.unwrap_or(50), 1000)?;
+    check_limit(u32::from(params.page_size.unwrap_or(100)), 100)?;
+    let valid = |id: &str| {
+        !id.is_empty()
+            && id.bytes().all(|b| b.is_ascii_digit())
+            && id.parse::<u64>().is_ok_and(|id| id > 0)
+    };
+    for list in [
+        &params.guild_ids,
+        &params.channel_ids,
+        &params.exclude_guild_ids,
+        &params.exclude_channel_ids,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if list.iter().any(|id| !valid(id)) {
+            return Err(RpcError::invalid_params(
+                "scope IDs must be positive Discord ID strings",
+            ));
+        }
+    }
+    if params.guild_ids.as_ref().is_some_and(Vec::is_empty)
+        || params.channel_ids.as_ref().is_some_and(Vec::is_empty)
+    {
+        return Err(RpcError::invalid_params(
+            "explicit allowlists must not be empty",
+        ));
+    }
+    for (allow, exclude) in [
+        (&params.guild_ids, &params.exclude_guild_ids),
+        (&params.channel_ids, &params.exclude_channel_ids),
+    ] {
+        if allow.as_ref().is_some_and(|allow| {
+            exclude
+                .as_ref()
+                .is_some_and(|exclude| allow.iter().any(|id| exclude.contains(id)))
+        }) {
+            return Err(RpcError::invalid_params(
+                "allowlists and exclusions must not overlap",
+            ));
+        }
+    }
+    if params.concurrency.unwrap_or(1) != 1 {
+        return Err(RpcError::invalid_params("only concurrency=1 is supported"));
+    }
+    if params
+        .max_duration_seconds
+        .is_some_and(|value| !(1..=3600).contains(&value))
+        || params.max_messages.is_some_and(|value| value > 100000)
+        || params
+            .max_discovery_http_requests
+            .is_some_and(|value| value > 100000)
+        || params
+            .max_body_http_requests
+            .is_some_and(|value| value > 100000)
+    {
+        return Err(RpcError::invalid_params(
+            "invalid account synchronization budget",
+        ));
+    }
+    Ok(crate::account_sync::AccountSyncOptions {
+        max_targets: params.max_targets.unwrap_or(50),
+        page_size: params.page_size.unwrap_or(100),
+        refresh_inventory: params.refresh_inventory,
+        scope: crate::account_sync::AccountScope {
+            guild_ids: params.guild_ids.clone(),
+            channel_ids: params.channel_ids.clone(),
+            exclude_guild_ids: params.exclude_guild_ids.clone().unwrap_or_default(),
+            exclude_channel_ids: params.exclude_channel_ids.clone().unwrap_or_default(),
+            include_dms: params.include_dms.unwrap_or(true),
+            include_threads: params.include_threads.unwrap_or(true),
+        },
+        max_discovery_http_requests: params.max_discovery_http_requests.unwrap_or(3000),
+        max_body_http_requests: params.max_body_http_requests.unwrap_or(3000),
+        max_messages: params.max_messages.unwrap_or(100000),
+        max_duration_seconds: params.max_duration_seconds.unwrap_or(60),
+        identity_http_reservation: 0,
+        execution_timeout: None,
+    })
+}
+
+pub(crate) fn validate_sync_start(params: &SyncStartParams) -> Result<(), RpcError> {
+    let scope = params.scope.as_deref().unwrap_or("changed_channels");
+    if !matches!(
+        scope,
+        "changed_channels" | "all" | "mentions" | "replies" | "refetch"
+    ) {
+        return Err(RpcError::invalid_params("unknown sync scope"));
+    }
+    check_limit(params.max_messages.unwrap_or(100), 1000)?;
+    let valid_id = |value: &str| {
+        !value.is_empty()
+            && value.bytes().all(|b| b.is_ascii_digit())
+            && value.parse::<u64>().is_ok_and(|id| id > 0)
+    };
+    if params.guild_id.as_deref().is_some_and(|id| !valid_id(id)) {
+        return Err(RpcError::invalid_params(
+            "guild_id must be a positive Discord ID string",
+        ));
+    }
+    if let Some(channels) = &params.channel_ids {
+        if channels.is_empty() || channels.iter().any(|id| !valid_id(id)) {
+            return Err(RpcError::invalid_params(
+                "channel_ids must be a nonempty list of positive Discord ID strings",
+            ));
+        }
+    }
+    if let Some(boundaries) = &params.refetch_before {
+        if scope != "refetch" {
+            return Err(RpcError::invalid_params(
+                "refetch_before is only valid for scope refetch",
+            ));
+        }
+        if boundaries
+            .iter()
+            .any(|(channel, message)| !valid_id(channel) || !valid_id(message))
+        {
+            return Err(RpcError::invalid_params(
+                "refetch_before must contain positive Discord ID strings",
+            ));
+        }
+        if let Some(channels) = &params.channel_ids {
+            if boundaries.keys().any(|channel| !channels.contains(channel)) {
+                return Err(RpcError::invalid_params(
+                    "refetch_before channels must belong to channel_ids",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Dispatch one request. Returns `None` for notification-style requests (no
 /// `id`), which get no response line.
 pub async fn dispatch(api: &dyn ReaderApi, request: RpcRequest) -> Option<RpcResponse> {
@@ -501,8 +688,18 @@ pub async fn dispatch(api: &dyn ReaderApi, request: RpcRequest) -> Option<RpcRes
             "get_capabilities" => api.get_capabilities().await,
             "get_read_state" => api.get_read_state(parse(&params)?).await,
             "record_inbox_state" => api.record_inbox_state(parse(&params)?).await,
+            "get_inbox_state" => api.get_inbox_state(parse(&params)?).await,
+            "patch_inbox_state" => api.patch_inbox_state(parse(&params)?).await,
+            "get_account_gaps" => api.get_account_gaps(parse(&params)?).await,
+            "record_account_gap" => api.record_account_gap(parse(&params)?).await,
+            "notification_outbox" => api.notification_outbox(parse(&params)?).await,
+
             "get_account_coverage" => api.get_account_coverage_page(parse(&params)?).await,
-            "start_account_sync" => api.start_account_sync(parse(&params)?).await,
+            "start_account_sync" => {
+                let p: AccountSyncParams = parse(&params)?;
+                validate_account_sync(&p)?;
+                api.start_account_sync(p).await
+            }
             "cancel_sync" => api.cancel_sync(parse(&params)?).await,
             "list_guilds" => api.list_guilds().await,
             "list_channels" => {
@@ -577,6 +774,7 @@ pub async fn dispatch(api: &dyn ReaderApi, request: RpcRequest) -> Option<RpcRes
             "get_sync_status" => api.get_sync_status_page(parse(&params)?).await,
             "start_sync" => {
                 let p: SyncStartParams = parse(&params)?;
+                validate_sync_start(&p)?;
                 api.start_sync(p).await
             }
             "get_sync_progress" => {
@@ -736,6 +934,11 @@ mod tests {
             let error = error.with_operation("list_changed_channels");
             let data = error.data.unwrap();
             assert_eq!(data["error"]["code"], code);
+            if code == "INVALID_PARAMS" {
+                assert_eq!(data["error"]["argument_code"], "INVALID_ARGUMENT");
+            } else {
+                assert!(data["error"]["argument_code"].is_null());
+            }
             assert_eq!(data["error"]["error_source"], source);
             assert_eq!(data["error"]["operation"], "list_changed_channels");
             assert_eq!(data["error"]["retryable"], false);
@@ -762,7 +965,9 @@ mod tests {
     use serde_json::json;
 
     #[derive(Default)]
-    struct FakeApi;
+    struct FakeApi {
+        sync_calls: std::sync::atomic::AtomicUsize,
+    }
 
     #[async_trait::async_trait]
     impl ReaderApi for FakeApi {
@@ -830,7 +1035,14 @@ mod tests {
             Ok(json!({}))
         }
         async fn start_sync(&self, _p: SyncStartParams) -> Result<Value, RpcError> {
+            self.sync_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(json!({"job_id": "1"}))
+        }
+        async fn start_account_sync(&self, _p: AccountSyncParams) -> Result<Value, RpcError> {
+            self.sync_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(json!({"job_id": "2"}))
         }
         async fn get_sync_progress(&self, _p: SyncProgressParams) -> Result<Value, RpcError> {
             Ok(json!({"progress": null}))
@@ -847,7 +1059,139 @@ mod tests {
     }
 
     fn api() -> Arc<dyn ReaderApi> {
-        Arc::new(FakeApi)
+        Arc::new(FakeApi::default())
+    }
+
+    #[tokio::test]
+    async fn local_workflow_routes_reject_unknown_fields_before_api() {
+        for method in [
+            "get_inbox_state",
+            "patch_inbox_state",
+            "get_account_gaps",
+            "record_account_gap",
+            "notification_outbox",
+        ] {
+            let result = dispatch(
+                &FakeApi::default(),
+                RpcRequest {
+                    id: Some(1),
+                    method: method.into(),
+                    params: json!({"channel_id":"2","message_id":"3","unknown_control":true}),
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.error.unwrap().code, -32602, "{method}");
+        }
+    }
+
+    #[test]
+    fn account_scope_and_budget_contract_is_strict() {
+        for params in [
+            json!({"guild_ids":[]}),
+            json!({"channel_ids":["invalid"]}),
+            json!({"guild_ids":["10"],"exclude_guild_ids":["10"]}),
+            json!({"channel_ids":["20"],"exclude_channel_ids":["20"]}),
+            json!({"concurrency":2}),
+            json!({"max_duration_seconds":0}),
+        ] {
+            let params: AccountSyncParams = serde_json::from_value(params).unwrap();
+            assert!(validate_account_sync(&params).is_err());
+        }
+        let params:AccountSyncParams=serde_json::from_value(json!({"guild_ids":["10"],"exclude_channel_ids":["20"],"dry_run":true,"max_body_http_requests":0,"include_dms":false})).unwrap();
+        let options = validate_account_sync(&params).unwrap();
+        assert_eq!(options.max_body_http_requests, 0);
+        assert_eq!(options.scope.guild_ids, Some(vec!["10".into()]));
+        assert!(!options.scope.include_dms);
+    }
+
+    #[tokio::test]
+    async fn rejected_sync_arguments_never_invoke_job_api() {
+        let api = FakeApi::default();
+        for method in ["start_account_sync", "start_sync"] {
+            for params in [
+                json!({"exclude":["200"]}),
+                json!({"dryrun":true}),
+                json!({"safety":{"exclude":["200"]}}),
+                json!({"max_target":1}),
+            ] {
+                let response = dispatch(
+                    &api,
+                    RpcRequest {
+                        id: Some(1),
+                        method: method.into(),
+                        params,
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    response.error.as_ref().map(|error| error.code),
+                    Some(-32602),
+                    "{method}: {response:?}"
+                );
+            }
+        }
+        for params in [
+            json!({"channel_ids":[]}),
+            json!({"guild_id":"invalid"}),
+            json!({"channel_ids":["0"]}),
+            json!({"scope":"unknown"}),
+            json!({"scope":"all","refetch_before":{}}),
+            json!({"max_messages":0}),
+            json!({"scope":"refetch","refetch_before":{"200":"invalid"}}),
+        ] {
+            let response = dispatch(
+                &api,
+                RpcRequest {
+                    id: Some(1),
+                    method: "start_sync".into(),
+                    params,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                response.error.as_ref().map(|error| error.code),
+                Some(-32602)
+            );
+        }
+        for params in [
+            json!({"max_targets":0}),
+            json!({"page_size":0}),
+            json!({"page_size":101}),
+        ] {
+            let response = dispatch(
+                &api,
+                RpcRequest {
+                    id: Some(1),
+                    method: "start_account_sync".into(),
+                    params,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                response.error.as_ref().map(|error| error.code),
+                Some(-32602)
+            );
+        }
+        assert_eq!(api.sync_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        for method in ["start_sync", "start_account_sync"] {
+            assert!(dispatch(
+                &api,
+                RpcRequest {
+                    id: Some(1),
+                    method: method.into(),
+                    params: json!({})
+                }
+            )
+            .await
+            .unwrap()
+            .error
+            .is_none());
+        }
+        assert_eq!(api.sync_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

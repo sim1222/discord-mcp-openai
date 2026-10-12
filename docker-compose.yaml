@@ -11,6 +11,8 @@ services:
     build:
       context: .
       dockerfile: docker/discord-reader.Dockerfile
+      args:
+        SOURCE_REVISION: ${DISCORD_READER_BUILD_SHA:-unknown}
     restart: unless-stopped
 
     # The ONLY service that sees the Discord credential.
@@ -52,6 +54,8 @@ services:
     build:
       context: .
       dockerfile: docker/discord-mcp.Dockerfile
+      args:
+        SOURCE_REVISION: ${DISCORD_READER_BUILD_SHA:-unknown}
     restart: unless-stopped
 
     # No secrets here: the MCP server never sees a Discord credential.

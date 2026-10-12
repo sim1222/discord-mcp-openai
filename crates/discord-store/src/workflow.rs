@@ -20,8 +20,111 @@ pub struct InboxWorkflow {
     pub completion_evidence: Option<String>,
 }
 
+/// A partial update distinguishes an omitted field from explicit null.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum FieldPatch<T> {
+    #[default]
+    Keep,
+    Clear,
+    Set(T),
+}
+
+impl<T: serde::Serialize> Serialize for FieldPatch<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Set(value) => value.serialize(serializer),
+            _ => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for FieldPatch<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Option::<T>::deserialize(deserializer).map(|value| value.map_or(Self::Clear, Self::Set))
+    }
+}
+
+impl<T> FieldPatch<T> {
+    fn is_keep(&self) -> bool {
+        matches!(self, Self::Keep)
+    }
+    fn apply(&self, value: &mut Option<T>)
+    where
+        T: Clone,
+    {
+        match self {
+            Self::Keep => {}
+            Self::Clear => *value = None,
+            Self::Set(new) => *value = Some(new.clone()),
+        }
+    }
+}
+
+/// Atomic local workflow update; version zero represents an absent row.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InboxWorkflowPatch {
+    pub expected_version: u64,
+    #[serde(default, skip_serializing_if = "FieldPatch::is_keep")]
+    pub notified_at: FieldPatch<String>,
+    #[serde(default, skip_serializing_if = "FieldPatch::is_keep")]
+    pub snoozed_until: FieldPatch<String>,
+    #[serde(default, skip_serializing_if = "FieldPatch::is_keep")]
+    pub action_required: FieldPatch<bool>,
+    #[serde(default, skip_serializing_if = "FieldPatch::is_keep")]
+    pub action_evidence: FieldPatch<String>,
+    #[serde(default, skip_serializing_if = "FieldPatch::is_keep")]
+    pub completed_at: FieldPatch<String>,
+    #[serde(default, skip_serializing_if = "FieldPatch::is_keep")]
+    pub completion_evidence: FieldPatch<String>,
+}
+
+/// Retained workflow together with its concurrency revision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowRevision {
+    pub workflow: InboxWorkflow,
+    pub version: u64,
+}
+
+/// A stale writer cannot overwrite newer user confirmations.
+#[derive(Debug, thiserror::Error)]
+pub enum WorkflowUpdateError {
+    #[error("workflow version conflict (expected {expected}, current {current})")]
+    Conflict { expected: u64, current: u64 },
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+pub(super) fn load_revision(
+    conn: &rusqlite::Connection,
+    user: &str,
+    channel: &str,
+    message: &str,
+) -> Result<Option<WorkflowRevision>, StoreError> {
+    let row: Option<(String,i64)> = conn.query_row("SELECT workflow_json,revision FROM inbox_workflow WHERE account_user_id=?1 AND channel_id=?2 AND message_id=?3", params![user,channel,message], |row| Ok((row.get(0)?,row.get(1)?))).optional()?;
+    row.map(|(json, version)| {
+        let workflow: InboxWorkflow = serde_json::from_str(&json)
+            .map_err(|_| StoreError::Data("invalid retained workflow state".into()))?;
+        workflow.validate()?;
+        if workflow.account_user_id != user
+            || workflow.channel_id != channel
+            || workflow.message_id != message
+        {
+            return Err(StoreError::Data(
+                "retained workflow account or message mismatch".into(),
+            ));
+        }
+        Ok(WorkflowRevision {
+            workflow,
+            version: u64::try_from(version)
+                .map_err(|_| StoreError::Data("invalid workflow revision".into()))?,
+        })
+    })
+    .transpose()
+}
+
 impl InboxWorkflow {
-    fn validate(&self) -> Result<(), StoreError> {
+    pub(super) fn validate(&self) -> Result<(), StoreError> {
         validate_ids(&self.account_user_id, &self.channel_id, &self.message_id)?;
         for timestamp in [&self.notified_at, &self.snoozed_until, &self.completed_at]
             .into_iter()
@@ -54,7 +157,7 @@ impl InboxWorkflow {
     }
 }
 
-fn validate_ids(user: &str, channel: &str, message: &str) -> Result<(), StoreError> {
+pub(super) fn validate_ids(user: &str, channel: &str, message: &str) -> Result<(), StoreError> {
     for id in [user, channel, message] {
         if !id.bytes().all(|byte| byte.is_ascii_digit())
             || id.parse::<u64>().ok().is_none_or(|id| id == 0)
@@ -74,7 +177,7 @@ impl Store {
         let workflow_json = serde_json::to_string(workflow)
             .map_err(|_| StoreError::Data("invalid workflow state".into()))?;
         self.conn.lock().expect("store lock").execute(
-            "INSERT INTO inbox_workflow(account_user_id,channel_id,message_id,workflow_json) VALUES(?1,?2,?3,?4) ON CONFLICT(account_user_id,channel_id,message_id) DO UPDATE SET workflow_json=excluded.workflow_json",
+            "INSERT INTO inbox_workflow(account_user_id,channel_id,message_id,workflow_json) VALUES(?1,?2,?3,?4) ON CONFLICT(account_user_id,channel_id,message_id) DO UPDATE SET workflow_json=excluded.workflow_json,revision=inbox_workflow.revision+1",
             params![workflow.account_user_id,workflow.channel_id,workflow.message_id,workflow_json],
         )?;
         Ok(())
@@ -88,25 +191,75 @@ impl Store {
         message: &str,
     ) -> Result<Option<InboxWorkflow>, StoreError> {
         validate_ids(user, channel, message)?;
-        let json: Option<String> = self.conn.lock().expect("store lock").query_row(
-            "SELECT workflow_json FROM inbox_workflow WHERE account_user_id=?1 AND channel_id=?2 AND message_id=?3",
-            params![user,channel,message], |row| row.get(0),
-        ).optional()?;
-        json.map(|json| {
-            let workflow: InboxWorkflow = serde_json::from_str(&json)
-                .map_err(|_| StoreError::Data("invalid retained workflow state".into()))?;
-            workflow.validate()?;
-            if workflow.account_user_id != user
-                || workflow.channel_id != channel
-                || workflow.message_id != message
-            {
-                return Err(StoreError::Data(
-                    "retained workflow account or message mismatch".into(),
-                ));
-            }
-            Ok(workflow)
-        })
-        .transpose()
+        Ok(self
+            .inbox_workflow_revision(user, channel, message)?
+            .map(|revision| revision.workflow))
+    }
+
+    /// Load current local confirmations with their revision.
+    pub fn inbox_workflow_revision(
+        &self,
+        user: &str,
+        channel: &str,
+        message: &str,
+    ) -> Result<Option<WorkflowRevision>, StoreError> {
+        validate_ids(user, channel, message)?;
+        load_revision(
+            &self.conn.lock().expect("store lock"),
+            user,
+            channel,
+            message,
+        )
+    }
+
+    /// Apply only explicit fields if the retained revision still matches.
+    pub fn patch_inbox_workflow(
+        &self,
+        user: &str,
+        channel: &str,
+        message: &str,
+        patch: &InboxWorkflowPatch,
+    ) -> Result<WorkflowRevision, WorkflowUpdateError> {
+        validate_ids(user, channel, message)?;
+        let mut conn = self.conn.lock().expect("store lock");
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(StoreError::from)?;
+        let retained = load_revision(&tx, user, channel, message)?;
+        let current = retained.as_ref().map_or(0, |revision| revision.version);
+        if current != patch.expected_version {
+            return Err(WorkflowUpdateError::Conflict {
+                expected: patch.expected_version,
+                current,
+            });
+        }
+        let mut workflow = retained.map_or_else(
+            || InboxWorkflow {
+                account_user_id: user.into(),
+                channel_id: channel.into(),
+                message_id: message.into(),
+                ..InboxWorkflow::default()
+            },
+            |revision| revision.workflow,
+        );
+        patch.notified_at.apply(&mut workflow.notified_at);
+        patch.snoozed_until.apply(&mut workflow.snoozed_until);
+        patch.action_required.apply(&mut workflow.action_required);
+        patch.action_evidence.apply(&mut workflow.action_evidence);
+        patch.completed_at.apply(&mut workflow.completed_at);
+        patch
+            .completion_evidence
+            .apply(&mut workflow.completion_evidence);
+        workflow.validate()?;
+        let version = current
+            .checked_add(1)
+            .filter(|v| *v <= i64::MAX as u64)
+            .ok_or_else(|| StoreError::Data("workflow revision exhausted".into()))?;
+        let json = serde_json::to_string(&workflow)
+            .map_err(|_| StoreError::Data("invalid workflow state".into()))?;
+        tx.execute("INSERT INTO inbox_workflow(account_user_id,channel_id,message_id,workflow_json,revision) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(account_user_id,channel_id,message_id) DO UPDATE SET workflow_json=excluded.workflow_json,revision=excluded.revision",params![user,channel,message,json,version as i64]).map_err(StoreError::from)?;
+        tx.commit().map_err(StoreError::from)?;
+        Ok(WorkflowRevision { workflow, version })
     }
 }
 
@@ -121,6 +274,40 @@ mod tests {
             message_id: "300".into(),
             ..InboxWorkflow::default()
         }
+    }
+
+    #[test]
+    fn patch_preserves_omissions_distinguishes_null_and_rejects_old_revision() {
+        let store = Store::open_in_memory().unwrap();
+        let initial = InboxWorkflow {
+            notified_at: Some("2026-10-10T10:00:00Z".into()),
+            action_evidence: Some("request".into()),
+            ..state()
+        };
+        store.record_inbox_workflow(&initial).unwrap();
+        let patch: InboxWorkflowPatch = serde_json::from_value(
+            serde_json::json!({"expected_version":1,"action_evidence":null}),
+        )
+        .unwrap();
+        let updated = store
+            .patch_inbox_workflow("7", "200", "300", &patch)
+            .unwrap();
+        assert_eq!(updated.version, 2);
+        assert_eq!(updated.workflow.notified_at, initial.notified_at);
+        assert_eq!(updated.workflow.action_evidence, None);
+        assert!(matches!(
+            store.patch_inbox_workflow("7", "200", "300", &patch),
+            Err(WorkflowUpdateError::Conflict { .. })
+        ));
+        store.record_inbox_workflow(&state()).unwrap();
+        assert_eq!(
+            store
+                .inbox_workflow_revision("7", "200", "300")
+                .unwrap()
+                .unwrap()
+                .version,
+            3
+        );
     }
 
     #[test]
