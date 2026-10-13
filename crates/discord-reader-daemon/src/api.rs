@@ -2439,6 +2439,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn member_with_cached_null_role_name_keeps_observed_role_ids() {
+        let mock = spawn_mock(VecDeque::from([(
+            200,
+            r#"{"user":{"id":"7"},"roles":["555"]}"#.into(),
+        )]))
+        .await;
+        let (api, store) = api_for(&mock.base);
+        *api.me_id.lock().unwrap() = Some("7".into());
+        store
+            .upsert_role(
+                Some("42"),
+                &discord_api::types::Role {
+                    id: "555".into(),
+                    name: None,
+                    color: None,
+                    position: None,
+                },
+            )
+            .unwrap();
+        let member = api
+            .get_member(MemberParams {
+                guild_id: "42".into(),
+                user_id: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(member["member"]["role_membership_status"], "observed");
+        assert_eq!(member["member"]["roles"], json!([{"id":"555","name":null}]));
+        assert_eq!(
+            store
+                .member_observation("7", "42")
+                .unwrap()
+                .unwrap()
+                .role_ids,
+            vec!["555"]
+        );
+    }
+
+    #[tokio::test]
     async fn empty_body_success_and_member_cache_failures_remain_distinct() {
         let mock = spawn_mock(VecDeque::from([(200, "[]".into())])).await;
         let (api, store) = api_for(&mock.base);

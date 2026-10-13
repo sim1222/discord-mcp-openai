@@ -274,3 +274,39 @@ The final smart-friend read-only review found no further actionable regressions.
 The test/docs privacy scan found no real server or organization names or supplied
 real account/channel/message IDs. No token, database copy or private live-response
 artifact is included in the commit.
+
+
+## Member role-name follow-up
+
+On 2026-10-13 JST, a reported storage failure at `role_name_read` prompted a
+nullable-label regression. The store accepted nullable role labels but decoded an
+existing row as a non-null string; SQL NULL therefore produced an invalid-column
+SQLite error. This is a reproduced source defect, not proof of the remote database's
+actual error or currently deployed revision.
+
+Before the fix, the anonymous store and daemon fixtures failed for existing NULL
+labels. After the fix, absent, NULL and named labels pass while malformed BLOB
+labels still fail. Current role IDs remain observed when only their label is unknown.
+Tests: `role_name_accepts_existing_null_name_without_hiding_invalid_types` and
+`member_with_cached_null_role_name_keeps_observed_role_ids`.
+
+The adapter supplies top-level payload aliases from the canonical nested error.
+`cache_errors_have_identical_text_and_structured_content` checks serialized
+`structuredContent.error_code`, all four aliases, text equality and the absence of
+argument classification for storage errors. Validation and timeout fixtures preserve
+their own codes and retryability.
+
+Authorized bounded real-token HTTP MCP checks passed on another read-only volume
+copy and independent backup: initial current membership, current membership with a
+NULL role label injected into the backup, and a BLOB-label error injected into the
+backup. The injected error returned identical text/structured content, matching
+`CACHE_SQLITE_ERROR` aliases, `role_name_read`, RPC -32004, unknown current membership
+and historical membership. The actual wire payload contained no `INVALID_ARGUMENT`.
+The private database and processes were removed; the original database and token
+were untouched. The corrected source tree was identified with a verification suffix.
+No deployment or wide synchronization was performed. The external reported wrapper
+and remote runtime remain unverified pending sanitized envelope/build evidence.
+
+Follow-up quality checks passed: 292 Rust tests, formatting, all-target Clippy with
+warnings denied, and the smart-friend read-only review. Anonymous tests/docs retain
+no supplied real server names, organization names, account IDs or message IDs.

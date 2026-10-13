@@ -221,7 +221,7 @@ pub(crate) fn remote_error(operation: &str, error: RpcClientError) -> CallToolRe
     if let Some(code) = rpc_code {
         payload["rpc_code"] = json!(code);
     }
-    CallToolResult::structured_error(payload)
+    error_result(payload)
 }
 
 fn tool_error(operation: &str, error: ErrorData) -> CallToolResult {
@@ -230,6 +230,19 @@ fn tool_error(operation: &str, error: ErrorData) -> CallToolResult {
         "error_source":if invalid { "client" } else { "mcp" }, "code":if invalid { "INVALID_PARAMS" } else { "INTERNAL_ERROR" },
         "operation":operation, "retryable":false, "message":error.message,"layer":if invalid {"validation"} else {"unknown"},"http_status":null,"discord_code":null,"argument_code":if invalid {Some("INVALID_ARGUMENT")} else {None}
     }, "rpc_code":error.code.0});
+    error_result(payload)
+}
+
+/// Keep legacy top-level classifications derived from the canonical error model.
+fn error_result(mut payload: Value) -> CallToolResult {
+    for (alias, canonical) in [
+        ("error_code", "code"),
+        ("error_source", "error_source"),
+        ("operation", "operation"),
+        ("retryable", "retryable"),
+    ] {
+        payload[alias] = payload["error"][canonical].clone();
+    }
     CallToolResult::structured_error(payload)
 }
 
@@ -306,6 +319,21 @@ mod tests {
         assert_eq!(text["error"]["operation"], "get_member");
         assert_eq!(text["error"]["retryable"], false);
         assert_eq!(text["rpc_code"], -32004);
+        assert!(text["error"].get("argument_code").is_none());
+        let wire = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            wire["structuredContent"]["error_code"],
+            "CACHE_SQLITE_ERROR"
+        );
+        for (alias, canonical) in [
+            ("error_code", "code"),
+            ("error_source", "error_source"),
+            ("operation", "operation"),
+            ("retryable", "retryable"),
+        ] {
+            assert_eq!(text[alias], text["error"][canonical]);
+        }
+
         let local = tool_error(
             "start_sync",
             ErrorData::invalid_params("invalid tool arguments", None),
@@ -380,11 +408,14 @@ mod tests {
     fn local_validation_and_transport_errors_are_structured() {
         let result = tool_error("recent_messages", limit_or(Some(0), 50, 100).unwrap_err());
         let value = result_json(&result);
+        assert_eq!(value["error_code"], "INVALID_PARAMS");
         assert_eq!(value["error"]["code"], "INVALID_PARAMS");
         assert_eq!(value["error"]["argument_code"], "INVALID_ARGUMENT");
         assert_eq!(value["error"]["operation"], "recent_messages");
         assert_eq!(value["error"]["retryable"], false);
         let timeout = result_json(&remote_error("start_sync", RpcClientError::Timeout));
+        assert_eq!(timeout["error_code"], "DAEMON_TIMEOUT");
+        assert_eq!(timeout["retryable"], true);
         assert_eq!(timeout["error"]["code"], "DAEMON_TIMEOUT");
         assert_eq!(timeout["error"]["retryable"], true);
     }

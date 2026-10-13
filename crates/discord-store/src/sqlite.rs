@@ -552,14 +552,14 @@ impl Store {
     /// Resolve a role id to its cached name, if known.
     pub fn role_name(&self, role_id: &str) -> Result<Option<String>, StoreError> {
         let conn = self.conn.lock().expect("store lock");
-        let name: Option<String> = conn
+        let name: Option<Option<String>> = conn
             .query_row(
                 "SELECT name FROM roles WHERE id = ?1",
                 params![role_id],
                 |row| row.get(0),
             )
             .optional()?;
-        Ok(name)
+        Ok(name.flatten())
     }
 
     pub fn upsert_user(&self, user: &User) -> Result<(), StoreError> {
@@ -1617,6 +1617,43 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
     use discord_api::types::MessageReference;
+
+    #[test]
+    fn role_name_accepts_existing_null_name_without_hiding_invalid_types() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.role_name("1").unwrap(), None);
+        store
+            .upsert_role(
+                Some("42"),
+                &Role {
+                    id: "1".into(),
+                    name: None,
+                    color: None,
+                    position: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(store.role_name("1").unwrap(), None);
+        store
+            .upsert_role(
+                Some("42"),
+                &Role {
+                    id: "1".into(),
+                    name: Some("Example role".into()),
+                    color: None,
+                    position: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(store.role_name("1").unwrap(), Some("Example role".into()));
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE roles SET name=X'00' WHERE id='1'", [])
+            .unwrap();
+        assert!(store.role_name("1").is_err());
+    }
 
     #[test]
     fn read_state_target_paging_counts_thirteen_thousand_without_materializing_targets() {

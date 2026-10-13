@@ -455,3 +455,23 @@ Synchronous SQLite work cannot be preempted by Tokio's timeout and may finish
 beyond the deadline; the next check stops retrieval and preserves incomplete
 coverage. Candidate listing still loads the retained fair queue, rather than
 claiming that all account-wide preprocessing has constant cost.
+
+
+### Nullable role labels and error aliases
+
+A retained role row with SQL `name=NULL` means the label is unknown. Self-member
+role IDs observed from Discord remain valid with `name:null`; a missing label does
+not make membership unknown. An absent role row has the same unknown-label result.
+Malformed stored types and other SQLite failures still fail with storage evidence,
+`cache_stage=role_name_read`, unknown current membership and retained last-observed
+membership. No database reset or schema change is required for nullable labels.
+
+Error payloads now provide `error_code`, `error_source`, `operation` and `retryable`
+alongside `error` and `rpc_code`. The four aliases are always derived from the
+canonical nested error. Text and `structuredContent` contain the identical payload.
+These are payload fields inside `structuredContent`, not additional JSON-RPC
+or `CallToolResult` fields. Cache errors use `error_code=CACHE_SQLITE_ERROR` and
+never the argument classification. Validation retains `INVALID_PARAMS` with its
+explicit nested `argument_code=INVALID_ARGUMENT`. An outer client UI or orchestration
+wrapper remains outside this server's control; compare its label with the raw wire
+payload and runtime revision before assigning the cause.
